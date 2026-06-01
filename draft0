@@ -1,0 +1,486 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include "SdFat.h"
+//#include <SD.h>
+
+SdFs sd;
+
+enum UIState { SCREEN_CHART, SCREEN_MENU };
+UIState currentState = SCREEN_CHART;
+
+volatile bool pause_sniffing = false;
+
+bool useLogScale = false;  // The user's toggle preference
+
+// Calibration data for the ILI9488 touch screen (you may need to tweak these later)
+// uint16_t calData[5] = { 276, 3494, 331, 3279, 7 };
+uint16_t calData[5] = { 288, 3501, 301, 3244, 7 };
+
+TFT_eSPI tft = TFT_eSPI();
+
+// --- Configuration ---
+const int CHANNELS[] = {1, 6, 11};            // The targeted channels
+const int NUM_CHANNELS = 3;
+int current_ch_idx = 0;
+
+const int UPDATE_INTERVAL = 500;              // Screen refresh (ms)
+const int HOP_INTERVAL = 1500;                // How long to sit on each channel (ms)
+const int MAX_MACS = 100;                     // Max devices in RAM
+
+// --- Optional BSSID Filter ---
+// Replace with your router's MAC to ONLY see your network,
+// or leave as zeros to see everything in the air.
+const uint8_t TARGET_BSSID[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+bool use_filter = false; // Set to true to activate
+
+// --- Display Geometry ---
+const int HEADER_HEIGHT = 80;
+const int CHART_BOTTOM = 320;
+int current_x = 0;
+
+// --- Memory Safe Data Structures ---
+struct MacRecord {
+  uint8_t mac[6];
+  uint32_t bytes;
+  char vendor[25];  // The box to hold the 24-character company name + null terminator
+  bool vendorFound; // The flag so we only search the SD card once per device
+};
+
+volatile MacRecord liveData[MAX_MACS];
+volatile uint16_t liveMacCount = 0;
+volatile uint32_t liveOtherBytes = 0;
+
+MacRecord sortData[MAX_MACS];
+uint16_t sortMacCount = 0;
+uint32_t sortOtherBytes = 0;
+
+// Upgraded to 9 colors for smaller font display
+uint16_t colors[9] = {TFT_RED, TFT_CYAN, TFT_GREEN, TFT_YELLOW, TFT_MAGENTA, TFT_ORANGE, TFT_PURPLE, TFT_BLUE, TFT_DARKGREY};
+
+// --- 1. The Wi-Fi Sniffer Callback ---
+void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (pause_sniffing) return; // Drop packets immediately if we are sorting or in the menu
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+  uint16_t len = pkt->rx_ctrl.sig_len;
+
+  uint8_t* mac1 = pkt->payload + 4;  // Destination
+  uint8_t* mac2 = pkt->payload + 10; // Source
+  uint8_t* mac3 = pkt->payload + 16; // BSSID
+
+  // Apply BSSID filter if active
+  if (use_filter) {
+      if (memcmp(mac1, TARGET_BSSID, 6) != 0 &&
+          memcmp(mac2, TARGET_BSSID, 6) != 0 &&
+          memcmp(mac3, TARGET_BSSID, 6) != 0) {
+          return; // Drop packet, not on our target network
+      }
+  }
+
+  // We track the Source MAC (who is transmitting right now)
+  uint8_t* target_mac = mac2;
+
+  // Don't track the router itself in the legend, we care about clients
+  if (use_filter && memcmp(target_mac, TARGET_BSSID, 6) == 0) return;
+
+  for(int i = 0; i < liveMacCount; i++) {
+    if(memcmp((void*)liveData[i].mac, target_mac, 6) == 0) {
+      liveData[i].bytes += len;
+      return;
+    }
+  }
+
+  if(liveMacCount < MAX_MACS) {
+    memcpy((void*)liveData[liveMacCount].mac, target_mac, 6);
+    liveData[liveMacCount].bytes = len;
+    liveMacCount++;
+  } else {
+    liveOtherBytes += len;
+  }
+}
+
+// --- UI Drawing Functions (Place this ABOVE setup) ---
+void drawMenu() {
+  tft.fillScreen(TFT_BLACK);
+
+  // Title
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(50, 30);
+  tft.print("DASHBOARD SETTINGS");
+
+  // 1. The Toggle Button (Hitbox: x: 50-250, y: 100-150)
+  // We change the color depending on the state
+  if (useLogScale) {
+    tft.fillRect(50, 100, 200, 50, TFT_GREEN);
+    tft.setTextColor(TFT_BLACK);
+  } else {
+    tft.fillRect(50, 100, 200, 50, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE);
+  }
+  tft.drawRect(50, 100, 200, 50, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(65, 115);
+  if (useLogScale) tft.print("MODE: LOG");
+  else tft.print("MODE: LINEAR");
+
+  // 2. Draw "Select Target AP" Button
+  tft.drawRect(50, 175, 200, 50, TFT_WHITE); // Adjust coordinates to fit your menu layout
+  tft.setCursor(65, 190);
+  tft.setTextColor(TFT_WHITE);
+  tft.print("Select Target AP");
+
+  // 3. The Exit Button (Hitbox: x: 300-450, y: 250-300)
+  tft.fillRect(300, 250, 150, 50, TFT_RED);
+  tft.drawRect(300, 250, 150, 50, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(340, 265);
+  tft.print("EXIT");
+
+}
+
+// --- Helper to draw the Header and Menu Button ---
+void drawChartHeader() {
+  tft.drawLine(0, HEADER_HEIGHT, 480, HEADER_HEIGHT, TFT_WHITE);
+
+  // Draw a sleek MENU button in the top right corner
+  tft.drawRoundRect(405, 2, 70, 22, 4, TFT_WHITE); // Rounded rectangle looks nicer
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(412, 6);
+  tft.print("MENU");
+}
+
+//--- SD Card Binary Search (MAC vendor (OUI) look up function) ---
+void resolveMacVendor(MacRecord* record) {
+  // If we already found it, don't waste time on the SD card
+  if (record->vendorFound) return;
+
+  // Default fallback if not found
+  sprintf(record->vendor, "Unknown Device");
+  record->vendorFound = true; // Mark as searched so we don't try again
+
+  char target[7];
+  sprintf(target, "%02X%02X%02X", record->mac[0], record->mac[1], record->mac[2]);
+
+  // Use SdFat's FsFile and O_READ
+  FsFile file = sd.open("/oui_db.txt", O_READ);
+  if (!file) return;
+
+  uint32_t low = 0;
+  // Use SdFat's fileSize() function
+  uint32_t high = (file.fileSize() / 32) - 1;
+
+  while (low <= high) {
+    uint32_t mid = low + (high - low) / 2;
+    file.seek(mid * 32);
+
+    char line[32];
+    file.read(line, 32);
+
+    char prefix[7];
+    strncpy(prefix, line, 6);
+    prefix[6] = '\0';
+
+    int cmp = strcmp(target, prefix);
+
+    if (cmp == 0) {
+      // Found the target! Extract the 24-character vendor name
+      strncpy(record->vendor, &line[7], 24);
+      record->vendor[24] = '\0';
+
+      // Trim trailing spaces from the Python padding
+      for(int i = 23; i >= 0; i--) {
+        if(record->vendor[i] == ' ') record->vendor[i] = '\0';
+        else break;
+      }
+      break;
+    }
+    else if (cmp < 0) {
+      if (mid == 0) break;
+      high = mid - 1;
+    }
+    else {
+      low = mid + 1;
+    }
+  }
+  file.close();
+}
+
+// --- 2. Setup ---
+// #if 0
+void setup() {
+  Serial.begin(115200);
+
+  // Force all Chip Select pins HIGH (inactive) immediately on boot
+  pinMode(15, OUTPUT); digitalWrite(15, HIGH); // Lock TFT
+  pinMode(21, OUTPUT); digitalWrite(21, HIGH); // Lock Touch
+  pinMode(5, OUTPUT);  digitalWrite(5, HIGH);  // Lock SD Card
+
+  delay(1000); // Give the serial port a second to open
+  Serial.println("\n--- ESP32 NOC Monitor Booting! ---"); // PROOF OF LIFE
+
+  tft.init();
+  tft.setTouch(calData);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  drawChartHeader();
+  //tft.drawLine(0, HEADER_HEIGHT, 480, HEADER_HEIGHT, TFT_WHITE);
+
+  // Check if user set a filter MAC
+  if (TARGET_BSSID[0] != 0x00 || TARGET_BSSID[1] != 0x00) {
+      use_filter = true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
+  esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+
+// --- SD CARD SANITY CHECK ---
+  Serial.println("\n--- Initializing SD Card ---");
+
+  if (!sd.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(4)))) {
+    Serial.println("[!] SD Card Mount Failed! Dumping exact hardware error:");
+    sd.initErrorPrint(&Serial); // WE NEED THIS TO DEBUG THE 64GB CARD!
+  } else {
+    Serial.println("[*] SD Card mounted successfully.");
+
+    // Attempt to locate the crushed database
+    FsFile file = sd.open("/oui_db.txt", O_READ);
+    if (!file) {
+      Serial.println("[!] Failed to open /oui_db.txt! Check filename.");
+    } else {
+      // Note the %llu and the fileSize() function!
+      Serial.printf("[*] SUCCESS! oui_db.txt found. Size: %llu bytes\n", file.fileSize());
+      file.close();
+    }
+  }
+  Serial.println("----------------------------\n");
+}
+// #endif
+
+// For TFT screen calibration (keep off during normal use, only turn on if you need to recalibrate)
+#if 0
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n--- ESP32 NOC Monitor Booting! ---");
+
+  tft.init();
+  tft.setRotation(1);
+
+  // --- THE AUTO-CALIBRATION HIJACK ---
+  uint16_t newCalData[5];
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(20, 160);
+  tft.println("Touch the arrows to calibrate...");
+
+  // This function will draw arrows in the 4 corners and wait for you to touch them
+  tft.calibrateTouch(newCalData, TFT_MAGENTA, TFT_BLACK, 15);
+
+  Serial.println("\n==================================");
+  Serial.println("CALIBRATION COMPLETE!");
+  Serial.println("Replace your calData array at the top of your code with this:");
+  Serial.printf("uint16_t calData[5] = { %d, %d, %d, %d, %d };\n",
+                newCalData[0], newCalData[1], newCalData[2], newCalData[3], newCalData[4]);
+  Serial.println("==================================\n");
+
+  // Lock the system here so you can copy the numbers
+  while(true) { delay(1000); }
+}
+#endif
+
+// --- 3. The Main Loop ---
+void loop() {
+  uint16_t t_x = 0, t_y = 0;
+
+// --- RAW SPI HARDWARE DIAGNOSTIC ---
+  static unsigned long lastDebugPrint = 0;
+  if (millis() - lastDebugPrint > 500) {
+    lastDebugPrint = millis();
+    uint16_t z_pressure = tft.getTouchRawZ();
+    Serial.printf("Raw Touch Z (Pressure): %d\n", z_pressure);
+  }
+
+  // Check if screen is touched
+// Check if screen is touched
+  bool pressed = tft.getTouch(&t_x, &t_y);
+
+  if (pressed) {
+    Serial.printf("Touch Detected! X: %d, Y: %d\n", t_x, t_y);
+    if (currentState == SCREEN_CHART) {
+      // Hitbox for Top-Right MENU Button (x: > 400, y: < 40)
+      if (t_x > 400 && t_y < 40) {
+        currentState = SCREEN_MENU;
+        pause_sniffing = true;           // Stop RAM corruption
+        esp_wifi_set_promiscuous(false); // Kill radio for clean SPI bus sharing
+        drawMenu();
+        delay(300); // Debounce
+      }
+    }
+    else if (currentState == SCREEN_MENU) {
+
+      // Hitbox for "Toggle Scale"
+      if (t_x > 50 && t_x < 250 && t_y > 100 && t_y < 150) {
+        useLogScale = !useLogScale;
+        drawMenu();
+        delay(300);
+      }
+
+      // Hitbox for "Select Target AP"
+      // (Make sure these coordinates match the drawRect you just made!)
+      if (t_x > 50 && t_x < 250 && t_y > 175 && t_y < 225) {
+        currentState = SCREEN_AP_SCAN;
+        drawApScanner();
+        delay(300); // Debounce
+      }
+
+      // Hitbox for "Exit"
+      if (t_x > 300 && t_x < 450 && t_y > 250 && t_y < 300) {
+        currentState = SCREEN_CHART;
+        tft.fillScreen(TFT_BLACK);
+        drawChartHeader();               // Redraw the header and button!
+        esp_wifi_set_promiscuous(true);  // Wake radio back up
+        pause_sniffing = false;          // Resume data collection
+        delay(300);
+      }
+    }
+  }
+  // --- CHART LOGIC ---
+  if (currentState == SCREEN_CHART) {
+    static unsigned long lastHop = 0;
+
+    if (millis() - lastHop > HOP_INTERVAL) {
+      lastHop = millis();
+      current_ch_idx++;
+
+      bool full_sweep_complete = false;
+      if (current_ch_idx >= NUM_CHANNELS) {
+        current_ch_idx = 0;
+        full_sweep_complete = true;
+      }
+
+      esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(5, 5);
+      tft.printf("CH: %02d | ESP32 NOC Monitor   ", CHANNELS[current_ch_idx]);
+
+      if (full_sweep_complete) {
+
+        // Use the manual interrupt flag to prevent the race condition bug
+        pause_sniffing = true;
+        memcpy(sortData, (void*)liveData, sizeof(liveData));
+        sortMacCount = liveMacCount;
+        sortOtherBytes = liveOtherBytes;
+        memset((void*)liveData, 0, sizeof(liveData));
+        liveMacCount = 0;
+        liveOtherBytes = 0;
+        pause_sniffing = false;
+
+        // Bubble sort
+        for (int i = 0; i < sortMacCount - 1; i++) {
+          for (int j = 0; j < sortMacCount - i - 1; j++) {
+            if (sortData[j].bytes < sortData[j+1].bytes) {
+              MacRecord temp = sortData[j];
+              sortData[j] = sortData[j+1];
+              sortData[j+1] = temp;
+            }
+          }
+        }
+
+        for(int i = 8; i < sortMacCount; i++) {
+          sortOtherBytes += sortData[i].bytes;
+        }
+
+        // DRAW LEGEND
+        tft.fillRect(0, 25, 480, HEADER_HEIGHT - 25, TFT_BLACK);
+        tft.setTextSize(1);
+        for(int i = 0; i < 8 && i < sortMacCount; i++) {
+
+          resolveMacVendor(&sortData[i]);
+          tft.setTextColor(colors[i]);
+
+          // --- KEEP: 3 Columns, 155px apart ---
+          int x_pos = 5 + (i % 3) * 155;
+          int y_pos = 30 + (i / 3) * 15;
+          tft.setCursor(x_pos, y_pos);
+
+          tft.print(sortData[i].vendor);
+        }
+
+        // --- NEW: PLACE "OTHER DEVICES" AS THE 9TH ITEM IN THE GRID ---
+        tft.setTextColor(colors[8]);
+        tft.setCursor(315, 60); // Exact coordinates for the bottom-right slot
+
+        // Calculate how many devices are bundled into "Other"
+        int otherCount = 0;
+        if (sortMacCount > 8) {
+          otherCount = sortMacCount - 8;
+        }
+
+        // Print the label with the dynamic count appended
+        tft.printf("OTHER DEVICES (%d)", otherCount);
+
+        // DRAW CHART (Unified Log & Linear Math)
+        tft.fillRect(current_x + 1, HEADER_HEIGHT + 1, 10, CHART_BOTTOM - HEADER_HEIGHT, TFT_BLACK);
+
+        int current_y = CHART_BOTTOM;
+        uint32_t total_bytes = sortOtherBytes;
+        for(int i = 0; i < 8 && i < sortMacCount; i++) total_bytes += sortData[i].bytes;
+
+        if (total_bytes > 0) {
+          double log_total = 0;
+
+          // Pre-calculate the total log denominator if necessary
+          if (useLogScale) {
+            for(int j = 0; j < 8 && j < sortMacCount; j++) {
+              log_total += log10((double)sortData[j].bytes + 1.0);
+            }
+            log_total += log10((double)sortOtherBytes + 1.0);
+          }
+
+          // 1. Draw Top 8
+          for(int i = 0; i < 8 && i < sortMacCount; i++) {
+            double fraction;
+            if (useLogScale) {
+              fraction = log10((double)sortData[i].bytes + 1.0) / log_total;
+            } else {
+              fraction = (double)sortData[i].bytes / (double)total_bytes;
+            }
+
+            int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
+            if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+
+            tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+
+            current_y -= bar_height;
+          }
+
+          // 2. Draw Other (and patch the integer rounding gap)
+          if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
+            // No log/linear math needed here!
+            // Just let the final grey block stretch to the ceiling to absorb the rounding error.
+            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
+          }
+          else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortMacCount > 0) {
+            // If there is no "Other" data, stretch the top-most MAC address bar to the ceiling instead
+            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
+          }
+        }
+
+        current_x += 2;
+        if (current_x >= 478) current_x = 0;
+      }
+    }
+  }
+}
