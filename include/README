@@ -1,37 +1,67 @@
+Find narrow mono fonts here:
+https://www.fontsquirrel.com/fonts/list/hot
+Ubuntu mono works
+Oswald is narrow but not mono
+Iosevka is good but can't find it in .tft.
+Some formats like .otf can be converted to .tft here: https://transfonter.org/
+Terminus would be good but is bitmap, couldn't find .tft.
+To convert to .h file to put in Include folder, drop .tft file here: https://rop.nl/truetype2gfx/
+Select 8 or 9 or 10 or 11 or 12 for size.
 
-This directory is intended for project header files.
+ble_oui.h sourced from officiel SIG list here: https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/company_identifiers/company_identifiers.yaml
+The file is downloaded using
+wget https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers/company_identifiers/company_identifiers.yaml
+and then data crushed into the ble_oui.h file by creating and running this python script:
 
-A header file is a file containing C declarations and macro definitions
-to be shared between several project source files. You request the use of a
-header file in your project source file (C, C++, etc) located in `src` folder
-by including it, with the C preprocessing directive `#include'.
+import yaml
+import sys
 
-```src/main.c
+print("Loading Bluetooth SIG Database...")
 
-#include "header.h"
+try:
+    with open('company_identifiers.yaml', 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+except FileNotFoundError:
+    print("Error: company_identifiers.yaml not found in this directory.")
+    sys.exit(1)
 
-int main (void)
-{
- ...
-}
-```
+# Extract the list of companies
+companies = data.get('company_identifiers', [])
 
-Including a header file produces the same results as copying the header file
-into each source file that needs it. Such copying would be time-consuming
-and error-prone. With a header file, the related declarations appear
-in only one place. If they need to be changed, they can be changed in one
-place, and programs that include the header file will automatically use the
-new version when next recompiled. The header file eliminates the labor of
-finding and changing all the copies as well as the risk that a failure to
-find one copy will result in inconsistencies within a program.
+# CRITICAL: Sort the companies by their numerical ID for the C++ binary search!
+companies_sorted = sorted(companies, key=lambda x: x['value'])
 
-In C, the convention is to give header files names that end with `.h'.
+print(f"Found {len(companies_sorted)} companies. Generating C++ header...")
 
-Read more about using header files in official GCC documentation:
+# Open a new C++ header file to write the output
+with open('ble_oui.h', 'w', encoding='utf-8') as out:
+    out.write('#ifndef BLE_OUI_H\n')
+    out.write('#define BLE_OUI_H\n\n')
+    out.write('#include <Arduino.h>\n\n')
 
-* Include Syntax
-* Include Operation
-* Once-Only Headers
-* Computed Includes
+    out.write('struct BleVendor {\n')
+    out.write('  uint16_t id;\n')
+    out.write('  const char* name;\n')
+    out.write('};\n\n')
 
-https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+    out.write('// Auto-generated BLE Company ID Dictionary\n')
+    out.write('// Sorted by ID for high-speed PROGMEM binary search.\n')
+    out.write('const BleVendor bleVendors[] PROGMEM = {\n')
+
+    for entry in companies_sorted:
+        comp_id = entry.get('value', 0)
+        name = entry.get('name', 'Unknown')
+
+        # Sanitize the name for C++ strings (escape quotes, clean whitespace)
+        safe_name = name.replace('"', '\\"').replace('\n', ' ').strip()
+
+        # Write the formatted C++ struct line:  { 0x004C, "Apple, Inc." },
+        out.write(f'  {{ 0x{comp_id:04X}, "{safe_name}" }},\n')
+
+    out.write('};\n\n')
+    out.write(f'const int numBleVendors = {len(companies_sorted)};\n\n')
+
+    out.write('#endif // BLE_OUI_H\n')
+
+print("Success! Created ble_oui.h")
+
