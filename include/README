@@ -11,7 +11,13 @@ Select 8 or 9 or 10 or 11 or 12 for size.
 ble_oui.h sourced from officiel SIG list here: https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/company_identifiers/company_identifiers.yaml
 The file is downloaded using
 wget https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers/company_identifiers/company_identifiers.yaml
-and then data crushed into the ble_oui.h file by creating and running this python script:
+wget https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers/core/appearance_values.yaml
+wget https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers/uuids/member_uuids.yaml
+wget https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers/uuids/service_uuids.yaml
+Unlike the MAC vendor look up table (30,000+ entries), this data (3000+ companies) is small enough to be stored on the esp32.
+Note if you don't see the file at first after the wget download you can find it running pwd and then, e.g., ls -l ~/appearance_values.yaml
+The raw <SIG file name>.yaml files are then "data crushed" into the ble_<SIG file name>.h files by creating (e.g., nano crushThis.py) and running the python scripts below.
+There is one python crusher script per .yaml file except in the case of member_uuids.yaml and service_uuids.yaml, which are handled in the same python script and consolidated into a single ble_uuids.h file.
 
 import yaml
 import sys
@@ -65,3 +71,148 @@ with open('ble_oui.h', 'w', encoding='utf-8') as out:
 
 print("Success! Created ble_oui.h")
 
+For the appearance_values.yaml file:
+
+import yaml
+import sys
+
+print("Loading Bluetooth SIG Appearance Database...")
+
+try:
+    with open('appearance_values.yaml', 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+except FileNotFoundError:
+    print("Error: appearance_values.yaml not found in this directory.")
+    sys.exit(1)
+
+# The root key in the SIG YAML for this file is usually 'appearance_values'
+appearances = data.get('appearance_values', [])
+
+# CRITICAL: Sort by numerical ID for the C++ binary search
+appearances_sorted = sorted(appearances, key=lambda x: x['value'])
+
+print(f"Found {len(appearances_sorted)} appearance categories. Generating C++ header...")
+
+with open('ble_appearance.h', 'w', encoding='utf-8') as out:
+    out.write('#ifndef BLE_APPEARANCE_H\n')
+    out.write('#define BLE_APPEARANCE_H\n\n')
+    out.write('#include <Arduino.h>\n\n')
+
+    out.write('struct BleAppearance {\n')
+    out.write('  uint16_t id;\n')
+    out.write('  const char* name;\n')
+    out.write('};\n\n')
+
+    out.write('// Auto-generated BLE Appearance Dictionary\n')
+    out.write('// Sorted by ID for high-speed PROGMEM binary search.\n')
+    out.write('const BleAppearance bleAppearances[] PROGMEM = {\n')
+
+    for entry in appearances_sorted:
+        app_id = entry.get('value', 0)
+        name = entry.get('name', 'Unknown')
+
+        # Sanitize and shorten the name for the UI (e.g., "Generic Heart rate Sensor" -> "Heart rate Sensor")
+        safe_name = name.replace('"', '\\"').replace('\n', ' ').replace('Generic ', '').strip()
+
+        # Truncate to 15 characters so it fits cleanly in your `typeTag` array without UI overflow
+        if len(safe_name) > 15:
+            safe_name = safe_name[:14] + "."
+
+        out.write(f'  {{ 0x{app_id:04X}, "{safe_name}" }},\n')
+
+    out.write('};\n\n')
+    out.write(f'const int numBleAppearances = {len(appearances_sorted)};\n\n')
+
+    out.write('#endif // BLE_APPEARANCE_H\n')
+
+print("Success! Created ble_appearance.h")
+
+To crush member_uuids.yaml and service_uuids.yaml at once:
+import yaml
+import sys
+import os
+
+print("Loading Bluetooth SIG UUID Databases...")
+
+def process_yaml(filename):
+    if not os.path.exists(filename):
+        print(f"Warning: {filename} not found. Skipping.")
+        return []
+
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        print(f"File error reading {filename}: {e}")
+        return []
+
+    # The root key might simply be 'uuids'
+    root_key = next(iter(data))
+    entries = data.get(root_key, [])
+
+    if not entries:
+        return []
+
+    parsed_entries = []
+
+    # Auto-detect keys (usually 'uuid' and 'name' for these files)
+    first_item = entries[0]
+    id_key = 'uuid' if 'uuid' in first_item else 'value'
+
+    for entry in entries:
+        raw_id = entry.get(id_key, 0)
+
+        # Ensure it's treated as a 16-bit integer
+        if isinstance(raw_id, str) and raw_id.startswith('0x'):
+            uid = int(raw_id, 16)
+        else:
+            uid = int(raw_id)
+
+        name = entry.get('name', 'Unknown')
+        safe_name = str(name).replace('"', '\\"').replace('\n', ' ').strip()
+
+        # Truncate to 15 chars for the UI tag
+        if len(safe_name) > 15:
+            safe_name = safe_name[:14] + "."
+
+        parsed_entries.append({'id': uid, 'name': safe_name})
+
+    return sorted(parsed_entries, key=lambda x: x['id'])
+
+
+# Process both files
+members = process_yaml('member_uuids.yaml')
+services = process_yaml('service_uuids.yaml')
+
+print(f"Found {len(members)} Member UUIDs and {len(services)} Service UUIDs.")
+
+# Generate the C++ Header
+with open('ble_uuids.h', 'w', encoding='utf-8') as out:
+    out.write('#ifndef BLE_UUIDS_H\n')
+    out.write('#define BLE_UUIDS_H\n\n')
+    out.write('#include <Arduino.h>\n\n')
+
+    out.write('struct BleUuidEntry {\n')
+    out.write('  uint16_t id;\n')
+    out.write('  const char* name;\n')
+    out.write('};\n\n')
+
+    # Write Member UUIDs (0x16)
+    out.write('// Auto-generated Corporate Member UUIDs (0x16 Service Data)\n')
+    out.write('const BleUuidEntry memberUuids[] PROGMEM = {\n')
+    for entry in members:
+        out.write(f'  {{ 0x{entry["id"]:04X}, "{entry["name"]}" }},\n')
+    out.write('};\n')
+    out.write(f'const int numMemberUuids = {len(members)};\n\n')
+
+    # Write Service UUIDs (0x02 / 0x03)
+    out.write('// Auto-generated Standard Service UUIDs (0x02/0x03)\n')
+    out.write('const BleUuidEntry serviceUuids[] PROGMEM = {\n')
+    for entry in services:
+        out.write(f'  {{ 0x{entry["id"]:04X}, "{entry["name"]}" }},\n')
+    out.write('};\n')
+    out.write(f'const int numServiceUuids = {len(services)};\n\n')
+
+    out.write('#endif // BLE_UUIDS_H\n')
+
+print("Success! Created ble_uuids.h")
