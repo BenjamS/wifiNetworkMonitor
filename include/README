@@ -1,3 +1,11 @@
+BLE scan is a two part passive and active scan. The passive scan waits for adverts offering to send info. Once received, the NimBLE software sends a response welcoming the info, at which point the device sends it.
+For distance calculations based on RSSI see this method: https://altbeacon.github.io/android-beacon-library/distance-calculations.html
+Distance measurement requires "RSSI dBm at 1 meter". Many BLE device adverts report this but wifi devices do not. When not reported a rough default
+value is used in the calculation. Therefore results are more accurate for BLE devices than for wifi devices.
+The parameters used in the linked method are fitted based on a specific cell phone (Nexus 5) with a specific antenna, gain, etc. which is different
+from that of the ESP32. For best results it's best to take new measurements using the ESP32.
+This is an alternative method not so sensitive to inaccurate
+
 Find narrow mono fonts here:
 https://www.fontsquirrel.com/fonts/list/hot
 Ubuntu mono works

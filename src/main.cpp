@@ -90,21 +90,39 @@ RadioMode currentRadioMode = RADIO_WIFI;
 // ==========================================
 #define MAX_BLE_DEVICES 150
 
+// 1. Define this enum above the struct so it exists in memory first
+enum OsintTrackerType : uint8_t {
+    TRACKER_NONE = 0,
+    TRACKER_APPLE_FINDMY,
+    TRACKER_APPLE_IBEACON,
+    TRACKER_GOOGLE_FASTPAIR,
+    TRACKER_SAMSUNG_SMARTTAG,
+    TRACKER_TILE,
+    TRACKER_MS_SWIFTPAIR,
+    TRACKER_EDDYSTONE
+};
+
+// 2. The perfectly aligned struct
+// 2. The perfectly aligned struct
 struct BLERecord {
-  // --- 4-Byte Variables (Aligned at the top) ---
-  int rssi;               
-  int txPower;            
+  // --- 4-Byte Types (Grouped at the top) ---
+  uint32_t firstSeen;       
+  uint32_t lastSeen;
   uint32_t hits;          
   float smoothedDistance; 
-  unsigned long firstSeen; 
-  unsigned long lastSeen;
 
-  // --- 1-Byte Arrays (Packed at the bottom) ---
+  // --- 2-Byte Types (The string replacements) ---
+  uint16_t appearanceId;    
+  uint16_t serviceId;       
+
+  // --- 1-Byte Types & Arrays (Grouped at the bottom) ---
   uint8_t mac[6];         
-  char name[25];          
-  char appearance[20];    
-  char service[20];       
-  char trackerData[20];   
+  uint8_t trackerType;      
+  int8_t rssi;               
+  int8_t txPower;     
+  uint8_t namePriority;     // <--- ADDED BACK: Protects your Eddystone URLs
+  char name[25];            
+  char payload[30];
 };
 
 // Perfectly aligned with your drawDeviceList() function!
@@ -139,29 +157,29 @@ bool target_locked = false;
 char target_ssid[33] = {0}; // Store the name of the targeted network
 
 const int HEADER_HEIGHT = 110; 
-const int CHART_BOTTOM = 320;
+const int CHART_BOTTOM = 295;
 int current_x = 0;
 
 struct MacRecord {
-  // 8-byte variables first
+  // 8-byte types
   uint64_t sum_bytes;
   uint64_t sum_sq_bytes;
 
-  // 4-byte variables
+  // 4-byte types 
+  uint32_t first_seen; 
+  uint32_t last_seen;  
   uint32_t packets;
-  unsigned long first_seen;
-  unsigned long last_seen;
   uint32_t tx_bytes;
   uint32_t rx_bytes;
+  float smoothedDistance;  // <--- Moved up to group with 4-byte types
 
-  // 1-byte arrays and variables
+  // 1-byte types & Arrays
   uint8_t mac[6];
-  char vendor[25];
-  int8_t rssi;         
-  uint8_t rate;        
-  bool vendorFound; 
+  char vendor[22];         // <--- Reduced to 22 bytes to hit the magic 72-byte struct limit
+  int8_t rssi;
+  uint8_t rate;
+  bool vendorFound;
   bool needs_lookup;
-  float smoothedDistance;
 };
 
 // ==========================================
@@ -208,7 +226,7 @@ static_assert(sizeof(MacRecord) * MAX_MACS >= sizeof(BLERecord) * MAX_BLE_DEVICE
 
 struct OUICache {
   uint8_t oui[3];
-  char vendor[25]; // Shrunk to match MacRecord and prevent string overflows
+  char vendor[22]; // <--- Shrunk to match MacRecord and prevent string overflows
 };
 
 OUICache vendorCache[OUI_CACHE_SIZE];
@@ -466,8 +484,9 @@ void resolveMacVendor(MacRecord* record) {
         vendorCache[i].oui[1] == record->mac[1] &&
         vendorCache[i].oui[2] == record->mac[2]) {
       
-      strncpy(record->vendor, vendorCache[i].vendor, 24);
-      record->vendor[24] = '\0'; // Guarantee safe termination!
+      // Updated to 21 chars max, null terminated at [21]
+      strncpy(record->vendor, vendorCache[i].vendor, 21);
+      record->vendor[21] = '\0'; 
       record->vendorFound = true;
       return; 
     }
@@ -504,12 +523,12 @@ void resolveMacVendor(MacRecord* record) {
           text_start++;
         }
         
-        // Safely extract from the true start of the word
-        strncpy(record->vendor, &line[text_start], 24); 
-        record->vendor[24] = '\0';
+        // Safely extract from the true start of the word (Updated to 21)
+        strncpy(record->vendor, &line[text_start], 21); 
+        record->vendor[21] = '\0';
         
-        // Strip trailing spaces working backward
-        for(int i = 23; i >= 0; i--) {         
+        // Strip trailing spaces working backward (Updated to start at 20)
+        for(int i = 20; i >= 0; i--) {         
           if(record->vendor[i] == ' ') record->vendor[i] = '\0';
           else break;
         }
@@ -533,8 +552,9 @@ void resolveMacVendor(MacRecord* record) {
   vendorCache[cacheHead].oui[1] = record->mac[1];
   vendorCache[cacheHead].oui[2] = record->mac[2];
   
-  strncpy(vendorCache[cacheHead].vendor, record->vendor, 24);
-  vendorCache[cacheHead].vendor[24] = '\0';
+  // Updated to 21 chars max, null terminated at [21]
+  strncpy(vendorCache[cacheHead].vendor, record->vendor, 21);
+  vendorCache[cacheHead].vendor[21] = '\0';
   
   if (cacheCount < OUI_CACHE_SIZE) cacheCount++;
   cacheHead = (cacheHead + 1) % OUI_CACHE_SIZE;
@@ -777,6 +797,99 @@ void drawChartHeader() {
   tft.drawString(bannerStr, 5, 4);
 }
 
+// ==========================================
+// WIFI SORTING STATE
+// ==========================================
+enum SortMode { SORT_TOTAL, SORT_TX, SORT_RX, SORT_AVG, SORT_CV };
+SortMode currentSortMode = SORT_TOTAL; // Default state
+
+// ==========================================
+// BLE SORTING STATE
+// ==========================================
+enum BleSortMode { SORT_BLE_HITS, SORT_BLE_DIST };
+BleSortMode currentBleSortMode = SORT_BLE_HITS; // Default state
+
+double getBleSortMetric(BLERecord& record, BleSortMode mode) {
+    switch(mode) {
+        case SORT_BLE_HITS:
+            return (double)record.hits;
+        case SORT_BLE_DIST:
+            return (double)record.smoothedDistance;
+    }
+    return 0.0;
+}
+
+void drawChartFooter() {
+  // 1. Draw the top bounding line (separating it from the waterfall)
+  tft.drawLine(0, 295, 480, 295, TFT_WHITE);
+
+  // 2. Clear the footer area to prevent text from overlapping when updated
+  tft.fillRect(0, 296, 480, 24, TFT_BLACK);
+
+  // 3. Set up the typography
+  tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextDatum(MC_DATUM); 
+
+  // ==========================================
+  // ZONE 1: SORT METRIC (Center X = 72)
+  // ==========================================
+  char metricStr[32];
+  if (currentRadioMode == RADIO_WIFI) {
+    if (currentSortMode == SORT_TOTAL) strcpy(metricStr, "SORT: TOTAL");
+    else if (currentSortMode == SORT_TX) strcpy(metricStr, "SORT: TX");
+    else if (currentSortMode == SORT_RX) strcpy(metricStr, "SORT: RX");
+    else if (currentSortMode == SORT_AVG) strcpy(metricStr, "SORT: AVG");
+    else if (currentSortMode == SORT_CV) strcpy(metricStr, "SORT: CV%");
+  } else {
+    // BLE specific modes
+    if (currentBleSortMode == SORT_BLE_HITS) strcpy(metricStr, "SORT: HITS");
+    else if (currentBleSortMode == SORT_BLE_DIST) strcpy(metricStr, "SORT: DIST");
+  }
+  tft.drawString(metricStr, 72, 308);
+
+  // Draw Vertical Separator 1
+  tft.drawLine(145, 295, 145, 320, TFT_WHITE);
+
+  // ==========================================
+  // ZONE 2: SORT DIRECTION (Center X = 217)
+  // ==========================================
+  if (sort_descending) {
+    tft.drawString("ORDER: DESC", 217, 308);
+  } else {
+    tft.setTextColor(TFT_GREEN); 
+    tft.drawString("ORDER: ASC", 217, 308);
+    tft.setTextColor(TFT_WHITE); 
+  }
+
+  // Draw Vertical Separator 2
+  tft.drawLine(290, 295, 290, 320, TFT_WHITE);
+
+  // ==========================================
+  // ZONE 3: SCALE MODE (Center X = 362)
+  // ==========================================
+  if (useLogScale) {
+    tft.setTextColor(TFT_YELLOW); 
+    tft.drawString("SCALE: LOG", 362, 308);
+  } else {
+    tft.drawString("SCALE: LIN", 362, 308);
+  }
+  
+  // Draw Vertical Separator 3 (Carving out the battery column!)
+  tft.drawLine(435, 295, 435, 320, TFT_WHITE);
+  
+  // ==========================================
+  // ZONE 4: BATTERY PLACEHOLDER
+  // ==========================================
+  tft.drawRect(445, 302, 22, 12, TFT_WHITE); // Battery Outline
+  tft.fillRect(467, 305, 3, 6, TFT_WHITE);   // Positive Terminal Nub
+  tft.fillRect(447, 304, 18, 8, TFT_GREEN);  // Fake "Full Charge" Indicator
+  
+  // 4. Reset datum so the rest of your UI doesn't draw off-center
+  tft.setTextDatum(TL_DATUM); 
+  tft.setTextColor(TFT_WHITE);
+}
+
 void drawApScanner() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1); 
@@ -968,14 +1081,15 @@ void drawDeviceList() {
     tft.setTextColor(TFT_GREEN);
     if (currentRadioMode == RADIO_WIFI) {
       tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-      tft.drawString("   VENDOR             First|Last    TX|RX(KB) Tot(KB)", 5, 26); 
+      tft.drawString("     VENDOR                  MAC           RSSI TOTAL", 5, 26); 
+      
       tft.setFreeFont(&UbuntuMono_RI9pt7b); 
-      tft.drawString("    MAC                   RSSI Mbps  Avg(B)   CV%", 5, 41); 
+      tft.drawString("    FIRST | LAST   DIST Mbps  AVG    CV%    TX | RX", 5, 41);
     } else {
       tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-      tft.drawString("   NAME              First|Last      RSSI  DIST HITS", 5, 26); 
+      tft.drawString("    NAME               FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
       tft.setFreeFont(&UbuntuMono_RI9pt7b); 
-      tft.drawString("    MAC                 Vendor:Appearance|Service|", 5, 41); 
+      tft.drawString("MAC ADDRESS       VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
     }
     tft.setTextColor(TFT_WHITE); 
 
@@ -993,140 +1107,188 @@ void drawDeviceList() {
       
       if (currentRadioMode == RADIO_WIFI) {
         
+        // ==========================================
+        // WIFI MODE - UI LAYOUT (Restored Logic)
+        // ==========================================
+        char line1[90];
+        char line2[90];
+
+        // 1. Resolve Vendor
         resolveMacVendor(&sessionData[i]);
 
+        // 2. Format MAC Address
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
                  sessionData[i].mac[0], sessionData[i].mac[1], sessionData[i].mac[2],
                  sessionData[i].mac[3], sessionData[i].mac[4], sessionData[i].mac[5]);
 
+        // 3. Randomized MAC Check & Safe Vendor (18 chars max)
         bool is_randomized = (sessionData[i].mac[0] & 0x02) != 0;
-
-        // VENDOR: Squeezed to exactly 18 characters
-        char short_vendor[20]; 
+        char safeVendor[20]; 
         if (is_randomized) {
-          snprintf(short_vendor, sizeof(short_vendor), "%-18.18s", "<Randomized>");
+            snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", "<Randomized>");
         } else if (sessionData[i].vendor[2] == ':' || strlen(sessionData[i].vendor) == 0) {
-          snprintf(short_vendor, sizeof(short_vendor), "%-18.18s", "Unknown Device");
+            snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", "Unknown Device");
         } else {
-          snprintf(short_vendor, sizeof(short_vendor), "%-18.18s", sessionData[i].vendor);
+            snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", sessionData[i].vendor);
         }
 
+        // 4. Packet Math (Mean & CV)
         double mean = 0.0;
         double cv_percent = 0.0;
         if (sessionData[i].packets > 0) {
-          mean = (double)sessionData[i].sum_bytes / (double)sessionData[i].packets;
-          double avg_sq_sum = (double)sessionData[i].sum_sq_bytes / (double)sessionData[i].packets;
-          double variance = avg_sq_sum - (mean * mean);
-          if (variance < 0) variance = 0; 
-          double std_dev = sqrt(variance);
-          if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
+            mean = (double)sessionData[i].sum_bytes / (double)sessionData[i].packets;
+            double avg_sq_sum = (double)sessionData[i].sum_sq_bytes / (double)sessionData[i].packets;
+            double variance = avg_sq_sum - (mean * mean);
+            if (variance < 0) variance = 0; 
+            double std_dev = sqrt(variance);
+            if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
         }
 
-        uint32_t total_bytes = sessionData[i].tx_bytes + sessionData[i].rx_bytes;
-
-        // AGE: Fixed-width 13 characters (e.g. "00h05m|01h20m")
-        char firstSeenStr[8];
-        char lastSeenStr[8];
+        // 5. Timestamps
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[16];
         getAgeString(sessionData[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
         getAgeString(sessionData[i].last_seen, lastSeenStr, sizeof(lastSeenStr));
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); // 13 chars
 
-        char ageCombo[16];
-        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr);
-
-        // --- NEW: DYNAMIC TRAFFIC SCALING ---
-        char txStr[8], rxStr[8], totStr[10];
-        
-        // Call the helpers we placed above drawDeviceList()
-        formatShortUnit(sessionData[i].tx_bytes, txStr, sizeof(txStr));
-        formatShortUnit(sessionData[i].rx_bytes, rxStr, sizeof(rxStr));
+        // 6. Data Formatting
+        uint32_t total_bytes = sessionData[i].tx_bytes + sessionData[i].rx_bytes;
+        char totStr[10];
         formatTotalUnit(total_bytes, totStr, sizeof(totStr));
 
-        // Packs into a rigid 9-character string like: "999K|2.4G"
-        char trafficCombo[20];
-        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr);
-
-        // --- THE 52-CHARACTER ALIGNMENT MAGIC ---
-        // %3d.     : Index (4 chars)
-        // %-18.18s : Left-justified Vendor (18 chars)
-        // %13s     : Right-justified Age (13 chars)
-        // %9s      : Right-justified TX|RX Combo (9 chars)
-        // %5s      : Right-justified Total Unit (5 chars)
-        // Plus 3 hardcoded spaces = 52 characters total.
-        char line1[90];
-        snprintf(line1, sizeof(line1), "%3d.%-18.18s %13s %9s %5s", 
-                 (i + 1), short_vendor, ageCombo, trafficCombo, totStr);
+        // Format TX and RX using your specific helper
+        char txStr[6], rxStr[6];
+        formatShortUnit(sessionData[i].tx_bytes, txStr, sizeof(txStr));
+        formatShortUnit(sessionData[i].rx_bytes, rxStr, sizeof(rxStr));
         
-        // --- Format Line 2: Indented 1 extra space to align under Vendor ---
-        char line2[90]; 
-        snprintf(line2, sizeof(line2), "     %s   %4d  %3d  %6.0f  %3.0f%%", 
-                 macStr, sessionData[i].rssi, sessionData[i].rate, mean, cv_percent);
+        char trafficCombo[12];
+        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); // 9 chars exactly
 
+        // ==========================================
+        // 52-CHARACTER LINE RENDERING
+        // ==========================================
+        
+        // LINE 1: Index (4), Vendor (18), MAC (17), RSSI (4), Total (5)
+        snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
+                 (i + 1), safeVendor, macStr, sessionData[i].rssi, totStr);
+
+        // LINE 2: Indent (4), Age (13), Dist (5), Rate (4), Mean (6), CV (5), TX|RX (9)
+        // Example output: "    00h05m|01h20m   12m 144M  1500B   50%  12M| 50K"
+        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d %5.0fB %4.0f%%   %9s", 
+                 ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
+                 mean, cv_percent, trafficCombo);
+
+        // --- DRAW TO SCREEN ---
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line1, 5, y);
+        
         tft.setTextColor(TFT_LIGHTGREY);
         tft.setFreeFont(&UbuntuMono_RI9pt7b);
-        tft.drawString(line2, 5, y + 15); 
-        tft.setTextColor(TFT_WHITE); 
-      
+        tft.drawString(line2, 5, y + 15);
+        tft.setTextColor(TFT_WHITE);      
       } else {
         // ==========================================
-        // BLE MODE (Unchanged layout)
+        // BLE MODE - JIT TRANSLATION & DISPLAY
         // ==========================================
         char line1[90];
         char safeName[20];
         
-        if (strlen(sessionBleData[i].name) == 0) {
-            snprintf(safeName, sizeof(safeName), "%-19.19s", "<Unnamed>");
+        // Use the raw memory check since we removed strings
+        if (sessionBleData[i].name[0] == '\0') {
+            snprintf(safeName, sizeof(safeName), "%-18.18s", "<Unnamed>");
         } else {
-            snprintf(safeName, sizeof(safeName), "%-19.19s", sessionBleData[i].name);
+            snprintf(safeName, sizeof(safeName), "%-18.18s", sessionBleData[i].name);
         }
 
+        // --- TIMESTAMPS ---
         char firstSeenStr[8];
         char lastSeenStr[8];
         getAgeString(sessionBleData[i].firstSeen, firstSeenStr, sizeof(firstSeenStr));
         getAgeString(sessionBleData[i].lastSeen, lastSeenStr, sizeof(lastSeenStr));
 
         char ageCombo[16];
-        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr);
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); // e.g. "00h05m|01h20m"
 
+        // --- JIT OSINT TRANSLATION (ENUMS TO STRINGS) ---
+        const char* trackerStr = "";
+        switch (sessionBleData[i].trackerType) {
+            case TRACKER_APPLE_FINDMY: trackerStr = "Apple: Find My"; break;
+            case TRACKER_APPLE_IBEACON: trackerStr = "Apple: iBeacon"; break;
+            case TRACKER_GOOGLE_FASTPAIR: trackerStr = "Google: FastPair"; break;
+            case TRACKER_SAMSUNG_SMARTTAG: trackerStr = "Samsung: SmartTag"; break;
+            case TRACKER_TILE: trackerStr = "Tile Tracker"; break;
+            case TRACKER_MS_SWIFTPAIR: trackerStr = "MS: Swift Pair"; break;
+            case TRACKER_EDDYSTONE: trackerStr = "Eddystone"; break;
+            default: trackerStr = ""; break;
+        }
+
+        // Resolve 16-bit IDs using your existing helper functions
+        std::string appStr = resolveBleAppearance(sessionBleData[i].appearanceId);
+        std::string srvStr = resolveBleServiceUuid(sessionBleData[i].serviceId);
+
+        // --- 1. BUILD THE STANDARD OSINT STRING ---
         std::string tagStr = "";
-        if (strlen(sessionBleData[i].trackerData) > 0) {
-            tagStr += sessionBleData[i].trackerData;
+        
+        // Only append the trackerStr to Line 2 if it ISN'T already being used as the Name on Line 1!
+        if (strlen(trackerStr) > 0 && sessionBleData[i].namePriority != 1) {
+            tagStr += trackerStr;
         }
-        if (strlen(sessionBleData[i].appearance) > 0) {
-            tagStr += (tagStr.length() > 0 ? "|" : "") + std::string(sessionBleData[i].appearance);
+        
+        if (appStr != "") {
+            tagStr += (tagStr.length() > 0 ? "|" : "") + appStr;
         }
-        if (strlen(sessionBleData[i].service) > 0) {
-            tagStr += (tagStr.length() > 0 ? "|" : "") + std::string(sessionBleData[i].service);
+        if (srvStr != "") {
+            tagStr += (tagStr.length() > 0 ? "|" : "") + srvStr;
         }
 
-        if (tagStr == "") tagStr = "No Data";
+        // --- 2. THE MULTIPLEXING FALLBACK ---
+        // If standard tags are completely empty, check the payload bucket!
+        if (tagStr == "") {
+            if (sessionBleData[i].payload[0] != '\0') {
+                // If it's an iBeacon, prepend the tracker name for context
+                if (sessionBleData[i].trackerType == TRACKER_APPLE_IBEACON) {
+                    tagStr = "iBeacon | " + std::string(sessionBleData[i].payload);
+                } else {
+                    // Otherwise, dump the Eddystone URL, telemetry, or Raw Hex
+                    tagStr = sessionBleData[i].payload; 
+                }
+            } else {
+                // If literally nothing exists, use the ultimate fallback
+                tagStr = "No Data"; 
+            }
+        }
         
+        // --- 3. CLEAN AND FORMAT ---
         cleanOsintString(tagStr); // Ensure your helper function stays in play!
 
-        if (tagStr.length() > 32) {
-            tagStr = tagStr.substr(0, 29) + "...";
-        }
-
+        // --- MAC STRING ---
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
                  sessionBleData[i].mac[0], sessionBleData[i].mac[1], sessionBleData[i].mac[2], 
                  sessionBleData[i].mac[3], sessionBleData[i].mac[4], sessionBleData[i].mac[5]);
 
-        snprintf(line1, sizeof(line1), "%d.%s %-13s %4d %4.0fm %4d", 
+        // ==========================================
+        // 52-CHARACTER LINE RENDERING
+        // ==========================================
+        
+        // LINE 1: Index, Name, AgeCombo, RSSI, Distance, Hits
+        snprintf(line1, sizeof(line1), "%2d.%-18.18s %13s %4d %4.0fm %5u", 
                  (i + 1), safeName, ageCombo, sessionBleData[i].rssi, 
                  sessionBleData[i].smoothedDistance, sessionBleData[i].hits);
 
+        // LINE 2: MAC (17 chars), Margin (2 spaces), TagStr (up to 33 chars now)
+        // Notice the leading spaces have been completely removed.
         char line2[90];
-        snprintf(line2, sizeof(line2), "    %s  %s", macStr, tagStr.c_str());
+        snprintf(line2, sizeof(line2), "%17s  %-33.33s", macStr, tagStr.c_str());
 
+        // --- DRAW TO SCREEN ---
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line1, 5, y);
+        
         tft.setTextColor(TFT_LIGHTGREY);
         tft.setFreeFont(&UbuntuMono_RI9pt7b);
         tft.drawString(line2, 5, y + 15);
-        tft.setTextColor(TFT_WHITE); 
+        tft.setTextColor(TFT_WHITE);
       }
       row++;
     }
@@ -1254,143 +1416,83 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
     std::string macStr = advertisedDevice->getAddress().toString();
     
     // ==========================================
-    // RAW PACKET HEX DUMP (DEBUG)
+    // ON-THE-FLY RAW HEX DUMP (No SRAM Storage)
     // ==========================================
-    uint8_t* payload = advertisedDevice->getPayload();
-    size_t payloadLength = advertisedDevice->getPayloadLength();
+    uint8_t* rawPayload = advertisedDevice->getPayload();
+    size_t payloadLen = advertisedDevice->getPayloadLength();
 
-    std::string rawDump = "RAW ADV [" + macStr + "] (" + std::to_string(payloadLength) + "b): ";
+    Serial.printf("RAW [%02d bytes] MAC: %s | ", payloadLen, advertisedDevice->getAddress().toString().c_str());
     
-    for (size_t i = 0; i < payloadLength; i++) {
-      char hex[4];
-      snprintf(hex, sizeof(hex), "%02X ", payload[i]);
-      rawDump += hex;
+    for (size_t p = 0; p < payloadLen; p++) {
+        Serial.printf("%02X ", rawPayload[p]);
     }
-    
-    Serial.println(rawDump.c_str());
+    Serial.println();
     // ==========================================
     
     int rssi = advertisedDevice->getRSSI();
-    
-    // Extract TX Power safely, defaulting to 0 if not present
     int txPower = advertisedDevice->haveTXPower() ? advertisedDevice->getTXPower() : 0;
     int sdCount = advertisedDevice->getServiceDataCount();
 
-    #if 0
-    // ==========================================
-    // THE ULTIMATE BLE REALITY CHECK
-    // ==========================================
-    bool hasValuableData = false;
-    std::string dumpStr = "MAC: " + macStr;
-
-    if (advertisedDevice->haveTXPower()) {
-      dumpStr += " | TX: " + std::to_string(txPower) + "dBm";
-      hasValuableData = true;
-    }
-
-    if (advertisedDevice->haveAppearance()) {
-      char appStr[16];
-      snprintf(appStr, sizeof(appStr), " | App: 0x%04X", advertisedDevice->getAppearance());
-      dumpStr += appStr;
-      hasValuableData = true;
-    }
-
-    if (advertisedDevice->haveServiceUUID()) {
-      dumpStr += " | UUID: " + advertisedDevice->getServiceUUID().toString();
-      hasValuableData = true;
-    }
-
-    if (sdCount > 0) {
-      dumpStr += " | Telemetry: ";
-      for (int k = 0; k < sdCount; k++) { 
-        NimBLEUUID sdUUID = advertisedDevice->getServiceDataUUID(k);
-        std::string sData = advertisedDevice->getServiceData(k);
-        
-        dumpStr += "[" + sdUUID.toString() + "] ";
-        for (size_t j = 0; j < sData.length(); j++) {
-          char hex[4];
-          snprintf(hex, sizeof(hex), "%02X ", (uint8_t)sData[j]);
-          dumpStr += hex;
-        }
-      }
-      hasValuableData = true;
-    }
-
-    // Manufacturer Specific Data (0xFF) HEX DUMP
-    if (advertisedDevice->haveManufacturerData()) {
-      dumpStr += " | Mfg (0xFF): ";
-      std::string mfgData = advertisedDevice->getManufacturerData();
-      
-      for (size_t j = 0; j < mfgData.length(); j++) {
-        char hex[4];
-        snprintf(hex, sizeof(hex), "%02X ", (uint8_t)mfgData[j]);
-        dumpStr += hex;
-      }
-      hasValuableData = true;
-    }
-
-    if (hasValuableData) {
-      Serial.println(dumpStr.c_str());
-    }
-    #endif
     // ==========================================
     // PARALLEL OSINT EXTRACTION & SIG LOOKUPS
     // ==========================================
     std::string newName = "";
-    std::string newTrackerData = "";
-    std::string newAppearance = "";
-    std::string newService = "";
+    uint8_t newNamePriority = 0;
+    // The new, memory-efficient IDs
+    uint8_t newTrackerType = TRACKER_NONE; 
+    uint16_t newAppearanceId = 0;          
+    uint16_t newServiceId = 0;
 
     // ==========================================
     // STEP 1: Name & Manufacturer Data (0xFF)
     // ==========================================
-    // 1A. Try to get the broadcasted Local Name first
     if (advertisedDevice->haveName()) {
       newName = advertisedDevice->getName();
     } 
     
-    // 1B. ALWAYS check for Manufacturer Data, even if a Name was found!
     if (advertisedDevice->haveManufacturerData()) {
       std::string mfg = advertisedDevice->getManufacturerData();
       if (mfg.length() >= 2) {
         uint16_t companyId = (uint8_t)mfg[1] << 8 | (uint8_t)mfg[0];
-        
-        // Resolve the company name once to use in both catch-alls
         std::string resolvedCompany = resolveBleCompanyId(mfg);
         
-        // --- HIGH-VALUE OSINT INTERCEPTS (Human Readable) ---
-        if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x12) newTrackerData = "Apple: Find My";
-        else if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x02) newTrackerData = "Apple: iBeacon";
-        else if (companyId == 0x00E0 && mfg.length() >= 3 && mfg[2] == 0xFC) newTrackerData = "Google: Fast Pair";
-        else if (companyId == 0x000D) newTrackerData = "Tile Tracker";
-        else if (companyId == 0x0075 && mfg.length() >= 3 && mfg[2] == 0x42) newTrackerData = "Samsung: SmartTag";
-        else if (companyId == 0x0075 && mfg.length() >= 3 && mfg[2] == 0x43) newTrackerData = "Samsung: SmartTag+";
-        else if (companyId == 0x0006 && mfg.length() >= 3 && mfg[2] == 0x09) newTrackerData = "MS: Swift Pair";
+        // --- HIGH-VALUE OSINT INTERCEPTS ---
+        if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x12) newTrackerType = TRACKER_APPLE_FINDMY;
+        else if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x02) newTrackerType = TRACKER_APPLE_IBEACON;
+        else if (companyId == 0x00E0 && mfg.length() >= 3 && mfg[2] == 0xFC) newTrackerType = TRACKER_GOOGLE_FASTPAIR;
+        else if (companyId == 0x000D) newTrackerType = TRACKER_TILE;
+        else if (companyId == 0x0075 && mfg.length() >= 3 && mfg[2] == 0x42) newTrackerType = TRACKER_SAMSUNG_SMARTTAG;
+        else if (companyId == 0x0006 && mfg.length() >= 3 && mfg[2] == 0x09) newTrackerType = TRACKER_MS_SWIFTPAIR;
         
-        // --- THE GENERIC CATCH-ALL (Dynamic Hex Tagging) ---
-        else {
-            if (resolvedCompany != "") {
+        // --- PRIORITY 1: TARGETED COMPANY NAME FALLBACK ---
+        if (newName == "" && resolvedCompany != "") {
+            
+            // 1. If we successfully resolved the protocol, promote it to the Name slot!
+            if (newTrackerType == TRACKER_APPLE_FINDMY) newName = "Apple Find My";
+            else if (newTrackerType == TRACKER_APPLE_IBEACON) newName = "Apple iBeacon";
+            else if (newTrackerType == TRACKER_GOOGLE_FASTPAIR) newName = "Google FastPair";
+            else if (newTrackerType == TRACKER_SAMSUNG_SMARTTAG) newName = "Samsung SmartTag";
+            else if (newTrackerType == TRACKER_TILE) newName = "Tile Tracker";
+            else if (newTrackerType == TRACKER_MS_SWIFTPAIR) newName = "MS Swift Pair";
+            
+            // 2. If it is an unknown proprietary protocol, leave the hex diagnostic!
+            else {
                 if (mfg.length() >= 3) {
-                    char trackerStr[20];
-                    snprintf(trackerStr, sizeof(trackerStr), "%s:0x%02X", 
+                    char fallbackName[25];
+                    snprintf(fallbackName, sizeof(fallbackName), "%s:0x%02X", 
                              resolvedCompany.substr(0, 12).c_str(), (uint8_t)mfg[2]);
-                    newTrackerData = trackerStr;
+                    newName = fallbackName;
                 } else {
-                    newTrackerData = resolvedCompany.substr(0, 19);
+                    newName = resolvedCompany.substr(0, 24);
                 }
             }
-        }
-
-        // --- TARGETED COMPANY NAME FALLBACK ---
-        // If the device hid its local name, but we know the company, promote the company to the Name column!
-        if (newName == "" && resolvedCompany != "") {
-            newName = resolvedCompany;
+            newNamePriority = 1; // Secure the Priority Rank!
         }
       }
     }
 
     // ==========================================
-    // STEP 2: Corporate Trackers & Eddystone (0x16 Service Data)
+    // STEP 2: Corporate Trackers & Eddystone (0x16)
     // ==========================================
     for (int k = 0; k < sdCount; k++) {
       NimBLEUUID sdUUID = advertisedDevice->getServiceDataUUID(k);
@@ -1398,75 +1500,39 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
       if (sdUUID.bitSize() == 16) {
         uint16_t uuid16 = sdUUID.getNative()->u16.value;
         
-        // --- THE EDDYSTONE INTERCEPT ---
+        // THE EDDYSTONE INTERCEPT
         if (uuid16 == 0xFEAA) {
-          std::string url = decodeEddystoneURL(advertisedDevice->getServiceData(k));
-          
-          // If Step 1 already found a high-value corporate tag (like "Samsung: SmartTag"),
-          // do NOT overwrite it. Instead, safely append the URL!
-          if (newTrackerData != "" && newTrackerData.find("0x") == std::string::npos) {
-              newTrackerData = newTrackerData + " | " + url; 
-          } else {
-              // It is safe to overwrite if the string is empty or just generic Hex
-              newTrackerData = url; 
+          newTrackerType = TRACKER_EDDYSTONE;
+          // If we don't have a name, promote the URL to the name column
+          if (newName == "") {
+              newName = decodeEddystoneURL(advertisedDevice->getServiceData(k)).substr(0, 24);
           }
           break; 
         }
 
-        std::string memberName = resolveBleMemberUuid(uuid16);
-        
-        if (memberName != "") {
-          // Only overwrite if Step 1 didn't find something more specific
-          if (newTrackerData == "" || newTrackerData.find("0x") != std::string::npos) {
-              newTrackerData = memberName;
-          }
-          break;
-        } else if (newTrackerData == "") {
-          char hexFallback[16];
-          snprintf(hexFallback, sizeof(hexFallback), "0x%04X", uuid16);
-          newTrackerData = hexFallback;
+        // If it's a generic 16-bit service data, save it so the UI can resolve the Member Name later
+        if (newServiceId == 0) {
+            newServiceId = uuid16; 
         }
       } 
-      // 128-bit Service Data Fallback (Proprietary IoT / Beacons)
-      else if (sdUUID.bitSize() == 128 && newTrackerData == "") {
-        std::string fullUUID = sdUUID.toString();
-        newTrackerData = "SD: " + fullUUID.substr(0, 8);
-      }
     }
 
     // ==========================================
     // STEP 3: Appearance (0x19)
     // ==========================================
+    // No more strings! Just grab the raw ID.
     if (advertisedDevice->haveAppearance()) {
-      uint16_t appCode = advertisedDevice->getAppearance();
-      newAppearance = resolveBleAppearance(appCode);
-      
-      if (newAppearance == "") {
-        char hexFallback[16];
-        snprintf(hexFallback, sizeof(hexFallback), "0x%04X", appCode);
-        newAppearance = hexFallback;
-      }
+      newAppearanceId = advertisedDevice->getAppearance();
     } 
 
     // ==========================================
     // STEP 4: Standard Services (0x02/0x03)
     // ==========================================
+    // Grab the first 16-bit Service UUID we find
     if (advertisedDevice->haveServiceUUID()) {
       NimBLEUUID sUUID = advertisedDevice->getServiceUUID();
-      if (sUUID.bitSize() == 16) {
-        uint16_t uuid16 = sUUID.getNative()->u16.value;
-        newService = resolveBleServiceUuid(uuid16);
-        
-        if (newService == "") {
-          char hexFallback[16];
-          snprintf(hexFallback, sizeof(hexFallback), "0x%04X", uuid16);
-          newService = hexFallback;
-        }
-      }
-      // 128-bit Custom Hardware UUIDs
-      else if (sUUID.bitSize() == 128) {
-        std::string fullUUID = sUUID.toString();
-        newService = "Custom: " + fullUUID.substr(0, 8);
+      if (sUUID.bitSize() == 16 && newServiceId == 0) {
+        newServiceId = sUUID.getNative()->u16.value;
       }
     }
 
@@ -1475,59 +1541,45 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
     // ==========================================
     const uint8_t* rawMac = advertisedDevice->getAddress().getNative();
     bool found = false;
+    
     for (int i = 0; i < liveBleCount; i++) {
       if (memcmp((void*)(uint8_t*)liveBleData[i].mac, rawMac, 6) == 0) {
         liveBleData[i].hits++;
         liveBleData[i].lastSeen = millis();
         liveBleData[i].rssi = rssi;
-        
-        // Ensure the live buffer holds the latest txPower for the loop() to use!
         liveBleData[i].txPower = txPower; 
 
-        // Update OSINT fields if new data arrived this advertisement
+        // Safely update the Name string if a new one arrived
         if (newName != "") {
           strncpy((char*)liveBleData[i].name, newName.c_str(), 24);
           liveBleData[i].name[24] = '\0';
         }
-        if (newTrackerData != "") {
-          strncpy((char*)liveBleData[i].trackerData, newTrackerData.c_str(), 19);
-          liveBleData[i].trackerData[19] = '\0';
-        }
-        if (newAppearance != "") {
-          strncpy((char*)liveBleData[i].appearance, newAppearance.c_str(), 19);
-          liveBleData[i].appearance[19] = '\0';
-        }
-        if (newService != "") {
-          strncpy((char*)liveBleData[i].service, newService.c_str(), 19);
-          liveBleData[i].service[19] = '\0';
-        }
+        
+        // Update IDs if we found new ones
+        if (newTrackerType != TRACKER_NONE) liveBleData[i].trackerType = newTrackerType;
+        if (newAppearanceId != 0) liveBleData[i].appearanceId = newAppearanceId;
+        if (newServiceId != 0) liveBleData[i].serviceId = newServiceId;
 
         found = true;
         break;
       }
     }
 
-    // Add New Device to live buffer
+    // Add New Device to the live buffer
     if (!found && liveBleCount < MAX_BLE_DEVICES) {
       memcpy((void*)(uint8_t*)liveBleData[liveBleCount].mac, rawMac, 6);
 
       strncpy((char*)liveBleData[liveBleCount].name, newName.c_str(), 24);
       liveBleData[liveBleCount].name[24] = '\0';
 
-      strncpy((char*)liveBleData[liveBleCount].trackerData, newTrackerData.c_str(), 19);
-      liveBleData[liveBleCount].trackerData[19] = '\0';
-
-      strncpy((char*)liveBleData[liveBleCount].appearance, newAppearance.c_str(), 19);
-      liveBleData[liveBleCount].appearance[19] = '\0';
-
-      strncpy((char*)liveBleData[liveBleCount].service, newService.c_str(), 19);
-      liveBleData[liveBleCount].service[19] = '\0';
+      // Drop the integers directly into the struct
+      liveBleData[liveBleCount].trackerType = newTrackerType;
+      liveBleData[liveBleCount].appearanceId = newAppearanceId;
+      liveBleData[liveBleCount].serviceId = newServiceId;
 
       liveBleData[liveBleCount].rssi = rssi;
       liveBleData[liveBleCount].hits = 1;
-      liveBleData[liveBleCount].txPower = txPower; // Loop needs this!
-      
-      // Removed the smoothedDistance initialization here.
+      liveBleData[liveBleCount].txPower = txPower; 
       
       liveBleData[liveBleCount].firstSeen = millis();
       liveBleData[liveBleCount].lastSeen = millis();
@@ -1882,6 +1934,7 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
   drawChartHeader();
+  drawChartFooter();
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_promiscuous(true);
@@ -1905,6 +1958,28 @@ void setup() {
   Serial.println("----------------------------\n");
 }
 
+double getSortMetric(MacRecord& record, SortMode mode) {
+    switch(mode) {
+        case SORT_TOTAL: 
+            return (double)(record.tx_bytes + record.rx_bytes);
+        case SORT_TX:    
+            return (double)record.tx_bytes;
+        case SORT_RX:    
+            return (double)record.rx_bytes;
+        case SORT_AVG:   
+            return (record.packets > 0) ? ((double)record.sum_bytes / record.packets) : 0.0;
+        case SORT_CV:
+            if (record.packets == 0) return 0.0;
+            double mean = (double)record.sum_bytes / record.packets;
+            if (mean == 0) return 0.0;
+            double avg_sq_sum = (double)record.sum_sq_bytes / record.packets;
+            double variance = avg_sq_sum - (mean * mean);
+            if (variance < 0) variance = 0;
+            return (sqrt(variance) / mean) * 100.0;
+    }
+    return 0.0;
+}
+
 void loop() {
   processPendingVendors();
   uint16_t t_x = 0, t_y = 0;
@@ -1912,8 +1987,11 @@ void loop() {
 
   if (pressed) {
 
+    // ==========================================
     // 1. CHART SCREEN TOUCH LOGIC
+    // ==========================================
     if (currentState == SCREEN_CHART) {
+      // TOP RIGHT: Menu Button
       if (t_x > 400 && t_y < 40) {
         currentState = SCREEN_MENU;
         pause_sniffing = true;
@@ -1921,52 +1999,81 @@ void loop() {
         drawMenu();
         delay(300);
       }
+      
+      // BOTTOM FOOTER: Live Data Controls (Y > 295)
+      else if (t_y > 295) {
+        // ZONE 1 (Left 0-160): SORT METRIC
+        if (t_x < 160) {
+          if (currentRadioMode == RADIO_WIFI) {
+            // Cycle Wi-Fi Modes: TOTAL -> TX -> RX -> AVG -> CV -> TOTAL
+            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;
+            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;
+            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;
+            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;
+            else currentSortMode = SORT_TOTAL;
+          } else {
+            // Cycle BLE Modes: HITS -> DIST -> HITS
+            if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
+            else currentBleSortMode = SORT_BLE_HITS;
+          }
+          delay(200); // Fast debounce for rapid tapping
+        }
+        
+        // ZONE 2 (Center 160-320): SORT DIRECTION (ASC/DESC)
+        else if (t_x >= 160 && t_x <= 320) {
+          sort_descending = !sort_descending;
+          delay(200);
+        }
+        
+        // ZONE 3 (Right 320-480): LOG/LINEAR SCALE
+        else if (t_x > 320) {
+          useLogScale = !useLogScale;
+          delay(200);
+        }
+      }
     }
 
+    // ==========================================
     // 2. MENU SCREEN TOUCH LOGIC
+    // ==========================================
     else if (currentState == SCREEN_MENU) {
-      if (t_x > 50 && t_x < 250 && t_y > 90 && t_y < 130) {
-        useLogScale = !useLogScale;
-        drawMenu();
-        delay(300);
-      }
-      else if (t_x > 50 && t_x < 250 && t_y > 140 && t_y < 180) {
-        sort_descending = !sort_descending;
-        drawMenu();
-        delay(300);
-      }
-      // Probe Request Tracker Button Touch Zone
-      else if (t_x > 300 && t_x < 450 && t_y > 140 && t_y < 180) {
+      // (Sort and Log buttons removed from here!)
+      
+      // Probe Request Tracker Button
+      if (t_x > 300 && t_x < 450 && t_y > 140 && t_y < 180) {
         currentState = SCREEN_PROBE_TRACKER;
         probe_current_page = 0; 
         drawProbeTracker();
         delay(300); 
       }
-      // 3. AP Scanner Button (X: 50-250, Y: 190-230)
+      // AP Scanner Button
       else if (t_x > 50 && t_x < 250 && t_y > 190 && t_y < 230) {
-        // NEW SAFETY CHECK: Only respond if Wi-Fi is the active radio!
         if (currentRadioMode == RADIO_WIFI) {
           currentState = SCREEN_AP_SCAN;
           drawApScanner();
           delay(300);
         }
       }
+      // Seen Devices Button
       else if (t_x > 50 && t_x < 250 && t_y > 240 && t_y < 280) {
         currentState = SCREEN_DEVICE_LIST;
         device_current_page = 0;
         drawDeviceList();
         delay(300);
       }
+      // Radio Mode Toggle (BLE/WIFI)
       else if (t_x > 300 && t_x < 450 && t_y > 190 && t_y < 230) {
         if (currentRadioMode == RADIO_WIFI) switchRadioMode(RADIO_BLE);
         else switchRadioMode(RADIO_WIFI);
         drawMenu();
         delay(300);
       }
+      // Exit Menu -> Return to Chart
       else if (t_x > 300 && t_x < 450 && t_y > 240 && t_y < 280) {
         currentState = SCREEN_CHART;
         tft.fillScreen(TFT_BLACK);
         drawChartHeader();
+        drawChartFooter();
         if (currentRadioMode == RADIO_WIFI) {
           if (target_locked) esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
           esp_wifi_set_promiscuous(true);
@@ -1977,7 +2084,9 @@ void loop() {
       }
     }
 
-    // 4. OSINT PROBE TRACKER TOUCH LOGIC
+    // ==========================================
+    // 3. OSINT PROBE TRACKER TOUCH LOGIC
+    // ==========================================
     else if (currentState == SCREEN_PROBE_TRACKER) {
       // Check for navigation footer clicks (Y: 260 to bottom)
       if (t_y > 260) {
@@ -2014,6 +2123,7 @@ void loop() {
         currentState = SCREEN_CHART;
         tft.fillScreen(TFT_BLACK);
         drawChartHeader();
+        drawChartFooter();
         delay(300);
       }
       
@@ -2063,12 +2173,13 @@ void loop() {
           currentState = SCREEN_CHART;
           tft.fillScreen(TFT_BLACK);
           drawChartHeader();
+          drawChartFooter();
           delay(300);
         }
       }
     }
 
-// 4. SEEN DEVICES TOUCH LOGIC
+    // 4. SEEN DEVICES TOUCH LOGIC
     else if (currentState == SCREEN_DEVICE_LIST) {
       if (t_y > 260) { // Changed to 260 to perfectly match the new Y-coordinate layout
         int total_devices = (currentRadioMode == RADIO_WIFI) ? sessionMacCount : sessionBleCount;
@@ -2156,7 +2267,7 @@ void loop() {
     if (should_render) {
       pause_sniffing = true; 
       
-     if (currentRadioMode == RADIO_WIFI) {
+if (currentRadioMode == RADIO_WIFI) {
         // ==========================================
         // 1. WI-FI DATA PROCESSING PIPELINE
         // ==========================================
@@ -2188,7 +2299,7 @@ void loop() {
               sessionData[j].rssi = liveData[i].rssi;
               sessionData[j].rate = liveData[i].rate;
               sessionData[j].last_seen = liveData[i].last_seen;
-              //sessionData[j].last_seen = millis(); // Keep the timestamp fresh!
+              
               // EMA Distance Filter
               if (rawDistance > 0) {
                   sessionData[j].smoothedDistance = 
@@ -2200,34 +2311,36 @@ void loop() {
             }
           }
           
-          // B. If it's a completely new MAC, claim a new slot
+          // B. If it's a completely new MAC, claim a new slot OR Evict
           if (!found) {
+            int targetIndex = 0;
+
             if (sessionMacCount < MAX_MACS) {
-              // Copy the MAC address safely
-              memcpy(sessionData[sessionMacCount].mac, (void*)(uint8_t*)liveData[i].mac, 6);
-              
-              // Transfer metrics line-by-line to bypass volatile errors
-              sessionData[sessionMacCount].packets = liveData[i].packets;
-              sessionData[sessionMacCount].tx_bytes = liveData[i].tx_bytes;
-              sessionData[sessionMacCount].rx_bytes = liveData[i].rx_bytes;
-              sessionData[sessionMacCount].sum_bytes = liveData[i].sum_bytes;
-              sessionData[sessionMacCount].sum_sq_bytes = liveData[i].sum_sq_bytes;
-              sessionData[sessionMacCount].rssi = liveData[i].rssi;
-              sessionData[sessionMacCount].rate = liveData[i].rate;
-              
-              // Critical flags and Initial Timestamp
-              sessionData[sessionMacCount].vendorFound = liveData[i].vendorFound;
-              sessionData[sessionMacCount].vendor[0] = '\0'; // Guarantee a clean string
-              sessionData[sessionMacCount].first_seen = liveData[i].first_seen;
-              sessionData[sessionMacCount].last_seen = liveData[i].last_seen;
-              sessionData[sessionMacCount].smoothedDistance = rawDistance > 0 ? rawDistance : 0.0;
+              // 1. We have empty space, use it!
+              targetIndex = sessionMacCount;
               sessionMacCount++;
             } else {
-              // Master array is full, dump it to the overflow bucket dynamically
-              sessionOtherBytes += (liveData[i].tx_bytes + liveData[i].rx_bytes);
+              // 2. Memory is full, execute LRU Eviction!
+              uint32_t oldestTime = 0xFFFFFFFF; 
+              for (int k = 0; k < MAX_MACS; k++) {
+                if (sessionData[k].last_seen < oldestTime) {
+                  oldestTime = sessionData[k].last_seen;
+                  targetIndex = k;
+                }
+              }
+              
+              // 3. Overflow Bucket: Dump the evicted device's stats so global totals remain accurate!
+              sessionOtherBytes += (sessionData[targetIndex].tx_bytes + sessionData[targetIndex].rx_bytes);
             }
+
+            // --- POPULATE THE TARGET SLOT ---
+            // 4. Bulk copy the entire raw packet struct into the target index
+            memcpy((void*)&sessionData[targetIndex], (void*)&liveData[i], sizeof(MacRecord));
+            
+            // 5. Inject the math we calculated at the top of the pipeline
+            sessionData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
           }
-        }
+        } // <-- Ends the 'for (int i...)' loop safely!
 
         // Wipe the live buffer clean so the interrupt can refill it
         memset((void*)liveData, 0, sizeof(liveData));
@@ -2238,19 +2351,22 @@ void loop() {
         // 2. SORTING & UI PREPARATION
         // ==========================================
         
-        // --- FAST INSERTION SORT: WI-FI SNAPSHOT ---
+// --- FAST INSERTION SORT: WI-FI SNAPSHOT ---
         for (int i = 1; i < sortMacCount; i++) {
           MacRecord key = sortData[i];
-          uint32_t key_total = key.tx_bytes + key.rx_bytes;
+          
+          // Dynamically grab the correct math based on the touch button!
+          double key_val = getSortMetric(key, currentSortMode); 
           int j = i - 1;
 
           if (sort_descending) {
-            while (j >= 0 && (sortData[j].tx_bytes + sortData[j].rx_bytes) < key_total) {
+            while (j >= 0 && getSortMetric(sortData[j], currentSortMode) < key_val) {
               sortData[j + 1] = sortData[j];
               j = j - 1;
             }
           } else {
-            while (j >= 0 && (sortData[j].tx_bytes + sortData[j].rx_bytes) > key_total && key_total > 0) {
+            // Preserved safety catch: keeps 0-value items at the bottom!
+            while (j >= 0 && getSortMetric(sortData[j], currentSortMode) > key_val && key_val > 0.0) {
               sortData[j + 1] = sortData[j];
               j = j - 1;
             }
@@ -2261,16 +2377,19 @@ void loop() {
         // --- FAST INSERTION SORT: WI-FI SESSION ---
         for (int i = 1; i < sessionMacCount; i++) {
           MacRecord key = sessionData[i];
-          uint32_t key_total = key.tx_bytes + key.rx_bytes;
+          
+          // Dynamically grab the correct math based on the touch button!
+          double key_val = getSortMetric(key, currentSortMode); 
           int j = i - 1;
 
           if (sort_descending) {
-            while (j >= 0 && (sessionData[j].tx_bytes + sessionData[j].rx_bytes) < key_total) {
+            while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) < key_val) {
               sessionData[j + 1] = sessionData[j];
               j = j - 1;
             }
           } else {
-            while (j >= 0 && (sessionData[j].tx_bytes + sessionData[j].rx_bytes) > key_total && key_total > 0) {
+            // Preserved safety catch: keeps 0-value items at the bottom!
+            while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) > key_val && key_val > 0.0) {
               sessionData[j + 1] = sessionData[j];
               j = j - 1;
             }
@@ -2278,13 +2397,19 @@ void loop() {
           sessionData[j + 1] = key;
         }
 
-        // Calculate "Other" for the live view 
-        sortOtherBytes = 0; 
+        // ==========================================
+        // Calculate "Other" for the live waterfall chart
+        // ==========================================
+        // 1. Start with any packets that overflowed the buffer entirely
+        sortOtherBytes = liveOtherBytes; 
+        
+        // 2. Add the TOTAL BYTES of everything from index 8 onwards, 
+        //    regardless of what metric the array is currently sorted by!
         for(int i = 8; i < sortMacCount; i++) {
           sortOtherBytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
         }
 
-        // Attempt Vendor Resolution for the top 8 visible devices
+        // 3. Attempt Vendor Resolution for ONLY the top 8 visible devices
         for(int i = 0; i < 8 && i < sortMacCount; i++) {
           resolveMacVendor(&sortData[i]);
         }
@@ -2300,6 +2425,7 @@ void loop() {
         for (int i = 0; i < liveBleCount; i++) {
           bool found = false;
           float rawDistance = calculateRfDistance(liveBleData[i].rssi, liveBleData[i].txPower, RADIO_BLE_24GHZ);
+          
           for (int j = 0; j < sessionBleCount; j++) {
             
             // CRITICAL FIX 1: Use memcmp for raw byte arrays, NOT strcmp!
@@ -2307,6 +2433,7 @@ void loop() {
                 
                 sessionBleData[j].hits += liveBleData[i].hits;
                 sessionBleData[j].rssi = liveBleData[i].rssi;
+                sessionBleData[j].txPower = liveBleData[i].txPower; // Keep the math engine fed with fresh data!
 
                 // CRITICAL FIX 2: Propagate the fresh timestamp from the live buffer!
                 sessionBleData[j].lastSeen = liveBleData[i].lastSeen;
@@ -2317,51 +2444,78 @@ void loop() {
                         (0.2 * rawDistance) + (0.8 * sessionBleData[j].smoothedDistance);
                 }
 
-                // Propagate OSINT fields if the live buffer captured new data
-                if (liveBleData[i].name[0] != '\0')
+                // --- NEW: HYBRID OSINT PROPAGATION ---
+                
+                // 1. Handle the dynamic Name string exactly as you did before
+                if (liveBleData[i].name[0] != '\0') {
                     strncpy((char*)sessionBleData[j].name, (char*)liveBleData[i].name, 24);
-                if (liveBleData[i].trackerData[0] != '\0')
-                    strncpy((char*)sessionBleData[j].trackerData, (char*)liveBleData[i].trackerData, 19);
-                if (liveBleData[i].appearance[0] != '\0')
-                    strncpy((char*)sessionBleData[j].appearance, (char*)liveBleData[i].appearance, 19);
-                if (liveBleData[i].service[0] != '\0')
-                    strncpy((char*)sessionBleData[j].service, (char*)liveBleData[i].service, 19);
+                    sessionBleData[j].name[24] = '\0'; // Guarantee safe termination
+                }
+                
+                // 2. Replace the massive string copies with tiny ID assignments
+                if (liveBleData[i].trackerType != TRACKER_NONE) {
+                    sessionBleData[j].trackerType = liveBleData[i].trackerType;
+                }
+                if (liveBleData[i].appearanceId != 0) {
+                    sessionBleData[j].appearanceId = liveBleData[i].appearanceId;
+                }
+                if (liveBleData[i].serviceId != 0) {
+                    sessionBleData[j].serviceId = liveBleData[i].serviceId;
+                }
 
                 found = true;
                 break;
             }
           }
 
+          // B. If it's a completely new device, claim a new slot OR Evict
           if (!found) {
+            int targetIndex = 0;
+
             if (sessionBleCount < MAX_BLE_DEVICES) {
-              
-              // 1. Bulk copy the entire raw packet struct (MAC, hits, OSINT strings, etc.)
-              memcpy((void*)&sessionBleData[sessionBleCount], (void*)&liveBleData[i], sizeof(BLERecord));
-              
-              // 2. Inject the math we calculated at the top of the pipeline
-              sessionBleData[sessionBleCount].smoothedDistance = rawDistance > 0 ? rawDistance : 0.0;
-              
+              // 1. We have empty space, use it!
+              targetIndex = sessionBleCount;
               sessionBleCount++;
+            } else {
+              // 2. Memory is full, execute LRU Eviction!
+              uint32_t oldestTime = 0xFFFFFFFF; 
+              for (int k = 0; k < MAX_BLE_DEVICES; k++) {
+                // Note: using camelCase lastSeen for BLE struct
+                if (sessionBleData[k].lastSeen < oldestTime) {
+                  oldestTime = sessionBleData[k].lastSeen;
+                  targetIndex = k;
+                }
+              }
+              // (No overflow bucket needed for BLE since we don't track packet byte sizes)
             }
+
+            // --- POPULATE THE TARGET SLOT ---
+            // 3. Bulk copy the entire raw packet struct into the target index
+            memcpy((void*)&sessionBleData[targetIndex], (void*)&liveBleData[i], sizeof(BLERecord));
+            
+            // 4. Inject the math we calculated at the top of the pipeline
+            sessionBleData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
           }
         }
 
+        // Dump the bucket for the next scanning wave
         memset((void*)liveBleData, 0, sizeof(liveBleData));
         liveBleCount = 0;
 
         // --- FAST INSERTION SORT: BLE SNAPSHOT (WATERFALL) ---
         for (int i = 1; i < sortBleCount; i++) {
           BLERecord key = sortBleData[i];
-          uint32_t key_hits = key.hits;
+          double key_val = getBleSortMetric(key, currentBleSortMode);
           int j = i - 1;
 
           if (sort_descending) {
-            while (j >= 0 && sortBleData[j].hits < key_hits) {
+            while (j >= 0 && getBleSortMetric(sortBleData[j], currentBleSortMode) < key_val) {
               sortBleData[j + 1] = sortBleData[j];
               j = j - 1;
             }
           } else {
-            while (j >= 0 && sortBleData[j].hits > key_hits && key_hits > 0) {
+            // Safety catch: explicitly check 'hits' so empty memory slots stay at the bottom
+            while (j >= 0 && getBleSortMetric(sortBleData[j], currentBleSortMode) > key_val && key.hits > 0) {
               sortBleData[j + 1] = sortBleData[j];
               j = j - 1;
             }
@@ -2372,16 +2526,16 @@ void loop() {
         // --- FAST INSERTION SORT: BLE SESSION (SEEN DEVICES) ---
         for (int i = 1; i < sessionBleCount; i++) {
           BLERecord key = sessionBleData[i];
-          uint32_t key_hits = key.hits;
+          double key_val = getBleSortMetric(key, currentBleSortMode);
           int j = i - 1;
 
           if (sort_descending) {
-            while (j >= 0 && sessionBleData[j].hits < key_hits) {
+            while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) < key_val) {
               sessionBleData[j + 1] = sessionBleData[j];
               j = j - 1;
             }
           } else {
-            while (j >= 0 && sessionBleData[j].hits > key_hits && key_hits > 0) {
+            while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) > key_val && key.hits > 0) {
               sessionBleData[j + 1] = sessionBleData[j];
               j = j - 1;
             }
