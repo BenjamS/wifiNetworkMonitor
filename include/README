@@ -1,3 +1,20 @@
+Thanks. I think that worked. Now we have a choice as to which direction to head next. The remaining big features I want to add are 1) FOXHUNT, 2) CHASE TAIL, 3) GLOBAL STATS, and 4) a optional side panel on the waterfall screen where the user can keep tabs on various things in summarized form without taking their eye off the waterfall.
+
+
+When the user presses the FOXHUNT button in the MENU, they will be invited to select the device they want to find from the list of seen devices. Having selected the target, they will then be taken to a screen where they are instructed to stand in the center of the room and hold the Net Trout close to their chest and slowly spin. When the RSSI or DIST suddenly drops significantly, an alert will appear on screen saying that the hunted device is likely behind them.
+
+
+When the user presses the CHASE TAIL button in the MENU, they will be taken to a screen listing devices that have appeared for a while, then disappeared for several minutes, then reappeared, which might suggest that the owners of such devices may be tailing the user. Basically the logic of the "Chase Your Tail" app. This feature could also keep track of things like number of reappearances, average loiter time, average absent time, etc.
+
+
+When the user presses the GLOBAL STATS button in the MENU, they are take to a screen showing 1) a bar chart of packets detected from the most common frame types/subtypes detected (beacons, probe requests, probe responses, data frames, etc., a running tally of which is made just prior to filtering out everything not a data frame); 2) A grid of histograms of Tot B, TX, RX, rssi or distance, Avg B, CV%, and Mbps based on the information in seen devices, with mean and standard deviation displayed for each. 3) A time series plot of the absolute value of total bytes. 4) Log-log scatter plots of device Tot B vs device rank and device Avg B vs. CV%.
+
+
+For the waterfall side panel feature, I'm thinking a button either in MENU or in the waterfall footer that, when pressed, opens a 19 char wide panel on the right, delimited above by the bottom of the legend and below by the footer, listing the top 10 or so sorted device names (or macs if name not resolved) in 7 or 8 pt font and perhaps their sorted variable (which depends on what the user has selected with the SORT BY: XX button). Pressing repeatedly on the panel, the user toggles through the graphics in GLOBAL STATS one by one, until arriving back at the top devices list.
+
+
+That's the vision a grosso modo. Which of these directions do you think we should go in first?
+
 BLE scan is a two part passive and active scan. The passive scan waits for adverts offering to send info. Once received, the NimBLE software sends a response welcoming the info, at which point the device sends it.
 For distance calculations based on RSSI see this method: https://altbeacon.github.io/android-beacon-library/distance-calculations.html
 Distance measurement requires "RSSI dBm at 1 meter". Many BLE device adverts report this but wifi devices do not. When not reported a rough default
