@@ -146,16 +146,27 @@ const int BLE_UPDATE_INTERVAL = 2000;         // Refresh rate for BLE waterfall 
 // NimBLE Global Scanner Pointer
 BLEScan* pBLEScan;
 
-#define MAX_AP_RECORDS 30 // Safe limit for APs
+#define MAX_AP_RECORDS 100 // Bumped from 30! Safely fits inside the Union.
 
 struct ApRecord {
+  // 8-byte types
+  uint64_t sum_bytes;
+  uint64_t sum_sq_bytes;
+
   // 4-byte types
-  uint32_t traffic_bytes; 
-  uint32_t last_seen;     
+  uint32_t first_seen; 
+  uint32_t last_seen;  
+  uint32_t packets;
+  uint32_t tx_bytes;
+  uint32_t rx_bytes;
+  float smoothedDistance;
 
   // 1-byte types & arrays
   uint8_t bssid[6];       
-  char ssid[34];          // Bumped to 34 so the struct aligns perfectly on a 4-byte boundary
+  uint8_t channel;
+  uint8_t max_rate;
+  int8_t rssi;
+  char ssid[31];         // 31 chars locks the struct exactly at 80 bytes
 };
 
 int device_current_page = 0;
@@ -328,7 +339,6 @@ uint8_t getBitrateMbps(wifi_promiscuous_pkt_t *pkt) {
 }
 
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
-// --- The Smart Endpoint Wi-Fi Sniffer Callback ---
 void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (pause_sniffing) return;
   wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
@@ -352,8 +362,6 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       
       // Subtype 8 is a Beacon Frame
       if (subtype == 8) { 
-        
-        // 1. Check if we already know this AP
         int ap_index = -1;
         for (int i = 0; i < liveApCount; i++) {
           if (memcmp((void*)liveApData[i].bssid, addr2, 6) == 0) {
@@ -362,49 +370,83 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           }
         }
         
-        // 2. If it's a new AP, add it to the dictionary
         if (ap_index == -1 && liveApCount < MAX_AP_RECORDS) {
           ap_index = liveApCount;
           memcpy((void*)liveApData[ap_index].bssid, addr2, 6);
-          liveApData[ap_index].traffic_bytes = 0;
+          
+          // Seed the mirrored math!
+          unsigned long now = millis();
+          liveApData[ap_index].first_seen = now;
+          liveApData[ap_index].last_seen = now;
+          liveApData[ap_index].packets = 0;
+          liveApData[ap_index].sum_bytes = 0;
+          liveApData[ap_index].sum_sq_bytes = 0;
+          liveApData[ap_index].tx_bytes = 0;
+          liveApData[ap_index].rx_bytes = 0;
+          liveApData[ap_index].max_rate = 0;
+          liveApData[ap_index].rssi = pkt->rx_ctrl.rssi;
+          liveApData[ap_index].channel = CHANNELS[current_ch_idx]; 
+          
           liveApCount++;
           
-          // 3. Extract the SSID
+          // Safely copy up to 31 chars of SSID
           if (payload[36] == 0) {
             uint8_t ssid_len = payload[37]; 
-            if (ssid_len > 0 && ssid_len <= 32) {
-              // Cast to (char*) for memcpy
+            if (ssid_len > 0 && ssid_len <= 31) {
               memcpy((void*)liveApData[ap_index].ssid, payload + 38, ssid_len);
               liveApData[ap_index].ssid[ssid_len] = '\0';
             } else {
-              // Cast to (char*) for strcpy
               strcpy((char*)liveApData[ap_index].ssid, "<HIDDEN>");
             }
           } else {
-             // Cast to (char*) for strcpy
              strcpy((char*)liveApData[ap_index].ssid, "<UNKNOWN>");
           }
         }
         
-        // Update timestamp so the AP stays alive
-        if (ap_index != -1) liveApData[ap_index].last_seen = millis();
+        if (ap_index != -1) {
+          liveApData[ap_index].last_seen = millis();
+          liveApData[ap_index].rssi = pkt->rx_ctrl.rssi; 
+          liveApData[ap_index].tx_bytes += len; // Beacons are AP transmissions!
+          liveApData[ap_index].packets += 1;
+          liveApData[ap_index].sum_bytes += len;
+          liveApData[ap_index].sum_sq_bytes += ((uint64_t)len * len);
+          uint8_t current_rate = getBitrateMbps(pkt);
+          if (current_rate > liveApData[ap_index].max_rate) {
+              liveApData[ap_index].max_rate = current_rate;
+          }
+        }
       }
     }
 
     // PART 2: THE COUNTER (Catch Data frames to measure volume)
     else if (type == WIFI_PKT_DATA) {
       for (int i = 0; i < liveApCount; i++) {
-        // Is this frame going to or coming from an AP in our dictionary?
-        if (memcmp((void*)liveApData[i].bssid, addr1, 6) == 0 || memcmp((void*)liveApData[i].bssid, addr2, 6) == 0) {
-          liveApData[i].traffic_bytes += len;
+        bool is_tx = (memcmp((void*)liveApData[i].bssid, addr2, 6) == 0);
+        bool is_rx = (memcmp((void*)liveApData[i].bssid, addr1, 6) == 0);
+        
+        if (is_tx || is_rx) {
+          liveApData[i].packets += 1;
+          liveApData[i].sum_bytes += len;
+          liveApData[i].sum_sq_bytes += ((uint64_t)len * len);
+          liveApData[i].rssi = pkt->rx_ctrl.rssi;
           liveApData[i].last_seen = millis();
-          break; // Stop searching once we found the owner
+          
+          // Max Rate Trap: Only update if the new packet is faster!
+          uint8_t current_rate = getBitrateMbps(pkt);
+          if (current_rate > liveApData[i].max_rate) {
+              liveApData[i].max_rate = current_rate;
+          }
+
+          // Route the traffic
+          if (is_tx) liveApData[i].tx_bytes += len;
+          else       liveApData[i].rx_bytes += len;
+          
+          break; 
         }
       }
     }
     
-    // EXIT EARLY: We are in AP Mode. Do not waste CPU running the client tracker below!
-    return; 
+    return; // Returns cleanly from RADIO_AP mode
   }
 
   // ==========================================
@@ -501,7 +543,11 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       liveData[i].sum_bytes += len;
       liveData[i].sum_sq_bytes += ((uint64_t)len * len);
       liveData[i].rssi = pkt->rx_ctrl.rssi;
-      liveData[i].rate = getBitrateMbps(pkt);
+      //liveData[i].rate = getBitrateMbps(pkt);
+      uint8_t current_rate = getBitrateMbps(pkt);
+      if (current_rate > liveData[i].rate) {
+          liveData[i].rate = current_rate;
+      }
       liveData[i].last_seen = millis();
       
       if (is_tx) liveData[i].tx_bytes += len;
@@ -876,7 +922,7 @@ void drawChartHeader() {
   // THE 3-STATE HEADER LOGIC
   // ==========================================
   if (currentRadioMode == RADIO_BLE) {
-    tft.setTextColor(TFT_PURPLE); 
+    tft.setTextColor(TFT_ORANGE); 
     snprintf(bannerStr, sizeof(bannerStr), "BLE MODE | SNIFFING...");
   } 
   else if (currentRadioMode == RADIO_AP) {
@@ -936,6 +982,33 @@ double getSortMetric(MacRecord& record, SortMode mode) {
     return 0.0;
 }
 
+double getSortMetric(ApRecord& record, SortMode mode) {
+    switch(mode) {
+        case SORT_TOTAL: 
+            return (double)(record.tx_bytes + record.rx_bytes);
+        case SORT_TX:    
+            return (double)record.tx_bytes;
+        case SORT_RX:    
+            return (double)record.rx_bytes;
+        case SORT_AVG:   
+            return (record.packets > 0) ? ((double)record.sum_bytes / record.packets) : 0.0;
+        case SORT_CV: {
+            if (record.packets == 0) return 0.0;
+            double mean = (double)record.sum_bytes / record.packets;
+            if (mean == 0) return 0.0;
+            double avg_sq_sum = (double)record.sum_sq_bytes / record.packets;
+            double variance = avg_sq_sum - (mean * mean);
+            if (variance < 0) variance = 0;
+            return (sqrt(variance) / mean) * 100.0;
+        }
+        case SORT_DIST:
+            return (double)record.smoothedDistance; 
+        case SORT_AGE:
+            return (double)record.last_seen; 
+    }
+    return 0.0;
+}
+
 // ==========================================
 // BLE SORTING STATE
 // ==========================================
@@ -975,7 +1048,7 @@ void drawChartFooter() {
 
   char metricStr[32];
   
-  if (currentRadioMode == RADIO_WIFI) {
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
     if (currentSortMode == SORT_TOTAL) {
       strcpy(metricStr, "SORT: TOTAL");
       tft.setTextColor(TFT_WHITE);
@@ -1135,7 +1208,7 @@ void drawApScanner() {
         char temp_ssid[13];
         strncpy(temp_ssid, raw_ssid.c_str(), 12);
         temp_ssid[12] = '\0';
-        snprintf(tactical_ssid, sizeof(tactical_ssid), "%s [%02X%02X]", temp_ssid, bssid[4], bssid[5]);
+        snprintf(tactical_ssid, sizeof(tactical_ssid), "%s~%02X%02X", temp_ssid, bssid[4], bssid[5]);
       } else {
         // Unique network! Give it more characters since we don't need the suffix.
         char temp_ssid[18]; 
@@ -1246,7 +1319,11 @@ void drawDeviceList() {
   // DYNAMIC PAGINATION MATH
   // ==========================================
   int items_per_page = 7; 
-  int total_devices = (currentRadioMode == RADIO_WIFI) ? sessionMacCount : sessionBleCount;
+  int total_devices = 0;
+  
+  if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
+  else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
+  else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
 
   // ==========================================
   // DRAW TOP BANNER (WITH FOXHUNT OVERRIDE)
@@ -1258,17 +1335,68 @@ void drawDeviceList() {
     // TACTICAL MODE HEADER (Red Alert)
     tft.fillRect(0, 0, 480, 24, TFT_RED); 
     char huntStr[64];
-    snprintf(huntStr, sizeof(huntStr), " SELECT FOXHUNT TARGET (%s) ", 
-            (currentRadioMode == RADIO_WIFI) ? "WI-FI" : "BLE");
+    const char* modeName = (currentRadioMode == RADIO_WIFI) ? "WI-FI" : (currentRadioMode == RADIO_BLE) ? "BLE" : "NETWORKS";
+    // Slightly abbreviated to ensure buttons fit on the right
+    snprintf(huntStr, sizeof(huntStr), " FOXHUNT TARGET (%s)", modeName);
     tft.drawString(huntStr, 5, 5);
   } else {
-    // NORMAL MODE HEADER (Blue or Purple)
-    tft.fillRect(0, 0, 480, 24, (currentRadioMode == RADIO_WIFI) ? TFT_BLUE : TFT_PURPLE);
+    // NORMAL MODE HEADER (Dynamic Colors)
+    uint16_t headerColor = TFT_BLUE;
+    const char* modeStr = "WI-FI";
+    
+    if (currentRadioMode == RADIO_BLE) {
+        headerColor = TFT_PURPLE;
+        modeStr = "BLE";
+    } else if (currentRadioMode == RADIO_AP) {
+        headerColor = TFT_DARKGREEN;
+        modeStr = "NETWORKS";
+    }
+    
+    tft.fillRect(0, 0, 480, 24, headerColor);
     char headerStr[64];
-    snprintf(headerStr, sizeof(headerStr), " SNIFFED %s DEVICES (Total: %d) ", 
-            (currentRadioMode == RADIO_WIFI) ? "WI-FI" : "BLE", total_devices);
+    // Removed "Total:" to free up space for the buttons
+    snprintf(headerStr, sizeof(headerStr), " SNIFFED %s (%d)", modeStr, total_devices);
     tft.drawString(headerStr, 5, 5); 
   } 
+
+  // ==========================================
+  // DYNAMIC SORT BUTTONS (RIGHT-ALIGNED IN HEADER)
+  // ==========================================
+  tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+  char metricStr[32];
+  uint16_t metricColor = TFT_WHITE;
+  
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT:TOTAL"); metricColor = TFT_WHITE; }
+    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT:TX"); metricColor = TFT_CYAN; }
+    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT:RX"); metricColor = TFT_MAGENTA; }
+    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT:AVG"); metricColor = TFT_YELLOW; }
+    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT:CV%"); metricColor = TFT_ORANGE; }
+    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT:DIST"); metricColor = TFT_GREEN; }
+    else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
+  } else {
+    if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT:HITS"); metricColor = TFT_WHITE; }
+    else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT:DIST"); metricColor = TFT_GREEN; }
+    else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
+  }
+
+  // Draw Metric Button Outline and Text
+  tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
+  tft.setTextColor(metricColor);
+  tft.drawString(metricStr, 282, 4);
+
+  // Draw Direction Button Outline and Text
+  tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
+  if (sort_descending) {
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("DESC", 423, 4);
+  } else {
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("ASC", 427, 4);
+  }
+  
+  // Reset for the rest of the list
+  tft.setTextColor(TFT_WHITE);
 
   if (total_devices == 0) {
     tft.setFreeFont(&UbuntuMono_Regular9pt7b);
@@ -1288,20 +1416,26 @@ void drawDeviceList() {
     tft.setTextColor(TFT_GREEN);
     if (currentRadioMode == RADIO_WIFI) {
       tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-      tft.drawString("     VENDOR                  MAC           RSSI TOTAL", 5, 26); 
-      
+      tft.drawString("     VENDOR                 MAC            RSSI TOTAL", 5, 26); 
       tft.setFreeFont(&UbuntuMono_RI9pt7b); 
       tft.drawString("    FIRST | LAST   DIST Mbps  AVG    CV%    TX | RX", 5, 41);
-    } else {
+    } 
+    else if (currentRadioMode == RADIO_AP) {
       tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-      tft.drawString("    NAME               FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
+      tft.drawString("     SSID                 BSSID            RSSI TOTAL", 5, 26);       
       tft.setFreeFont(&UbuntuMono_RI9pt7b); 
-      tft.drawString("MAC ADDRESS       VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
+      tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%   TX | RX", 5, 41);
+    }
+    else {
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+      tft.drawString("    NAME                FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
+      tft.setFreeFont(&UbuntuMono_RI9pt7b); 
+      tft.drawString("MAC ADDRESS        VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
     }
     tft.setTextColor(TFT_WHITE); 
 
     // --- HEADER SEPARATOR LINE ---
-    tft.drawLine(0, 57, 480, 57, TFT_WHITE); // Shifted up to 57
+    tft.drawLine(0, 57, 480, 57, TFT_WHITE); 
 
     // ==========================================
     // DRAW THE DATA ROWS
@@ -1309,27 +1443,20 @@ void drawDeviceList() {
     int row = 0;
     for (int i = start_idx; i < end_idx; i++) {
       
-      // Calculate row Y-position (Stays exactly the same)
       int y = 62 + (row * 33); 
       
       if (currentRadioMode == RADIO_WIFI) {
-        
         // ==========================================
-        // WIFI MODE - UI LAYOUT (Restored Logic)
+        // WIFI MODE - UI LAYOUT
         // ==========================================
-        char line1[90];
-        char line2[90];
-
-        // 1. Resolve Vendor
+        char line1[90]; char line2[90];
         resolveMacVendor(&sessionData[i]);
 
-        // 2. Format MAC Address
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
                  sessionData[i].mac[0], sessionData[i].mac[1], sessionData[i].mac[2],
                  sessionData[i].mac[3], sessionData[i].mac[4], sessionData[i].mac[5]);
 
-        // 3. Randomized MAC Check & Safe Vendor (18 chars max)
         bool is_randomized = (sessionData[i].mac[0] & 0x02) != 0;
         char safeVendor[20]; 
         if (is_randomized) {
@@ -1340,9 +1467,7 @@ void drawDeviceList() {
             snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", sessionData[i].vendor);
         }
 
-        // 4. Packet Math (Mean & CV)
-        double mean = 0.0;
-        double cv_percent = 0.0;
+        double mean = 0.0; double cv_percent = 0.0;
         if (sessionData[i].packets > 0) {
             mean = (double)sessionData[i].sum_bytes / (double)sessionData[i].packets;
             double avg_sq_sum = (double)sessionData[i].sum_sq_bytes / (double)sessionData[i].packets;
@@ -1352,71 +1477,54 @@ void drawDeviceList() {
             if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
         }
 
-        // 5. Timestamps
         char firstSeenStr[8], lastSeenStr[8], ageCombo[16];
         getAgeString(sessionData[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
         getAgeString(sessionData[i].last_seen, lastSeenStr, sizeof(lastSeenStr));
-        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); // 13 chars
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
 
-        // 6. Data Formatting
         uint32_t total_bytes = sessionData[i].tx_bytes + sessionData[i].rx_bytes;
         char totStr[10];
         formatTotalUnit(total_bytes, totStr, sizeof(totStr));
 
-        // Format TX and RX using your specific helper
-        char txStr[6], rxStr[6];
+        char txStr[6], rxStr[6], trafficCombo[12];
         formatShortUnit(sessionData[i].tx_bytes, txStr, sizeof(txStr));
         formatShortUnit(sessionData[i].rx_bytes, rxStr, sizeof(rxStr));
-        
-        char trafficCombo[12];
-        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); // 9 chars exactly
+        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); 
 
-        // ==========================================
-        // 52-CHARACTER LINE RENDERING
-        // ==========================================
-        
-        // LINE 1: Index (4), Vendor (18), MAC (17), RSSI (4), Total (5)
+        char avgStr[6];
+        formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
+
         snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
                  (i + 1), safeVendor, macStr, sessionData[i].rssi, totStr);
 
-        // LINE 2: Indent (4), Age (13), Dist (5), Rate (4), Mean (6), CV (5), TX|RX (9)
-        // Example output: "    00h05m|01h20m   12m 144M  1500B   50%  12M| 50K"
-        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d %5.0fB %4.0f%%   %9s", 
+        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d %-5.5s %4.0f%%   %9s", 
                  ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
-                 mean, cv_percent, trafficCombo);
+                 avgStr, cv_percent, trafficCombo);
 
-        // --- DRAW TO SCREEN ---
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line1, 5, y);
-        
         tft.setTextColor(TFT_LIGHTGREY);
         tft.setFreeFont(&UbuntuMono_RI9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE);      
-      } else {
+        
+      } else if (currentRadioMode == RADIO_BLE) {
         // ==========================================
         // BLE MODE - JIT TRANSLATION & DISPLAY
         // ==========================================
-        char line1[90];
-        char safeName[20];
+        char line1[90]; char safeName[20];
         
-        // Use the raw memory check since we removed strings
         if (sessionBleData[i].name[0] == '\0') {
             snprintf(safeName, sizeof(safeName), "%-18.18s", "<Unnamed>");
         } else {
             snprintf(safeName, sizeof(safeName), "%-18.18s", sessionBleData[i].name);
         }
 
-        // --- TIMESTAMPS ---
-        char firstSeenStr[8];
-        char lastSeenStr[8];
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[16];
         getAgeString(sessionBleData[i].firstSeen, firstSeenStr, sizeof(firstSeenStr));
         getAgeString(sessionBleData[i].lastSeen, lastSeenStr, sizeof(lastSeenStr));
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
 
-        char ageCombo[16];
-        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); // e.g. "00h05m|01h20m"
-
-        // --- JIT OSINT TRANSLATION (ENUMS TO STRINGS) ---
         const char* trackerStr = "";
         switch (sessionBleData[i].trackerType) {
             case TRACKER_APPLE_FINDMY: trackerStr = "Apple: Find My"; break;
@@ -1429,18 +1537,13 @@ void drawDeviceList() {
             default: trackerStr = ""; break;
         }
 
-        // Resolve 16-bit IDs using your existing helper functions
         std::string appStr = resolveBleAppearance(sessionBleData[i].appearanceId);
         std::string srvStr = resolveBleServiceUuid(sessionBleData[i].serviceId);
-
-        // --- 1. BUILD THE STANDARD OSINT STRING ---
         std::string tagStr = "";
         
-        // Only append the trackerStr to Line 2 if it ISN'T already being used as the Name on Line 1!
         if (strlen(trackerStr) > 0 && sessionBleData[i].namePriority != 1) {
             tagStr += trackerStr;
         }
-        
         if (appStr != "") {
             tagStr += (tagStr.length() > 0 ? "|" : "") + appStr;
         }
@@ -1448,54 +1551,112 @@ void drawDeviceList() {
             tagStr += (tagStr.length() > 0 ? "|" : "") + srvStr;
         }
 
-        // --- 2. THE MULTIPLEXING FALLBACK ---
-        // If standard tags are completely empty, check the payload bucket!
         if (tagStr == "") {
             if (sessionBleData[i].payload[0] != '\0') {
-                // If it's an iBeacon, prepend the tracker name for context
                 if (sessionBleData[i].trackerType == TRACKER_APPLE_IBEACON) {
                     tagStr = "iBeacon | " + std::string(sessionBleData[i].payload);
                 } else {
-                    // Otherwise, dump the Eddystone URL, telemetry, or Raw Hex
                     tagStr = sessionBleData[i].payload; 
                 }
             } else {
-                // If literally nothing exists, use the ultimate fallback
                 tagStr = "No Data"; 
             }
         }
         
-        // --- 3. CLEAN AND FORMAT ---
-        cleanOsintString(tagStr); // Ensure your helper function stays in play!
+        cleanOsintString(tagStr); 
 
-        // --- MAC STRING ---
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
                  sessionBleData[i].mac[0], sessionBleData[i].mac[1], sessionBleData[i].mac[2], 
                  sessionBleData[i].mac[3], sessionBleData[i].mac[4], sessionBleData[i].mac[5]);
 
-        // ==========================================
-        // 52-CHARACTER LINE RENDERING
-        // ==========================================
-        
-        // LINE 1: Index, Name, AgeCombo, RSSI, Distance, Hits
         snprintf(line1, sizeof(line1), "%2d.%-18.18s %13s %4d %4.0fm %5u", 
                  (i + 1), safeName, ageCombo, sessionBleData[i].rssi, 
                  sessionBleData[i].smoothedDistance, sessionBleData[i].hits);
 
-        // LINE 2: MAC (17 chars), Margin (2 spaces), TagStr (up to 33 chars now)
-        // Notice the leading spaces have been completely removed.
         char line2[90];
         snprintf(line2, sizeof(line2), "%17s  %-33.33s", macStr, tagStr.c_str());
 
-        // --- DRAW TO SCREEN ---
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line1, 5, y);
-        
         tft.setTextColor(TFT_LIGHTGREY);
         tft.setFreeFont(&UbuntuMono_RI9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE);
+
+      } else if (currentRadioMode == RADIO_AP) {
+        // ==========================================
+        // AP MODE - NETWORKS SNIFF LIST
+        // ==========================================
+        char line1[90];
+        char line2[90];
+
+        bool has_clone = false;
+        if (strcmp(sessionApData[i].ssid, "<HIDDEN>") != 0 && strcmp(sessionApData[i].ssid, "<UNKNOWN>") != 0) {
+          for (int j = 0; j < sessionApCount; j++) {
+            if (i != j && strcmp(sessionApData[i].ssid, sessionApData[j].ssid) == 0) {
+              has_clone = true; break;
+            }
+          }
+        }
+
+        char safeSsid[20];
+        if (strcmp(sessionApData[i].ssid, "<HIDDEN>") == 0 || strcmp(sessionApData[i].ssid, "<UNKNOWN>") == 0) {
+           snprintf(safeSsid, sizeof(safeSsid), "%-18.18s", sessionApData[i].ssid);
+        } else if (has_clone) {
+           char temp_ssid[13];
+           strncpy(temp_ssid, sessionApData[i].ssid, 12); temp_ssid[12] = '\0';
+           snprintf(safeSsid, sizeof(safeSsid), "%s~%02X%02X", temp_ssid, sessionApData[i].bssid[4], sessionApData[i].bssid[5]);
+        } else {
+           snprintf(safeSsid, sizeof(safeSsid), "%-18.18s", sessionApData[i].ssid);
+        }
+
+        char bssidStr[18];
+        snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 sessionApData[i].bssid[0], sessionApData[i].bssid[1], sessionApData[i].bssid[2],
+                 sessionApData[i].bssid[3], sessionApData[i].bssid[4], sessionApData[i].bssid[5]);
+
+        double mean = 0.0;
+        double cv_percent = 0.0;
+        if (sessionApData[i].packets > 0) {
+            mean = (double)sessionApData[i].sum_bytes / (double)sessionApData[i].packets;
+            double avg_sq_sum = (double)sessionApData[i].sum_sq_bytes / (double)sessionApData[i].packets;
+            double variance = avg_sq_sum - (mean * mean);
+            if (variance < 0) variance = 0; 
+            double std_dev = sqrt(variance);
+            if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
+        }
+
+        char avgStr[6];
+        formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
+
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[16];
+        getAgeString(sessionApData[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
+        getAgeString(sessionApData[i].last_seen, lastSeenStr, sizeof(lastSeenStr));
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
+
+        uint32_t total_bytes = sessionApData[i].tx_bytes + sessionApData[i].rx_bytes;
+        char totStr[10];
+        formatTotalUnit(total_bytes, totStr, sizeof(totStr));
+
+        char txStr[6], rxStr[6], trafficCombo[12];
+        formatShortUnit(sessionApData[i].tx_bytes, txStr, sizeof(txStr));
+        formatShortUnit(sessionApData[i].rx_bytes, rxStr, sizeof(rxStr));
+        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); 
+
+        snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
+                 (i + 1), safeSsid, bssidStr, sessionApData[i].rssi, totStr);
+
+        snprintf(line2, sizeof(line2), "    %13s %3.0fm %02d %3uM %-4.4s %3.0f%%   %9s", 
+                 ageCombo, sessionApData[i].smoothedDistance, sessionApData[i].channel, 
+                 sessionApData[i].max_rate, avgStr, cv_percent, trafficCombo);
+
+        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+        tft.drawString(line1, 5, y);
+        tft.setTextColor(TFT_LIGHTGREY);
+        tft.setFreeFont(&UbuntuMono_RI9pt7b);
+        tft.drawString(line2, 5, y + 15);
+        tft.setTextColor(TFT_WHITE); 
       }
       row++;
     }
@@ -1503,7 +1664,7 @@ void drawDeviceList() {
 
   // --- SAFE NAVIGATION FOOTER ---
   tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-  tft.drawLine(0, 294, 480, 294, TFT_WHITE); // Shifted down to 294
+  tft.drawLine(0, 294, 480, 294, TFT_WHITE); 
 
   if (device_current_page > 0 && total_devices > 0) {
     tft.setTextColor(TFT_WHITE);
@@ -2327,6 +2488,66 @@ void setup() {
   Serial.println("----------------------------\n");
 }
 
+void forceSessionSort() {
+  if (currentRadioMode == RADIO_WIFI) {
+    for (int i = 1; i < sessionMacCount; i++) {
+      MacRecord key = sessionData[i];
+      double key_val = getSortMetric(key, currentSortMode);
+      int j = i - 1;
+      if (sort_descending) {
+        while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) < key_val) {
+          sessionData[j + 1] = sessionData[j];
+          j = j - 1;
+        }
+      } else {
+        while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) > key_val && key_val > 0.0) {
+          sessionData[j + 1] = sessionData[j];
+          j = j - 1;
+        }
+      }
+      sessionData[j + 1] = key;
+    }
+  } 
+  else if (currentRadioMode == RADIO_BLE) {
+    for (int i = 1; i < sessionBleCount; i++) {
+      BLERecord key = sessionBleData[i];
+      double key_val = getBleSortMetric(key, currentBleSortMode);
+      int j = i - 1;
+      if (sort_descending) {
+        while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) < key_val) {
+          sessionBleData[j + 1] = sessionBleData[j];
+          j = j - 1;
+        }
+      } else {
+        while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) > key_val && key.hits > 0) {
+          sessionBleData[j + 1] = sessionBleData[j];
+          j = j - 1;
+        }
+      }
+      sessionBleData[j + 1] = key;
+    }
+  } 
+  else if (currentRadioMode == RADIO_AP) {
+    for (int i = 1; i < sessionApCount; i++) {
+      ApRecord key = sessionApData[i];
+      double key_val = getSortMetric(key, currentSortMode);
+      int j = i - 1;
+      if (sort_descending) {
+        while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) < key_val) {
+          sessionApData[j + 1] = sessionApData[j];
+          j = j - 1;
+        }
+      } else {
+        while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) > key_val && key_val > 0.0) {
+          sessionApData[j + 1] = sessionApData[j];
+          j = j - 1;
+        }
+      }
+      sessionApData[j + 1] = key;
+    }
+  }
+}
+
 void loop() {
   processPendingVendors();
   uint16_t t_x = 0, t_y = 0;
@@ -2358,7 +2579,7 @@ void loop() {
           tft.fillRect(3, 299, 139, 17, TFT_BLACK);
           
           // 2. Toggle the variable
-          if (currentRadioMode == RADIO_WIFI) {
+          if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
             if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;
             else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;
             else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;
@@ -2495,8 +2716,12 @@ void loop() {
         drawChartHeader();
         drawChartFooter();
         
-        // Hardware was already handled by switchRadioMode()!
-        // We only need to tune the radio if we are actively hunting a specific Wi-Fi target.
+        // THE FIX: Wake the Wi-Fi radio back up if we are in a Wi-Fi mode!
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+            esp_wifi_set_promiscuous(true); 
+        }
+        
+        // Channel tuning for locked targets
         if (currentRadioMode == RADIO_WIFI && target_locked) {
           esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
         }
@@ -2579,12 +2804,12 @@ void loop() {
 
           // 2. Build the tactical string directly into the global target_ssid variable
           if (raw_ssid.length() == 0) {
-            snprintf(target_ssid, sizeof(target_ssid), "<HIDDEN> [%02X%02X]", bssid[4], bssid[5]);
+            snprintf(target_ssid, sizeof(target_ssid), "<HIDDEN>~%02X%02X", bssid[4], bssid[5]);
           } else if (has_clone) {
             char temp_ssid[13];
             strncpy(temp_ssid, raw_ssid.c_str(), 12);
             temp_ssid[12] = '\0';
-            snprintf(target_ssid, sizeof(target_ssid), "%s [%02X%02X]", temp_ssid, bssid[4], bssid[5]);
+            snprintf(target_ssid, sizeof(target_ssid), "%s~%02X%02X", temp_ssid, bssid[4], bssid[5]);
           } else {
             char temp_ssid[18]; 
             strncpy(temp_ssid, raw_ssid.c_str(), 17);
@@ -2650,25 +2875,63 @@ void loop() {
     else if (currentState == SCREEN_DEVICE_LIST) {
       
       // ==========================================
-      // 1. FOOTER NAVIGATION (Shifted to 290px to match new UI)
+      // A. HEADER TOUCH LOGIC (SORT CONTROLS)
       // ==========================================
-      if (t_y >= 290) {
-        int total_devices = (currentRadioMode == RADIO_WIFI) ? sessionMacCount : sessionBleCount;
-        int items_per_page = 7; // <-- FIXED: Synced to your drawing function
+      if (t_y <= 30) {
+        // ZONE 1: TOGGLE SORT METRIC (X: 275 to 405)
+        if (t_x >= 275 && t_x < 405) {
+          if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;
+            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;
+            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;
+            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;
+            else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;
+            else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE;
+            else currentSortMode = SORT_TOTAL;
+          } else {
+            if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
+            else if (currentBleSortMode == SORT_BLE_DIST) currentBleSortMode = SORT_BLE_AGE;
+            else currentBleSortMode = SORT_BLE_HITS;
+          }
+          device_current_page = 0; // Snap list back to page 1 upon resorting
+          forceSessionSort();
+          drawDeviceList();
+          delay(200);
+        }
+        // ZONE 2: TOGGLE SORT DIRECTION (X: 410 to 480)
+        else if (t_x >= 410) {
+          sort_descending = !sort_descending;
+          device_current_page = 0; // Snap list back to page 1 upon resorting
+          forceSessionSort();
+          drawDeviceList();
+          delay(200);
+        }
+      }
 
-        // 1. PREV PAGE
+      // ==========================================
+      // B. FOOTER NAVIGATION (Y >= 294)
+      // ==========================================
+      else if (t_y >= 294) { 
+        int items_per_page = 7; 
+        int total_devices = 0;
+        
+        if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
+        else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
+        else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
+
+        // 1. PREV PAGE (X: 0 to 160)
         if (t_x < 160 && device_current_page > 0) {
           device_current_page--;
           drawDeviceList();
           delay(250);
         }
-        // 2. NEXT PAGE
+        // 2. NEXT PAGE (X: 320 to 480)
         else if (t_x > 320 && ((device_current_page + 1) * items_per_page) < total_devices) {
           device_current_page++;
           drawDeviceList();
           delay(250);
         }
-        // 3. BACK TO MENU
+        // 3. BACK TO MENU (X: 160 to 320)
         else if (t_x >= 160 && t_x <= 320) {
           currentState = SCREEN_MENU;
           device_current_page = 0; 
@@ -2678,42 +2941,47 @@ void loop() {
       }
       
       // ==========================================
-      // 2. LIST ROW SELECTION (The "Hot" Devices)
+      // C. LIST ROW SELECTION (The "Hot" Devices)
       // ==========================================
-      else if (t_y >= 62 && t_y < 290) { // The area between header and footer
+      else if (t_y >= 62 && t_y < 294) { // Protected area ends at 294
         
         int tapped_screen_row = (t_y - 62) / 33;
-        int total_devices = (currentRadioMode == RADIO_WIFI) ? sessionMacCount : sessionBleCount;
+        int total_devices = 0;
+        
+        if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
+        else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
+        else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
+
         int tapped_array_index = (device_current_page * 7) + tapped_screen_row;
 
-        // Ensure the user didn't tap an empty row on the final page
         if (tapped_screen_row < 7 && tapped_array_index < total_devices) {
-          
           if (is_selecting_target) {
             // --- TARGET ACQUIRED: LAUNCH FOXHUNT ---
             if (currentRadioMode == RADIO_WIFI) {
               memcpy(foxhunt_target_mac, sessionData[tapped_array_index].mac, 6);
               strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, 25);
-            } else {
+            } else if (currentRadioMode == RADIO_BLE) {
               memcpy(foxhunt_target_mac, sessionBleData[tapped_array_index].mac, 6);
               strncpy(foxhunt_target_vendor, sessionBleData[tapped_array_index].name, 25);
               if (foxhunt_target_vendor[0] == '\0') {
                 strncpy(foxhunt_target_vendor, "<Unnamed BLE>", 25);
               }
+            } else if (currentRadioMode == RADIO_AP) {
+              // Allows Foxhunting routers from the AP list!
+              memcpy(foxhunt_target_mac, sessionApData[tapped_array_index].bssid, 6);
+              strncpy(foxhunt_target_vendor, sessionApData[tapped_array_index].ssid, 25);
             }
 
-            // Reset routing flags and tracking math
             is_selecting_target = false;
             is_foxhunting = true;
             smoothed_rssi = -100.0;
             baseline_rssi = -100;
             target_behind_alert = false;
 
-            if (currentRadioMode == RADIO_WIFI) {
+            if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
               target_locked = false; 
             }
 
-            // Transition the screen
             currentState = SCREEN_FOXHUNT;
             drawFoxhuntScreen(); 
             delay(200);
@@ -2877,7 +3145,10 @@ void loop() {
               sessionData[j].sum_bytes += liveData[i].sum_bytes;
               sessionData[j].sum_sq_bytes += liveData[i].sum_sq_bytes;
               sessionData[j].rssi = liveData[i].rssi;
-              sessionData[j].rate = liveData[i].rate;
+              // (Ignores 0-value parsing failures from advanced modern packets)
+              if (liveData[i].rate > 0) {
+                  sessionData[j].rate = liveData[i].rate;
+              }
               sessionData[j].last_seen = liveData[i].last_seen;
               
               // EMA Distance Filter
@@ -3133,55 +3404,111 @@ void loop() {
         // ==========================================
         // 3. AP NETWORK DATA PROCESSING PIPELINE
         // ==========================================
-        
+                
         // 1. Snapshot the live data for the waterfall
         memcpy((void*)sortApData, (void*)liveApData, sizeof(liveApData));
         sortApCount = liveApCount;
         
-        // 2. Sync to Historical Session (Simple update, no complex math needed yet)
+        // 2. Sync to Historical Session
         for (int i = 0; i < liveApCount; i++) {
           bool found = false;
+          float rawDistance = calculateRfDistance(liveApData[i].rssi, 0, RADIO_WIFI_24GHZ);
+
           for (int j = 0; j < sessionApCount; j++) {
             if (memcmp(sessionApData[j].bssid, (void*)liveApData[i].bssid, 6) == 0) {
-              sessionApData[j].traffic_bytes += liveApData[i].traffic_bytes;
-              sessionApData[j].last_seen = liveApData[i].last_seen;
               
-              // If we originally caught it as <UNKNOWN> but now have the SSID, update it!
+              sessionApData[j].packets += liveApData[i].packets;
+              sessionApData[j].tx_bytes += liveApData[i].tx_bytes;
+              sessionApData[j].rx_bytes += liveApData[i].rx_bytes;
+              sessionApData[j].sum_bytes += liveApData[i].sum_bytes;
+              sessionApData[j].sum_sq_bytes += liveApData[i].sum_sq_bytes;
+              
+              sessionApData[j].last_seen = liveApData[i].last_seen;
+              sessionApData[j].rssi = liveApData[i].rssi;
+              sessionApData[j].channel = liveApData[i].channel;
+              
+              // Only overwrite the historical rate if the new one is faster
+              if (liveApData[i].max_rate > sessionApData[j].max_rate) {
+                  sessionApData[j].max_rate = liveApData[i].max_rate;
+              }
+              
+              if (rawDistance > 0) {
+                  sessionApData[j].smoothedDistance = 
+                      (0.2 * rawDistance) + (0.8 * sessionApData[j].smoothedDistance);
+              }
+              
               if (strcmp(sessionApData[j].ssid, "<UNKNOWN>") == 0 && strcmp((char*)liveApData[i].ssid, "<UNKNOWN>") != 0) {
                 strcpy((char*)sessionApData[j].ssid, (char*)liveApData[i].ssid);
               }
               
-              found = true;
-              break;
+              found = true; break;
             }
           }
           
           if (!found && sessionApCount < MAX_AP_RECORDS) {
              memcpy((void*)&sessionApData[sessionApCount], (void*)&liveApData[i], sizeof(ApRecord));
+             sessionApData[sessionApCount].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
              sessionApCount++;
           }
         }
         
-        // 3. Dump the bucket
-        memset((void*)liveApData, 0, sizeof(liveApData));
-        liveApCount = 0;
+        // 3. Clear the traffic counters, but PRESERVE THE DICTIONARY!
+        for (int i = 0; i < liveApCount; i++) {
+            liveApData[i].packets = 0;
+            liveApData[i].tx_bytes = 0;
+            liveApData[i].rx_bytes = 0;
+            liveApData[i].sum_bytes = 0;
+            liveApData[i].sum_sq_bytes = 0;
+            
+            // We intentionally do NOT reset max_rate, bssid, or ssid.
+            // We also intentionally do NOT reset liveApCount to 0!
+        }
         
         // 4. --- FAST INSERTION SORT: AP SNAPSHOT ---
-        // (Sort strictly descending by traffic_bytes for the visualizer)
         for (int i = 1; i < sortApCount; i++) {
           ApRecord key = sortApData[i];
+          double key_val = getSortMetric(key, currentSortMode);
           int j = i - 1;
-          while (j >= 0 && sortApData[j].traffic_bytes < key.traffic_bytes) {
-            sortApData[j + 1] = sortApData[j];
-            j = j - 1;
+          
+          if (sort_descending) {
+            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) < key_val) {
+              sortApData[j + 1] = sortApData[j];
+              j = j - 1;
+            }
+          } else {
+            // Safety catch: keeps 0-value items at the bottom
+            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) > key_val && key_val > 0.0) {
+              sortApData[j + 1] = sortApData[j];
+              j = j - 1;
+            }
           }
           sortApData[j + 1] = key;
+        }
+
+        // --- FAST INSERTION SORT: AP SESSION (SEEN DEVICES) ---
+        for (int i = 1; i < sessionApCount; i++) {
+          ApRecord key = sessionApData[i];
+          double key_val = getSortMetric(key, currentSortMode);
+          int j = i - 1;
+
+          if (sort_descending) {
+            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) < key_val) {
+              sessionApData[j + 1] = sessionApData[j];
+              j = j - 1;
+            }
+          } else {
+            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) > key_val && key_val > 0.0) {
+              sessionApData[j + 1] = sessionApData[j];
+              j = j - 1;
+            }
+          }
+          sessionApData[j + 1] = key;
         }
         
         // 5. Calculate "Other" Bytes for the AP Waterfall
         sortOtherBytes = 0; 
         for(int i = 8; i < sortApCount; i++) {
-          sortOtherBytes += sortApData[i].traffic_bytes;
+          sortOtherBytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
         }
       }
 
@@ -3258,7 +3585,7 @@ void loop() {
                char temp_ssid[13];
                strncpy(temp_ssid, sortApData[i].ssid, 12); 
                temp_ssid[12] = '\0';
-               snprintf(short_text, sizeof(short_text), "%s [%02X%02X]", 
+               snprintf(short_text, sizeof(short_text), "%s~%02X%02X", 
                         temp_ssid, sortApData[i].bssid[4], sortApData[i].bssid[5]);
             } else {
                // Unique network! Give it more characters since we don't need the bracket suffix
@@ -3402,7 +3729,7 @@ void loop() {
           // ==========================================
           uint32_t total_bytes = sortOtherBytes;
           for(int i = 0; i < 8 && i < sortApCount; i++) {
-            total_bytes += sortApData[i].traffic_bytes;
+            total_bytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
           }
 
           if (total_bytes > 0) {
@@ -3411,7 +3738,8 @@ void loop() {
             // Log Scale Calculations
             if (useLogScale) {
               for(int j = 0; j < 8 && j < sortApCount; j++) {
-                log_total += log10((double)sortApData[j].traffic_bytes + 1.0);
+                uint32_t device_total = sortApData[j].tx_bytes + sortApData[j].rx_bytes;
+                log_total += log10((double)device_total + 1.0);
               }
               log_total += log10((double)sortOtherBytes + 1.0);
             }
@@ -3419,11 +3747,12 @@ void loop() {
             // Draw the Top 8 bars
             for(int i = 0; i < 8 && i < sortApCount; i++) {
               double fraction;
+              uint32_t current_device_bytes = sortApData[i].tx_bytes + sortApData[i].rx_bytes;
               
               if (useLogScale) {
-                fraction = log10((double)sortApData[i].traffic_bytes + 1.0) / log_total;
+                fraction = log10((double)current_device_bytes + 1.0) / log_total;
               } else {
-                fraction = (double)sortApData[i].traffic_bytes / (double)total_bytes;
+                fraction = (double)current_device_bytes / (double)total_bytes;
               }
 
               int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
