@@ -98,7 +98,7 @@ const int PROBES_PER_PAGE = 5;
 // ==========================================
 // RADIO MODE STATE
 // ==========================================
-enum RadioMode { RADIO_WIFI, RADIO_BLE, RADIO_AP };
+enum RadioMode { RADIO_WIFI, RADIO_BLE, RADIO_AP, RADIO_CHANNELS };
 RadioMode currentRadioMode = RADIO_WIFI;
 
 // ==========================================
@@ -169,6 +169,25 @@ struct ApRecord {
   char ssid[31];         // 31 chars locks the struct exactly at 80 bytes
 };
 
+#define MAX_CHANNEL_RECORDS 100
+
+struct ChannelRecord {
+  uint64_t sum_bytes;
+  uint64_t sum_sq_bytes;
+  uint32_t first_seen;
+  uint32_t last_seen;
+  uint32_t packets;
+  uint32_t tx_bytes;
+  uint32_t rx_bytes;
+  uint8_t channel;
+  
+  // --- The EMA Time-Series Variables ---
+  float avg_rssi;     // The moving noise floor
+  float ema_variance; // The volatility tracker
+  float prev_rssi;    // Memory of the last packet
+  float ema_cov;      // The autocorrelation tracker
+};
+
 int device_current_page = 0;
 const int DEVICES_PER_PAGE = 13; // 9pt font with 18px line spacing fits 13 devices perfectly
 
@@ -226,12 +245,14 @@ struct MacRecord {
 static union {
   volatile MacRecord liveData[MAX_MACS];
   volatile BLERecord liveBleData[MAX_BLE_DEVICES];
-  volatile ApRecord liveApData[MAX_AP_RECORDS];     // <-- NEW
+  volatile ApRecord liveApData[MAX_AP_RECORDS];
+  volatile ChannelRecord liveChannelData[MAX_CHANNEL_RECORDS];
 };
 volatile uint16_t liveMacCount = 0;
 volatile uint32_t liveOtherBytes = 0;
 volatile uint16_t liveBleCount = 0;
-volatile uint16_t liveApCount = 0;                  // <-- NEW
+volatile uint16_t liveApCount = 0;
+volatile uint16_t liveChannelCount = 0;
 
 // ==========================================
 // 2. SORT BUFFER (Shared RAM)
@@ -239,12 +260,14 @@ volatile uint16_t liveApCount = 0;                  // <-- NEW
 static union {
   MacRecord sortData[MAX_MACS];
   BLERecord sortBleData[MAX_BLE_DEVICES];
-  ApRecord sortApData[MAX_AP_RECORDS];              // <-- NEW
+  ApRecord sortApData[MAX_AP_RECORDS];
+  ChannelRecord sortChannelData[MAX_CHANNEL_RECORDS];
 };
 uint16_t sortMacCount = 0;
 uint32_t sortOtherBytes = 0;
 uint16_t sortBleCount = 0;
-uint16_t sortApCount = 0;                           // <-- NEW
+uint16_t sortApCount = 0;
+uint16_t sortChannelCount = 0;
 
 // ==========================================
 // 3. SESSION BUFFER (Shared RAM)
@@ -252,20 +275,23 @@ uint16_t sortApCount = 0;                           // <-- NEW
 static union {
   MacRecord sessionData[MAX_MACS];
   BLERecord sessionBleData[MAX_BLE_DEVICES];
-  ApRecord sessionApData[MAX_AP_RECORDS];           // <-- NEW
+  ApRecord sessionApData[MAX_AP_RECORDS]; 
+  ChannelRecord sessionChannelData[MAX_CHANNEL_RECORDS];
 };
 uint16_t sessionMacCount = 0;
 uint32_t sessionOtherBytes = 0;
 uint16_t sessionBleCount = 0;
-uint16_t sessionApCount = 0;                        // <-- NEW
+uint16_t sessionApCount = 0;
+uint16_t sessionChannelCount = 0;
 
-// Compile-time safety check to prevent silent memory corruption
 // Compile-time safety check to prevent silent memory corruption
 constexpr size_t max_wifi_size = sizeof(MacRecord) * MAX_MACS;
 static_assert(max_wifi_size >= sizeof(BLERecord) * MAX_BLE_DEVICES, 
               "FATAL: BLE array exceeds union boundary.");
 static_assert(max_wifi_size >= sizeof(ApRecord) * MAX_AP_RECORDS, 
               "FATAL: AP array exceeds union boundary.");
+static_assert(max_wifi_size >= sizeof(ChannelRecord) * MAX_CHANNEL_RECORDS, 
+              "FATAL: Channel array exceeds union boundary.");
 // ==========================================
 // OUI RAM CACHE (Ring Buffer)
 // ==========================================
@@ -450,6 +476,73 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   }
 
   // ==========================================
+  // BYPASS: CHANNEL SPECTRUM MODE
+  // ==========================================
+  if (currentRadioMode == RADIO_CHANNELS) {
+    uint8_t ch = CHANNELS[current_ch_idx];
+    int idx = -1; 
+
+    // 1. Search for the active channel in our existing array
+    for (int i = 0; i < liveChannelCount; i++) {
+        if (liveChannelData[i].channel == ch) {
+            idx = i;
+            break;
+        }
+    }
+
+    // 2. If it's a completely new channel, claim the next available slot
+    if (idx == -1) {
+        if (liveChannelCount < MAX_CHANNEL_RECORDS) {
+            idx = liveChannelCount;
+            liveChannelData[idx].channel = ch;
+            unsigned long now = millis();
+            liveChannelData[idx].first_seen = now;
+            liveChannelData[idx].last_seen = now;
+            
+            liveChannelData[idx].avg_rssi = (float)pkt->rx_ctrl.rssi;
+            liveChannelData[idx].ema_variance = 0.0; // Starts at 0 volatility
+            
+            liveChannelCount++; 
+        } else {
+            return; 
+        }
+    }
+
+    // 3. Process the packet exactly as before
+    liveChannelData[idx].packets += 1;
+    liveChannelData[idx].sum_bytes += len;
+    liveChannelData[idx].sum_sq_bytes += ((uint64_t)len * len);
+    liveChannelData[idx].last_seen = millis();
+    
+    // --- EMA MEAN & VARIANCE CALCULATION ---
+    float alpha = 0.05; // 5% weight to new packets, 95% to history
+    float current_rssi = (float)pkt->rx_ctrl.rssi;
+    
+    // Calculate the difference between this packet and our running average
+    float diff = current_rssi - liveChannelData[idx].avg_rssi;
+    
+    // Update the Variance first (using the old average)
+    liveChannelData[idx].ema_variance = (1.0 - alpha) * (liveChannelData[idx].ema_variance + alpha * diff * diff);
+    
+    // Then update the Mean
+    liveChannelData[idx].avg_rssi += (alpha * diff);
+    
+    // --- UPLINK / DOWNLINK ROUTER ---
+    uint8_t ds_flags = payload[1] & 0x03;
+    bool to_ds   = (ds_flags & 0x01); // Client -> AP
+    bool from_ds = (ds_flags & 0x02); // AP -> Client
+
+    bool is_uplink = false;
+    if (to_ds && !from_ds) is_uplink = true;
+    else if (payload[0] == 0x40) is_uplink = true; // Probe Requests
+
+    if (is_uplink) liveChannelData[idx].rx_bytes += len; 
+    else           liveChannelData[idx].tx_bytes += len; 
+
+    return; 
+  }
+
+  // ==========================================
   // PROBE REQUEST BOUNCER (Runs only in WIFI mode)
   // ==========================================
   // Check if Frame Control byte 0 is 0x40 (Subtype 4: Probe Request)
@@ -600,19 +693,22 @@ void resetMonitorState() {
   liveMacCount = 0;
   liveOtherBytes = 0;
   liveBleCount = 0;
-  liveApCount = 0;     // <-- NEW
+  liveApCount = 0;
+  liveChannelCount = 0;
 
   memset(sortData, 0, sizeof(sortData));
   sortMacCount = 0;
   sortOtherBytes = 0;
   sortBleCount = 0;
-  sortApCount = 0;     // <-- NEW
+  sortApCount = 0;
+  sortChannelCount = 0;
 
   memset(sessionData, 0, sizeof(sessionData));
   sessionMacCount = 0;
   sessionOtherBytes = 0;
   sessionBleCount = 0;
-  sessionApCount = 0;  // <-- NEW
+  sessionApCount = 0;
+  sessionChannelCount = 0;
 
   pause_sniffing = false;
 }
@@ -874,6 +970,9 @@ void drawMenu() {
   else if (currentRadioMode == RADIO_AP) {
     tft.fillRect(300, 190, 150, 40, TFT_DARKGREEN); // New color for AP mode
   }
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    tft.fillRect(300, 190, 150, 40, TFT_ORANGE); // New color for channel spectrum mode
+  }
 
   // 2. Draw the universal white border
   tft.drawRect(300, 190, 150, 40, TFT_WHITE);
@@ -887,6 +986,9 @@ void drawMenu() {
   } 
   else if (currentRadioMode == RADIO_AP) {
     tft.drawString("MODE: NETWORKS", 375, 210);
+  }
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    tft.drawString("MODE: CHANNELS", 375, 210);
   }
 
   // 5. EXIT BUTTON
@@ -923,23 +1025,27 @@ void drawChartHeader() {
   // ==========================================
   if (currentRadioMode == RADIO_BLE) {
     tft.setTextColor(TFT_ORANGE); 
-    snprintf(bannerStr, sizeof(bannerStr), "BLE MODE | SNIFFING...");
+    snprintf(bannerStr, sizeof(bannerStr), "SNIFFING BLE DEVICES");
   } 
   else if (currentRadioMode == RADIO_AP) {
     tft.setTextColor(TFT_GREEN); 
     // AP Mode also hops channels, so showing the active channel is highly useful!
-    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | NETWORKS SCAN", CHANNELS[current_ch_idx]);
+    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING NETWORKS", CHANNELS[current_ch_idx]);
+  }
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    tft.setTextColor(TFT_ORANGE); 
+    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING SPECTRUM", CHANNELS[current_ch_idx]);
   }
   else if (currentRadioMode == RADIO_WIFI) {
     tft.setTextColor(TFT_WHITE); 
     
     if (!target_locked) {
-      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | FREE AIRSPACE", CHANNELS[current_ch_idx]);
+      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING FREE AIRSPACE", CHANNELS[current_ch_idx]);
     } else {
       char safe_ssid[15];
       strncpy(safe_ssid, target_ssid, 14);
       safe_ssid[14] = '\0';
-      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | %s (%ddBm)", target_channel, safe_ssid, target_rssi);
+      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING %s (%ddBm)", target_channel, safe_ssid, target_rssi);
     }
   }
 
@@ -1046,43 +1152,31 @@ void drawChartFooter() {
   // Draw the button outline
   tft.drawRoundRect(2, 298, 141, 19, 3, TFT_WHITE); 
 
-  char metricStr[32];
+  char metricStr[32] = "SORT: ERR"; // Failsafe fallback
   
   if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-    if (currentSortMode == SORT_TOTAL) {
-      strcpy(metricStr, "SORT: TOTAL");
-      tft.setTextColor(TFT_WHITE);
-    } else if (currentSortMode == SORT_TX) {
-      strcpy(metricStr, "SORT: TX");
-      tft.setTextColor(TFT_CYAN);
-    } else if (currentSortMode == SORT_RX) {
-      strcpy(metricStr, "SORT: RX");
-      tft.setTextColor(TFT_MAGENTA);
-    } else if (currentSortMode == SORT_AVG) {
-      strcpy(metricStr, "SORT: AVG");
-      tft.setTextColor(TFT_YELLOW);
-    } else if (currentSortMode == SORT_CV) {
-      strcpy(metricStr, "SORT: CV%");
-      tft.setTextColor(TFT_ORANGE);
-    } else if (currentSortMode == SORT_DIST) {
-      strcpy(metricStr, "SORT: DIST");
-      tft.setTextColor(TFT_GREEN);
-    } else if (currentSortMode == SORT_AGE) {
-      strcpy(metricStr, "SORT: AGE");
-      tft.setTextColor(TFT_BLUE);
-    }
-  } else {
-    // BLE specific modes
-    if (currentBleSortMode == SORT_BLE_HITS) {
-      strcpy(metricStr, "SORT: HITS");
-      tft.setTextColor(TFT_WHITE);
-    } else if (currentBleSortMode == SORT_BLE_DIST) {
-      strcpy(metricStr, "SORT: DIST");
-      tft.setTextColor(TFT_GREEN);
-    } else if (currentBleSortMode == SORT_BLE_AGE) {
-      strcpy(metricStr, "SORT: AGE");
-      tft.setTextColor(TFT_BLUE);
-    }
+    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
+    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: TX"); tft.setTextColor(TFT_CYAN); }
+    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: RX"); tft.setTextColor(TFT_MAGENTA); }
+    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
+    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
+    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
+    else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
+  } 
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    // --- NEW SPECTRUM STRINGS ---
+    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
+    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: DN"); tft.setTextColor(TFT_CYAN); }
+    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: UP"); tft.setTextColor(TFT_MAGENTA); }
+    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
+    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
+    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: PWR"); tft.setTextColor(TFT_GREEN); }
+    else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
+  }
+  else if (currentRadioMode == RADIO_BLE) {
+    if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT: HITS"); tft.setTextColor(TFT_WHITE); }
+    else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
+    else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
   }
   
   // Draw the text with the newly assigned color
@@ -1324,6 +1418,7 @@ void drawDeviceList() {
   if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
   else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
   else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
+  else if (currentRadioMode == RADIO_CHANNELS) total_devices = sessionChannelCount;
 
   // ==========================================
   // DRAW TOP BANNER (WITH FOXHUNT OVERRIDE)
@@ -1350,6 +1445,9 @@ void drawDeviceList() {
     } else if (currentRadioMode == RADIO_AP) {
         headerColor = TFT_DARKGREEN;
         modeStr = "NETWORKS";
+    } else if (currentRadioMode == RADIO_CHANNELS) {
+        headerColor = TFT_ORANGE;
+        modeStr = "CHANNELS";
     }
     
     tft.fillRect(0, 0, 480, 24, headerColor);
@@ -1363,10 +1461,11 @@ void drawDeviceList() {
   // DYNAMIC SORT BUTTONS (RIGHT-ALIGNED IN HEADER)
   // ==========================================
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-  char metricStr[32];
-  uint16_t metricColor = TFT_WHITE;
+  char metricStr[32] = "SORT:ERR";
+  uint16_t metricColor = TFT_RED;
   
   if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+    // 1. STANDARD WI-FI / AP METRICS
     if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT:TOTAL"); metricColor = TFT_WHITE; }
     else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT:TX"); metricColor = TFT_CYAN; }
     else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT:RX"); metricColor = TFT_MAGENTA; }
@@ -1374,19 +1473,34 @@ void drawDeviceList() {
     else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT:CV%"); metricColor = TFT_ORANGE; }
     else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT:DIST"); metricColor = TFT_GREEN; }
     else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
-  } else {
+  } 
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    // 2. CUSTOM SPECTRUM METRICS
+    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT:TOTAL"); metricColor = TFT_WHITE; }
+    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT:DN"); metricColor = TFT_CYAN; }
+    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT:UP"); metricColor = TFT_MAGENTA; }
+    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT:AVG"); metricColor = TFT_YELLOW; }
+    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT:CV%"); metricColor = TFT_ORANGE; }
+    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT:PWR"); metricColor = TFT_GREEN; }
+  } 
+  else if (currentRadioMode == RADIO_BLE) {
+    // 3. BLE METRICS
     if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT:HITS"); metricColor = TFT_WHITE; }
     else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT:DIST"); metricColor = TFT_GREEN; }
     else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
   }
 
   // Draw Metric Button Outline and Text
+  tft.fillRoundRect(275, 2, 130, 20, 3, TFT_DARKGREY); 
   tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
   tft.setTextColor(metricColor);
   tft.drawString(metricStr, 282, 4);
 
   // Draw Direction Button Outline and Text
+  // FIX: Updated X coordinate to 410 and Width to 65
+  tft.fillRoundRect(410, 2, 65, 20, 3, TFT_DARKGREY); 
   tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
+  
   if (sort_descending) {
     tft.setTextColor(TFT_WHITE);
     tft.drawString("DESC", 423, 4);
@@ -1415,21 +1529,29 @@ void drawDeviceList() {
     // ==========================================
     tft.setTextColor(TFT_GREEN);
     if (currentRadioMode == RADIO_WIFI) {
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+      tft.setFreeFont(&UbuntuMono_B9pt7b);
       tft.drawString("     VENDOR                 MAC            RSSI TOTAL", 5, 26); 
-      tft.setFreeFont(&UbuntuMono_RI9pt7b); 
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
       tft.drawString("    FIRST | LAST   DIST Mbps  AVG    CV%    TX | RX", 5, 41);
     } 
     else if (currentRadioMode == RADIO_AP) {
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+      tft.setFreeFont(&UbuntuMono_B9pt7b);
       tft.drawString("     SSID                 BSSID            RSSI TOTAL", 5, 26);       
-      tft.setFreeFont(&UbuntuMono_RI9pt7b); 
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
       tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%   TX | RX", 5, 41);
     }
+    else if (currentRadioMode == RADIO_CHANNELS) {
+      tft.setFreeFont(&UbuntuMono_B9pt7b);
+      // 'PWR(AVG|STD)' replaces the old raw RSSI column
+      tft.drawString("     CHANNEL              PWR(AVG|STD)       TOTAL", 5, 26);       
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+      // 'STATE' replaces the blank space
+      tft.drawString("    FIRST | LAST       STATE   AVG  CV%    DN | UP", 5, 41);
+    }
     else {
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+      tft.setFreeFont(&UbuntuMono_B9pt7b);
       tft.drawString("    NAME                FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
-      tft.setFreeFont(&UbuntuMono_RI9pt7b); 
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
       tft.drawString("MAC ADDRESS        VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
     }
     tft.setTextColor(TFT_WHITE); 
@@ -1501,10 +1623,10 @@ void drawDeviceList() {
                  ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
                  avgStr, cv_percent, trafficCombo);
 
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+        tft.setFreeFont(&UbuntuMono_B9pt7b);
         tft.drawString(line1, 5, y);
         tft.setTextColor(TFT_LIGHTGREY);
-        tft.setFreeFont(&UbuntuMono_RI9pt7b);
+        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE);      
         
@@ -1577,10 +1699,10 @@ void drawDeviceList() {
         char line2[90];
         snprintf(line2, sizeof(line2), "%17s  %-33.33s", macStr, tagStr.c_str());
 
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+        tft.setFreeFont(&UbuntuMono_B9pt7b);
         tft.drawString(line1, 5, y);
         tft.setTextColor(TFT_LIGHTGREY);
-        tft.setFreeFont(&UbuntuMono_RI9pt7b);
+        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE);
 
@@ -1651,10 +1773,86 @@ void drawDeviceList() {
                  ageCombo, sessionApData[i].smoothedDistance, sessionApData[i].channel, 
                  sessionApData[i].max_rate, avgStr, cv_percent, trafficCombo);
 
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+        tft.setFreeFont(&UbuntuMono_B9pt7b);
         tft.drawString(line1, 5, y);
         tft.setTextColor(TFT_LIGHTGREY);
-        tft.setFreeFont(&UbuntuMono_RI9pt7b);
+        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+        tft.drawString(line2, 5, y + 15);
+        tft.setTextColor(TFT_WHITE); 
+      }
+      else if (currentRadioMode == RADIO_CHANNELS) {
+        // ==========================================
+        // CHANNELS MODE - NETWORKS SNIFF LIST
+        // ==========================================
+        char line1[90];
+        char line2[90];
+
+        // 1. GLOBAL VOLUME STATISTICS (Bytes)
+        double mean = 0.0;
+        double cv_percent = 0.0;
+        if (sessionChannelData[i].packets > 0) {
+            mean = (double)sessionChannelData[i].sum_bytes / (double)sessionChannelData[i].packets;
+            double avg_sq_sum = (double)sessionChannelData[i].sum_sq_bytes / (double)sessionChannelData[i].packets;
+            double variance = avg_sq_sum - (mean * mean);
+            if (variance < 0) variance = 0; 
+            double std_dev = sqrt(variance);
+            if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
+        }
+
+        // 2. EMA TIME-SERIES STATISTICS (RSSI & RF Physics)
+        float avg_rssi = sessionChannelData[i].avg_rssi;
+        double std_dev_rssi = sqrt(sessionChannelData[i].ema_variance);
+        
+        // Calculate Autocorrelation (rho)
+        float rho = 0.0;
+        if (sessionChannelData[i].ema_variance > 0.01) { // Prevent divide-by-zero
+            rho = sessionChannelData[i].ema_cov / sessionChannelData[i].ema_variance;
+        }
+
+        // Translate rho into a human-readable diagnostic state
+        char stateStr[10];
+        if (sessionChannelData[i].packets < 5) strcpy(stateStr, "CALC.."); // Gathering data
+        else if (rho > 0.6) strcpy(stateStr, "DRIFT");   // Mobile/Shifting interference
+        else if (rho > 0.2) strcpy(stateStr, "ACTIVE");  // Standard bursting traffic
+        else strcpy(stateStr, "STATIC");                 // Stationary/Thermal noise
+
+        // 3. STRING FORMATTING
+        char avgStr[6];
+        formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
+
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[16];
+        getAgeString(sessionChannelData[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
+        getAgeString(sessionChannelData[i].last_seen, lastSeenStr, sizeof(lastSeenStr));
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
+
+        uint32_t total_bytes = sessionChannelData[i].tx_bytes + sessionChannelData[i].rx_bytes;
+        char totStr[10];
+        formatTotalUnit(total_bytes, totStr, sizeof(totStr));
+
+        char txStr[6], rxStr[6], trafficCombo[12];
+        formatShortUnit(sessionChannelData[i].tx_bytes, txStr, sizeof(txStr)); // Downlink
+        formatShortUnit(sessionChannelData[i].rx_bytes, rxStr, sizeof(rxStr)); // Uplink
+        snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); 
+
+        // Format the combined Power String (e.g., "-65|±3")
+        char pwrStr[16];
+        if (sessionChannelData[i].packets == 0) strcpy(pwrStr, "N/A");
+        else snprintf(pwrStr, sizeof(pwrStr), "%3.0f|%s%-2.0f", avg_rssi, "±", std_dev_rssi);
+
+        // --- PERFECTLY JUSTIFIED UI STRINGS ---
+        // 14-char spacer to align Power, 11-char padding to align Total to the far right
+        snprintf(line1, sizeof(line1), "%3d. CHANNEL %02d %14s %-11.11s   %-5.5s", 
+                 (i + 1), sessionChannelData[i].channel, "", pwrStr, totStr);
+
+        // Aligns Age, State, Byte Avg, Byte CV%, and Uplink/Downlink combo
+        snprintf(line2, sizeof(line2), "    %13s %5s %-7.7s %-4.4s %3.0f%%   %9s", 
+                 ageCombo, "", stateStr, avgStr, cv_percent, trafficCombo);
+
+        // 4. DRAW TO SCREEN
+        tft.setFreeFont(&UbuntuMono_B9pt7b);
+        tft.drawString(line1, 5, y);
+        tft.setTextColor(TFT_LIGHTGREY);
+        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE); 
       }
@@ -1976,9 +2174,10 @@ void switchRadioMode(RadioMode targetMode) {
   sessionOtherBytes = 0; liveOtherBytes = 0;
   sessionBleCount = 0; sortBleCount = 0; liveBleCount = 0;
   sessionApCount = 0; sortApCount = 0; liveApCount = 0;
+  sessionChannelCount = 0; sortChannelCount = 0; liveChannelCount = 0;
 
   // 3. HARDWARE ANTENNA TOGGLE
-  if (targetMode == RADIO_WIFI || targetMode == RADIO_AP) {
+  if (targetMode == RADIO_WIFI || targetMode == RADIO_AP || targetMode == RADIO_CHANNELS) {
     // Put BLE to sleep so Wi-Fi gets 100% of the antenna
     if (pBLEScan != nullptr) {
       pBLEScan->stop();
@@ -2450,42 +2649,22 @@ void updateFoxhuntSignal(int packet_rssi) {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(15, OUTPUT); digitalWrite(15, HIGH);
-  pinMode(21, OUTPUT); digitalWrite(21, HIGH);
-  pinMode(5, OUTPUT);  digitalWrite(5, HIGH);
-
-  initProbeTracker();
-
-  delay(1000);
-  tft.init();
-  tft.setTouch(calData);
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
-  drawChartHeader();
-  drawChartFooter();
-
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
-  esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
-
-  Serial.println("\n--- Initializing SD Card ---");
-  if (!sd.begin(SdSpiConfig(5, SHARED_SPI, SD_SCK_MHZ(4)))) {
-    Serial.println("[!] SD Card Mount Failed!");
-    sd.initErrorPrint(&Serial);
-  } else {
-    Serial.println("[*] SD Card mounted successfully.");
-    FsFile file = sd.open("/oui_db.txt", O_READ);
-    if (!file) {
-      Serial.println("[!] Failed to open /oui_db.txt! Check filename.");
-    } else {
-      Serial.printf("[*] SUCCESS! oui_db.txt found. Size: %llu bytes\n", file.fileSize());
-      file.close();
-    }
+double getChannelMetric(ChannelRecord r, SortMode mode) {
+  if (mode == SORT_TOTAL) return (double)(r.tx_bytes + r.rx_bytes);
+  if (mode == SORT_TX) return (double)r.tx_bytes; // Downlink
+  if (mode == SORT_RX) return (double)r.rx_bytes; // Uplink
+  if (mode == SORT_AVG) return (r.packets > 0) ? (double)(r.sum_bytes / r.packets) : 0;
+  if (mode == SORT_CV) {
+    if (r.packets == 0) return 0;
+    double mean = (double)r.sum_bytes / r.packets;
+    double variance = ((double)r.sum_sq_bytes / r.packets) - (mean * mean);
+    if (variance <= 0 || mean == 0) return 0;
+    return (sqrt(variance) / mean) * 100.0;
   }
-  Serial.println("----------------------------\n");
+  // Repurposing SORT_DIST to sort by Power (Avg RSSI)
+  if (mode == SORT_DIST) return (double)r.avg_rssi; 
+  
+  return (double)(r.tx_bytes + r.rx_bytes); // Failsafe fallback
 }
 
 void forceSessionSort() {
@@ -2546,11 +2725,70 @@ void forceSessionSort() {
       sessionApData[j + 1] = key;
     }
   }
+  else if (currentRadioMode == RADIO_CHANNELS) {
+    for (int i = 1; i < sessionChannelCount; i++) {
+      ChannelRecord key = sessionChannelData[i];
+      double key_val = getChannelMetric(key, currentSortMode);
+      int j = i - 1;
+      if (sort_descending) {
+        while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) < key_val) {
+          sessionChannelData[j + 1] = sessionChannelData[j];
+          j = j - 1;
+        }
+      } else {
+        // Prevent sorting zero-data to the top in ascending mode
+        while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) > key_val && key_val > 0.0) {
+          sessionChannelData[j + 1] = sessionChannelData[j];
+          j = j - 1;
+        }
+      }
+      sessionChannelData[j + 1] = key;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+  pinMode(21, OUTPUT); digitalWrite(21, HIGH);
+  pinMode(5, OUTPUT);  digitalWrite(5, HIGH);
+
+  initProbeTracker();
+
+  delay(1000);
+  tft.init();
+  tft.setTouch(calData);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  drawChartHeader();
+  drawChartFooter();
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
+  esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+
+  Serial.println("\n--- Initializing SD Card ---");
+  if (!sd.begin(SdSpiConfig(5, SHARED_SPI, SD_SCK_MHZ(4)))) {
+    Serial.println("[!] SD Card Mount Failed!");
+    sd.initErrorPrint(&Serial);
+  } else {
+    Serial.println("[*] SD Card mounted successfully.");
+    FsFile file = sd.open("/oui_db.txt", O_READ);
+    if (!file) {
+      Serial.println("[!] Failed to open /oui_db.txt! Check filename.");
+    } else {
+      Serial.printf("[*] SUCCESS! oui_db.txt found. Size: %llu bytes\n", file.fileSize());
+      file.close();
+    }
+  }
+  Serial.println("----------------------------\n");
 }
 
 void loop() {
   processPendingVendors();
   uint16_t t_x = 0, t_y = 0;
+  bool should_render = false;
   bool pressed = tft.getTouch(&t_x, &t_y);
 
   if (pressed) {
@@ -2587,14 +2825,25 @@ void loop() {
             else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;
             else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE;
             else currentSortMode = SORT_TOTAL;
-          } else {
+          } 
+          else if (currentRadioMode == RADIO_CHANNELS) {
+            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;     
+            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;   
+            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;  
+            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;  
+            else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST; 
+            else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE; // <-- ADD THIS LINE
+            else currentSortMode = SORT_TOTAL;                                 // Loops back to TOTAL
+          }
+          else if (currentRadioMode == RADIO_BLE) {
             if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
             else if (currentBleSortMode == SORT_BLE_DIST) currentBleSortMode = SORT_BLE_AGE;
             else currentBleSortMode = SORT_BLE_HITS;
           }
           
           // 3. Redraw
-          drawChartFooter(); 
+          drawChartFooter();
+          should_render = true; // Trigger the engine to re-sort and redraw the bars
           delay(200); 
         }
         
@@ -2676,6 +2925,7 @@ void loop() {
         RadioMode nextMode;
         if (currentRadioMode == RADIO_WIFI) nextMode = RADIO_BLE;
         else if (currentRadioMode == RADIO_BLE) nextMode = RADIO_AP;
+        else if (currentRadioMode == RADIO_AP) nextMode = RADIO_CHANNELS;
         else nextMode = RADIO_WIFI;
 
         // 2. INSTANT PARTIAL REDRAW (Zero Screen Flicker!)
@@ -2692,11 +2942,16 @@ void loop() {
           tft.drawRect(300, 190, 150, 40, TFT_WHITE);
           tft.setTextColor(TFT_WHITE);
           tft.drawString("MODE: BLE", 375, 210);
-        } else {
+        } else if (nextMode == RADIO_AP) {
           tft.fillRect(300, 190, 150, 40, TFT_DARKGREEN);
           tft.drawRect(300, 190, 150, 40, TFT_WHITE);
           tft.setTextColor(TFT_WHITE);
           tft.drawString("MODE: NETWORKS", 375, 210);
+        } else {
+          tft.fillRect(300, 190, 150, 40, TFT_ORANGE);
+          tft.drawRect(300, 190, 150, 40, TFT_WHITE);
+          tft.setTextColor(TFT_WHITE);
+          tft.drawString("MODE: CHANNELS", 375, 210);
         }
         
         tft.setTextDatum(TL_DATUM); // Reset datum for the rest of your UI
@@ -2716,10 +2971,10 @@ void loop() {
         drawChartHeader();
         drawChartFooter();
         
-        // THE FIX: Wake the Wi-Fi radio back up if we are in a Wi-Fi mode!
-        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-            esp_wifi_set_promiscuous(true); 
-        }
+        // THE FIX: Wake the Wi-Fi radio back up if we are in ANY Wi-Fi based mode!
+          if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
+              esp_wifi_set_promiscuous(true); 
+          }
         
         // Channel tuning for locked targets
         if (currentRadioMode == RADIO_WIFI && target_locked) {
@@ -2880,7 +3135,9 @@ void loop() {
       if (t_y <= 30) {
         // ZONE 1: TOGGLE SORT METRIC (X: 275 to 405)
         if (t_x >= 275 && t_x < 405) {
+          
           if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+            // Standard Wi-Fi/AP Toggle Cycle
             if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;
             else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;
             else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;
@@ -2888,13 +3145,25 @@ void loop() {
             else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;
             else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE;
             else currentSortMode = SORT_TOTAL;
-          } else {
+          } 
+          else if (currentRadioMode == RADIO_CHANNELS) {
+            // Custom Channels Toggle Cycle (Loops back after PWR)
+            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;      // DN
+            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;    // UP
+            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;   // AVG Bytes
+            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;   // CV% Bytes
+            else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;  // PWR (Avg RSSI)
+            else currentSortMode = SORT_TOTAL;                                 // Skip AGE, loop back to TOTAL
+          }
+          else if (currentRadioMode == RADIO_BLE) {
+            // BLE Toggle Cycle
             if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
             else if (currentBleSortMode == SORT_BLE_DIST) currentBleSortMode = SORT_BLE_AGE;
             else currentBleSortMode = SORT_BLE_HITS;
           }
-          device_current_page = 0; // Snap list back to page 1 upon resorting
-          forceSessionSort();
+          
+          device_current_page = 0; 
+          forceSessionSort(); 
           drawDeviceList();
           delay(200);
         }
@@ -2918,6 +3187,7 @@ void loop() {
         if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
         else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
         else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
+        else if (currentRadioMode == RADIO_CHANNELS) total_devices = sessionChannelCount;
 
         // 1. PREV PAGE (X: 0 to 160)
         if (t_x < 160 && device_current_page > 0) {
@@ -3044,15 +3314,15 @@ void loop() {
 
   if (currentState == SCREEN_CHART || currentState == SCREEN_FOXHUNT) {
     static unsigned long lastTimer = 0;
-    bool should_render = false; // Local render trigger
+    //bool should_render = false; // Local render trigger MOVED TO TOP
 
     tft.setTextWrap(false);
 
-// ==========================================
+    // ==========================================
     // RADIO-AWARE TIMERS
     // ==========================================
     // Both Wi-Fi and AP modes need the Channel Hopper!
-    if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+    if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
       if (!target_locked) {
         if (millis() - lastTimer > HOP_INTERVAL) {
           lastTimer = millis();
@@ -3071,11 +3341,9 @@ void loop() {
           tft.setTextDatum(TL_DATUM);
           
           // Match the colors we set in drawChartHeader!
-          if (currentRadioMode == RADIO_AP) {
-            tft.setTextColor(TFT_GREEN);
-          } else {
-            tft.setTextColor(TFT_WHITE);
-          }
+          if (currentRadioMode == RADIO_AP) tft.setTextColor(TFT_GREEN);
+          else if (currentRadioMode == RADIO_CHANNELS) tft.setTextColor(TFT_ORANGE);
+          else tft.setTextColor(TFT_WHITE);
 
           char chStr[16];
           sprintf(chStr, "CH: %02d", CHANNELS[current_ch_idx]);
@@ -3100,7 +3368,7 @@ void loop() {
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.setTextDatum(TL_DATUM);
         tft.setTextColor(TFT_ORANGE);
-        tft.drawString("BLE MODE | SNIFFING...", 5, 4);
+        tft.drawString("SNIFFING BLE DEVICES", 5, 4);
       }
     }
 
@@ -3511,6 +3779,81 @@ void loop() {
           sortOtherBytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
         }
       }
+      else if (currentRadioMode == RADIO_CHANNELS) {
+        // ==========================================
+        // 4. CHANNEL SPECTRUM PROCESSING PIPELINE
+        // ==========================================
+        // 1. Snapshot the live data for the waterfall
+        memcpy((void*)sortChannelData, (void*)liveChannelData, sizeof(liveChannelData));
+        sortChannelCount = liveChannelCount;
+        
+        // 2. Sync to Historical Session
+        for (int i = 0; i < liveChannelCount; i++) {
+          bool found = false;
+          for (int j = 0; j < sessionChannelCount; j++) {
+            if (sessionChannelData[j].channel == liveChannelData[i].channel) {
+              // 1. Accumulate Volume
+              sessionChannelData[j].packets += liveChannelData[i].packets;
+              sessionChannelData[j].tx_bytes += liveChannelData[i].tx_bytes;
+              sessionChannelData[j].rx_bytes += liveChannelData[i].rx_bytes;
+              sessionChannelData[j].sum_bytes += liveChannelData[i].sum_bytes;
+              sessionChannelData[j].sum_sq_bytes += liveChannelData[i].sum_sq_bytes;
+              sessionChannelData[j].last_seen = liveChannelData[i].last_seen;
+              
+              // 2. Overwrite EMA State (Sync the physics model)
+              sessionChannelData[j].avg_rssi = liveChannelData[i].avg_rssi;
+              sessionChannelData[j].ema_variance = liveChannelData[i].ema_variance;
+              sessionChannelData[j].prev_rssi = liveChannelData[i].prev_rssi;
+              sessionChannelData[j].ema_cov = liveChannelData[i].ema_cov;
+              
+              found = true; break;
+            }
+          }
+          
+          // (Keep the memcpy block exactly as it is below this, 
+          // because memcpy perfectly copies all the floats automatically for new channels!)
+          
+          if (!found && sessionChannelCount < MAX_CHANNEL_RECORDS) {
+             memcpy((void*)&sessionChannelData[sessionChannelCount], (void*)&liveChannelData[i], sizeof(ChannelRecord));
+             sessionChannelCount++;
+          }
+        }
+        
+        // 3. Clear traffic counters for the next hop
+        for (int i = 0; i < liveChannelCount; i++) {
+            liveChannelData[i].packets = 0;
+            liveChannelData[i].tx_bytes = 0;
+            liveChannelData[i].rx_bytes = 0;
+            liveChannelData[i].sum_bytes = 0;
+            liveChannelData[i].sum_sq_bytes = 0;
+        }
+        
+        // 4. --- DYNAMIC INSERTION SORT: CHANNEL SNAPSHOT ---
+        for (int i = 1; i < sortChannelCount; i++) {
+          ChannelRecord key = sortChannelData[i];
+          double key_val = getChannelMetric(key, currentSortMode);
+          int j = i - 1;
+          
+          if (sort_descending) {
+              while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) < key_val) {
+                sortChannelData[j + 1] = sortChannelData[j];
+                j = j - 1;
+              }
+          } else {
+              while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) > key_val && key_val != 0) {
+                sortChannelData[j + 1] = sortChannelData[j];
+                j = j - 1;
+              }
+          }
+          sortChannelData[j + 1] = key;
+        }
+        
+        // 5. Calculate "Other" Bytes for channels beyond the top 8
+        sortOtherBytes = 0; 
+        for(int i = 8; i < sortChannelCount; i++) {
+          sortOtherBytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+        }
+      }
 
       pause_sniffing = false;
 
@@ -3520,8 +3863,9 @@ void loop() {
       if (currentRadioMode == RADIO_WIFI) displayCount = sortMacCount;
       else if (currentRadioMode == RADIO_BLE) displayCount = sortBleCount;
       else if (currentRadioMode == RADIO_AP) displayCount = sortApCount;
-        
-      if (displayCount > 0 || ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) && sortOtherBytes > 0)) {
+      else if (currentRadioMode == RADIO_CHANNELS) displayCount = sortChannelCount;
+
+      if (displayCount > 0 || ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) && sortOtherBytes > 0)) {
 
         // 1. CALCULATE AND DRAW "OTHER" IN THE TOP MENU BANNER
         int otherCount = 0;
@@ -3546,6 +3890,7 @@ void loop() {
         if (currentRadioMode == RADIO_WIFI) renderCount = sortMacCount;
         else if (currentRadioMode == RADIO_BLE) renderCount = sortBleCount;
         else if (currentRadioMode == RADIO_AP) renderCount = sortApCount;
+        else if (currentRadioMode == RADIO_CHANNELS) renderCount = sortChannelCount;
 
         for(int i = 0; i < 8 && i < renderCount; i++) {
           char short_text[20];
@@ -3593,6 +3938,11 @@ void loop() {
                short_text[19] = '\0';
             }
           }
+          else if (currentRadioMode == RADIO_CHANNELS) {
+             // Simply print the channel number (e.g., "CH 06")
+             snprintf(short_text, sizeof(short_text), "CH %02d", sortChannelData[i].channel);
+          }
+
 
           tft.setTextColor(colors[i]);
           int x_pos = 5 + (i % 2) * 240; 
@@ -3776,6 +4126,49 @@ void loop() {
             }
           }
         }
+        else if (currentRadioMode == RADIO_CHANNELS) {
+          // ==========================================
+          // CHANNEL PLOTTING (Log/Lin Scale)
+          // ==========================================
+          uint32_t total_bytes = sortOtherBytes;
+          for(int i = 0; i < 8 && i < sortChannelCount; i++) {
+            total_bytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+          }
+
+          if (total_bytes > 0) {
+            double log_total = 0;
+            if (useLogScale) {
+              for(int j = 0; j < 8 && j < sortChannelCount; j++) {
+                uint32_t c_total = sortChannelData[j].tx_bytes + sortChannelData[j].rx_bytes;
+                log_total += log10((double)c_total + 1.0);
+              }
+              log_total += log10((double)sortOtherBytes + 1.0);
+            }
+
+            for(int i = 0; i < 8 && i < sortChannelCount; i++) {
+              double fraction;
+              uint32_t current_c_bytes = sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes;
+              
+              if (useLogScale) fraction = log10((double)current_c_bytes + 1.0) / log_total;
+              else fraction = (double)current_c_bytes / (double)total_bytes;
+
+              int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
+              if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+
+              tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+              current_y -= bar_height;
+            }
+
+            if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
+              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
+            } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortChannelCount > 0) {
+              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortChannelCount - 1]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortChannelCount - 1]);
+            }
+          }
+      }
 
       current_x += 2;
       if (current_x >= 478) current_x = 0;
