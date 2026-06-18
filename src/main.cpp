@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include "SdFat.h"
 #include <NimBLEDevice.h>
+#include "tag221Lookup.h"
 #include "ble_oui.h"
 #include "ble_appearance.h"
 #include "ble_uuids.h"
@@ -56,7 +57,7 @@ const int RSSI_DROP_THRESHOLD = 12; // dBm drop to trigger body-block alert
 
 // --- Forward Declarations for OSINT Probe Tracker ---
 int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &added, uint8_t current_count);
-void processProbeRequestShared(uint8_t* mac, const char* ssid);
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor = "");
 
 enum UIState { SCREEN_CHART, SCREEN_MENU, SCREEN_AP_SCAN,
    SCREEN_DEVICE_LIST, SCREEN_PROBE_TRACKER, SCREEN_FOXHUNT };
@@ -396,39 +397,97 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           }
         }
         
-        if (ap_index == -1 && liveApCount < MAX_AP_RECORDS) {
-          ap_index = liveApCount;
-          memcpy((void*)liveApData[ap_index].bssid, addr2, 6);
-          
-          // Seed the mirrored math!
-          unsigned long now = millis();
-          liveApData[ap_index].first_seen = now;
-          liveApData[ap_index].last_seen = now;
-          liveApData[ap_index].packets = 0;
-          liveApData[ap_index].sum_bytes = 0;
-          liveApData[ap_index].sum_sq_bytes = 0;
-          liveApData[ap_index].tx_bytes = 0;
-          liveApData[ap_index].rx_bytes = 0;
-          liveApData[ap_index].max_rate = 0;
-          liveApData[ap_index].rssi = pkt->rx_ctrl.rssi;
-          liveApData[ap_index].channel = CHANNELS[current_ch_idx]; 
-          
-          liveApCount++;
-          
-          // Safely copy up to 31 chars of SSID
-          if (payload[36] == 0) {
-            uint8_t ssid_len = payload[37]; 
-            if (ssid_len > 0 && ssid_len <= 31) {
-              memcpy((void*)liveApData[ap_index].ssid, payload + 38, ssid_len);
-              liveApData[ap_index].ssid[ssid_len] = '\0';
-            } else {
-              strcpy((char*)liveApData[ap_index].ssid, "<HIDDEN>");
-            }
+        if (ap_index == -1) {
+          if (liveApCount < MAX_AP_RECORDS) {
+            // Space available, claim the next slot
+            ap_index = liveApCount;
+            liveApCount++;
           } else {
-             strcpy((char*)liveApData[ap_index].ssid, "<UNKNOWN>");
+            // ==========================================
+            // THE STALE & WEAK HYBRID EVICTION
+            // ==========================================
+            unsigned long now = millis();
+            int stalest_idx = 0;
+            int weakest_idx = 0;
+            unsigned long oldest_time = 0xFFFFFFFF;
+            int lowest_rssi = 127; // Max possible int8_t
+
+            for (int i = 0; i < MAX_AP_RECORDS; i++) {
+              if (liveApData[i].last_seen < oldest_time) {
+                oldest_time = liveApData[i].last_seen;
+                stalest_idx = i;
+              }
+              if (liveApData[i].rssi < lowest_rssi) {
+                lowest_rssi = liveApData[i].rssi;
+                weakest_idx = i;
+              }
+            }
+
+            // 1. The Ghost Hunt (Evict if silent for > 60 seconds)
+            if ((now - oldest_time) > 60000) {
+              ap_index = stalest_idx;
+            }
+            // 2. The Weakest Link (Evict if new AP is stronger than our worst AP)
+            else if (pkt->rx_ctrl.rssi > lowest_rssi) {
+              ap_index = weakest_idx;
+            }
+          }
+
+          // If we successfully claimed a slot (either a new one or an evicted one)
+          if (ap_index != -1) {
+            
+            // ==========================================
+            // THE BEACON DECODER (Extract True Channel & SSID)
+            // ==========================================
+            uint8_t true_channel = CHANNELS[current_ch_idx]; // Fallback to current hopper
+            char extracted_ssid[32] = "<HIDDEN>"; // Default to hidden
+            
+            // Beacons have a 24-byte MAC Header + 12-byte Fixed Parameters = 36 bytes before Tags begin.
+            int offset = 36; 
+            
+            while (offset < len - 4) { // Loop through tags, stopping before the 4-byte FCS checksum
+              uint8_t tag_num = payload[offset];
+              uint8_t tag_len = payload[offset + 1];
+              
+              if (offset + 2 + tag_len > len) break; // Memory safety bounds check
+              
+              // Tag 0: SSID
+              if (tag_num == 0) {
+                if (tag_len > 0 && tag_len <= 31) {
+                  memcpy(extracted_ssid, payload + offset + 2, tag_len);
+                  extracted_ssid[tag_len] = '\0'; // Null terminate
+                }
+              }
+              // Tag 3: DS Parameter Set (Current Channel)
+              else if (tag_num == 3 && tag_len == 1) {
+                true_channel = payload[offset + 2];
+              }
+              
+              offset += 2 + tag_len; // Jump to the next tag
+            }
+
+            // ==========================================
+            // POPULATE THE AP RECORD
+            // ==========================================
+            memcpy((void*)liveApData[ap_index].bssid, addr2, 6);
+            
+            unsigned long now = millis();
+            liveApData[ap_index].first_seen = now;
+            liveApData[ap_index].last_seen = now;
+            liveApData[ap_index].packets = 0;
+            liveApData[ap_index].sum_bytes = 0;
+            liveApData[ap_index].sum_sq_bytes = 0;
+            liveApData[ap_index].tx_bytes = 0;
+            liveApData[ap_index].rx_bytes = 0;
+            liveApData[ap_index].max_rate = 0;
+            liveApData[ap_index].rssi = pkt->rx_ctrl.rssi;
+            
+            liveApData[ap_index].channel = true_channel; // <--- INJECT THE TRUE CHANNEL
+            strcpy((char*)liveApData[ap_index].ssid, extracted_ssid); // <--- INJECT THE PARSED SSID
           }
         }
-        
+
+        // If the AP made it into the array, process the packet!
         if (ap_index != -1) {
           liveApData[ap_index].last_seen = millis();
           liveApData[ap_index].rssi = pkt->rx_ctrl.rssi; 
@@ -499,8 +558,11 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
             liveChannelData[idx].first_seen = now;
             liveChannelData[idx].last_seen = now;
             
+            // Seed the physics engine
             liveChannelData[idx].avg_rssi = (float)pkt->rx_ctrl.rssi;
-            liveChannelData[idx].ema_variance = 0.0; // Starts at 0 volatility
+            liveChannelData[idx].prev_rssi = (float)pkt->rx_ctrl.rssi; // Remember the very first packet
+            liveChannelData[idx].ema_variance = 0.0; 
+            liveChannelData[idx].ema_cov = 0.0;      
             
             liveChannelCount++; 
         } else {
@@ -514,18 +576,27 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     liveChannelData[idx].sum_sq_bytes += ((uint64_t)len * len);
     liveChannelData[idx].last_seen = millis();
     
-    // --- EMA MEAN & VARIANCE CALCULATION ---
+    // --- EMA MEAN, VARIANCE, & COVARIANCE CALCULATION ---
     float alpha = 0.05; // 5% weight to new packets, 95% to history
     float current_rssi = (float)pkt->rx_ctrl.rssi;
     
-    // Calculate the difference between this packet and our running average
+    // 1. Calculate the difference from the mean for the CURRENT packet
     float diff = current_rssi - liveChannelData[idx].avg_rssi;
     
-    // Update the Variance first (using the old average)
+    // 2. Calculate the difference from the mean for the PREVIOUS packet
+    float prev_diff = liveChannelData[idx].prev_rssi - liveChannelData[idx].avg_rssi;
+    
+    // 3. Update Autocovariance (Must happen before updating variance/mean)
+    liveChannelData[idx].ema_cov = (1.0 - alpha) * (liveChannelData[idx].ema_cov + alpha * diff * prev_diff);
+    
+    // 4. Update Variance
     liveChannelData[idx].ema_variance = (1.0 - alpha) * (liveChannelData[idx].ema_variance + alpha * diff * diff);
     
-    // Then update the Mean
+    // 5. Update Mean
     liveChannelData[idx].avg_rssi += (alpha * diff);
+    
+    // 6. Store current RSSI into memory for the next packet's covariance check
+    liveChannelData[idx].prev_rssi = current_rssi;
     
     // --- UPLINK / DOWNLINK ROUTER ---
     uint8_t ds_flags = payload[1] & 0x03;
@@ -548,38 +619,134 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Check if Frame Control byte 0 is 0x40 (Subtype 4: Probe Request)
   if (payload[0] == 0x40) {
     
-    // THE RANDOMIZATION FILTER:
-    // Check the Locally Administered bit (second least-significant bit of the first byte).
-    // If it's a 0, this is a globally unique physical MAC.
-    if ((addr2[0] & 0x02) == 0) { 
-      
-      // In Probe Requests, the Tagged Parameters start after the 24-byte MAC header.
-      int offset = 24; 
-      
-      // Loop through the tags to find the SSID (Tag Number 0)
-      while (offset < len - 4) { // -4 to ignore the FCS checksum at the end
-        uint8_t tag_num = payload[offset];
-        uint8_t tag_len = payload[offset + 1];
+    // --- SAFE HEX DUMPER FOR IE DEBUGGING ---
+    static unsigned long last_debug_dump = 0;
+    if (millis() - last_debug_dump > 2000) { // Only dump one packet every 2 seconds
+        last_debug_dump = millis();
+        
+        Serial.printf("\n--- PROBE REQUEST IE DUMP (MAC: %02X:%02X:%02X:%02X:%02X:%02X) ---\n", 
+                      addr2[0], addr2[1], addr2[2], addr2[3], addr2[4], addr2[5]);
+        
+        // Probe Requests have no fixed parameters, tags start exactly at byte 24
+        int debug_offset = 24; 
+        
+        while (debug_offset < len - 4) { // Stop before the 4-byte FCS checksum
+            uint8_t tag_num = payload[debug_offset];
+            uint8_t tag_len = payload[debug_offset + 1];
+            
+            if (debug_offset + 2 + tag_len > len) break; // Memory safety boundary
+            
+            // Print the Tag ID and Length
+            Serial.printf("Tag %3d (0x%02X) | Len: %2d | Data: ", tag_num, tag_num, tag_len);
+            
+            // Print the raw Hex payload of the tag
+            for (int d = 0; d < tag_len; d++) {
+                Serial.printf("%02X ", payload[debug_offset + 2 + d]);
+            }
+            
+            // If it is an SSID (Tag 0), print the human-readable ASCII next to it
+            if (tag_num == 0 && tag_len > 0) {
+                Serial.print("  (\"");
+                for (int d = 0; d < tag_len; d++) {
+                    char c = payload[debug_offset + 2 + d];
+                    if (c >= 32 && c <= 126) Serial.print(c); // Printable ASCII
+                    else Serial.print('.');                   // Unprintable character
+                }
+                Serial.print("\")");
+            }
+            Serial.println(); // Next tag
+            
+            debug_offset += 2 + tag_len; // Jump to the next tag in the chain
+        }
+        Serial.println("-----------------------------------------------------------\n");
+    }
+    // ----------------------------------------
 
-        // 0x00 is the SSID Tag
-        if (tag_num == 0) {
-          // Check the reported length first
-          if (tag_len > 0 && tag_len <= 32) {
-            char extracted_ssid[33];
-            memcpy(extracted_ssid, &payload[offset + 2], tag_len);
-            extracted_ssid[tag_len] = '\0'; // Ensure it's null-terminated
-
-            // THE CLOAKING FILTER
-            if (strlen(extracted_ssid) > 0) {
-              processProbeRequestShared(addr2, extracted_ssid);
+    // ==========================================
+    // THE SMART BOUNCER & IE PARSER (Replaces old Filter)
+    // ==========================================
+    bool is_randomized = (addr2[0] & 0x02) != 0;
+    
+    int offset = 24; 
+    char final_ssid[33] = "";
+    bool is_valid_ssid = false; 
+    
+    char ie_vendor[25] = "";    
+    uint8_t highest_weight_found = 0; // Resets for every new packet
+    
+    // 1. FIRST PASS: Parse the IE tags to build the profile
+    while (offset < len - 4) {
+      uint8_t tag_num = payload[offset];
+      uint8_t tag_len = payload[offset + 1];
+      
+      if (offset + 2 + tag_len > len) break; // Memory safety boundary
+      
+      // Extract the SSID (Tag 0)
+      if (tag_num == 0) {
+        if (tag_len == 0) {
+          strcpy(final_ssid, "<Wld>");
+        } 
+        else if (tag_len <= 32) {
+          if (payload[offset + 2] == 0x00) {
+            strcpy(final_ssid, "<Nul>");
+          } else {
+            bool has_valid_chars = false;
+            for (int c = 0; c < tag_len; c++) {
+              char ch = payload[offset + 2 + c];
+              if (ch >= 32 && ch <= 126) {
+                final_ssid[c] = ch;
+                has_valid_chars = true; 
+              } else {
+                final_ssid[c] = '.';
+              }
+            }
+            final_ssid[tag_len] = '\0';
+            
+            if (has_valid_chars) {
+              is_valid_ssid = true; // Valid printable network name found!
+            } else {
+              strcpy(final_ssid, "<Nul>");
             }
           }
-          break; // Once we process the SSID, we can stop parsing this packet
         }
-        // Jump to the next tag
-        offset += 2 + tag_len;
       }
+      
+      // Extract the True Vendor via Tag 221
+      else if (tag_num == 221 && tag_len >= 3) {
+        // Search the compiled array from your include/tag221Lookup.h file
+        for (int v = 0; v < TAG_221_COUNT; v++) {
+          if (payload[offset+2] == TAG_221_DATABASE[v].oui[0] && 
+              payload[offset+3] == TAG_221_DATABASE[v].oui[1] && 
+              payload[offset+4] == TAG_221_DATABASE[v].oui[2]) {
+                
+            if (TAG_221_DATABASE[v].weight > highest_weight_found) {
+              highest_weight_found = TAG_221_DATABASE[v].weight;
+              snprintf(ie_vendor, sizeof(ie_vendor), "%s (IE)", TAG_221_DATABASE[v].name);
+            }
+            break; 
+          }
+        }
+      }
+      
+      offset += 2 + tag_len; 
     }
+
+    // 2. THE DECISION GATE
+    // Universal Pass: Real MACs get through.
+    // Conditional Pass: Randomized MACs only get through if targeting a named network.
+    if (!is_randomized || (is_randomized && is_valid_ssid)) {
+      if (strlen(final_ssid) > 0) { 
+        
+        // ONLY pass the Tag 221 guess if the MAC is randomized!
+        // If it is a physical MAC, pass an empty string so Core 1 checks the SD Card.
+        if (is_randomized) {
+          processProbeRequestShared(addr2, final_ssid, ie_vendor);
+        } else {
+          processProbeRequestShared(addr2, final_ssid, ""); 
+        }
+        
+      }
+    }    
     return; // EXIT EARLY: Do not let Management frames hit the bandwidth math!
   }
   // ==========================================
@@ -1045,7 +1212,7 @@ void drawChartHeader() {
       char safe_ssid[15];
       strncpy(safe_ssid, target_ssid, 14);
       safe_ssid[14] = '\0';
-      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING %s (%ddBm)", target_channel, safe_ssid, target_rssi);
+      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | %s (%ddBm)", target_channel, safe_ssid, target_rssi);
     }
   }
 
@@ -1491,14 +1658,14 @@ void drawDeviceList() {
   }
 
   // Draw Metric Button Outline and Text
-  tft.fillRoundRect(275, 2, 130, 20, 3, TFT_DARKGREY); 
+  tft.fillRoundRect(275, 2, 130, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
   tft.setTextColor(metricColor);
   tft.drawString(metricStr, 282, 4);
 
   // Draw Direction Button Outline and Text
   // FIX: Updated X coordinate to 410 and Width to 65
-  tft.fillRoundRect(410, 2, 65, 20, 3, TFT_DARKGREY); 
+  tft.fillRoundRect(410, 2, 65, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
   
   if (sort_descending) {
@@ -1538,15 +1705,15 @@ void drawDeviceList() {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
       tft.drawString("     SSID                 BSSID            RSSI TOTAL", 5, 26);       
       tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%   TX | RX", 5, 41);
+      tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%    TX | RX", 5, 41);
     }
     else if (currentRadioMode == RADIO_CHANNELS) {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
       // 'PWR(AVG|STD)' replaces the old raw RSSI column
-      tft.drawString("     CHANNEL              PWR(AVG|STD)       TOTAL", 5, 26);       
+      tft.drawString("     CHANNEL           PWR(AVG dBm|STD)         TOTAL", 5, 26);       
       tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
       // 'STATE' replaces the blank space
-      tft.drawString("    FIRST | LAST       STATE   AVG  CV%    DN | UP", 5, 41);
+      tft.drawString("    FIRST | LAST         STATE   AVG  CV%    DN | UP", 5, 41);
     }
     else {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
@@ -1619,7 +1786,7 @@ void drawDeviceList() {
         snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
                  (i + 1), safeVendor, macStr, sessionData[i].rssi, totStr);
 
-        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d %-5.5s %4.0f%%   %9s", 
+        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d  %-5.5s %4.0f%%   %9s", 
                  ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
                  avgStr, cv_percent, trafficCombo);
 
@@ -1837,7 +2004,8 @@ void drawDeviceList() {
         // Format the combined Power String (e.g., "-65|±3")
         char pwrStr[16];
         if (sessionChannelData[i].packets == 0) strcpy(pwrStr, "N/A");
-        else snprintf(pwrStr, sizeof(pwrStr), "%3.0f|%s%-2.0f", avg_rssi, "±", std_dev_rssi);
+        else snprintf(pwrStr, sizeof(pwrStr), "%3.0f|~%-2.0f", avg_rssi, std_dev_rssi);
+        //replace "~" with "±" if your font supports it, or keep as is for clarity on the small screen
 
         // --- PERFECTLY JUSTIFIED UI STRINGS ---
         // 14-char spacer to align Power, 11-char padding to align Total to the far right
@@ -2326,7 +2494,7 @@ int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &ad
   }
 }
 
-void processProbeRequestShared(uint8_t* mac, const char* ssid) {
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor) {
   int target_slot = -1;
   unsigned long oldest_time = 0xFFFFFFFF;
   int oldest_slot = 0;
@@ -2371,10 +2539,17 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid) {
     probeList[target_slot].generation++; 
     
     // ==========================================
-    // DEFER THE SD CARD LOOKUP TO CORE 1
+    // DEFER TO CORE 1 OR USE KNOWN VENDOR
     // ==========================================
-    strncpy(probeList[target_slot].vendor, "Resolving...", 25);
-    probeList[target_slot].needs_lookup = true; 
+    if (strlen(known_vendor) > 0) {
+      // We already know who this is from Tag 221! Lock out Core 1.
+      strncpy(probeList[target_slot].vendor, known_vendor, 25);
+      probeList[target_slot].needs_lookup = false; 
+    } else {
+      // We have no idea who this is. Tell Core 1 to check the SD Card.
+      strncpy(probeList[target_slot].vendor, "Resolving...", 25);
+      probeList[target_slot].needs_lookup = true; 
+    }
     // ==========================================
   }
 
@@ -2471,14 +2646,31 @@ void drawProbeTracker() {
     int y = 35 + (row * 50); // Each entry block gets 50px of vertical height
 
     if (!is_slot_empty) {
-      // --- LINE 1: Metadata (Vendor, MAC, & Hit Count) ---
+// --- LINE 1: Metadata (Vendor, MAC, & Hit Count) ---
       tft.setTextColor(TFT_GREEN);
+      
+      // 1. The Vendor Formatting Logic
+      bool is_randomized = (probeList[i].mac[0] & 0x02) != 0;
+      char safeVendor[20];
+      
+      // Check for ongoing resolution, randomization, colons (MAC fallback), or empty/Unknown strings
+      if (strcmp(probeList[i].vendor, "Resolving...") == 0) {
+          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "Resolving...");
+      } else if (is_randomized) {
+          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "<Randomized>");
+      } else if (probeList[i].vendor[2] == ':' || strcmp(probeList[i].vendor, "Unknown") == 0 || strlen(probeList[i].vendor) == 0) {
+          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "Unknown Device");
+      } else {
+          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", probeList[i].vendor);
+      }
+
+      // 2. The String Assembly (Upgraded to handle the 16-character vendor width)
       char metaStr[60];
-      snprintf(metaStr, sizeof(metaStr), "[%02d] %-8s %02X:%02X:%02X:%02X:%02X:%02X",
-               i + 1,
-               probeList[i].vendor,
+      snprintf(metaStr, sizeof(metaStr), "[%02d] %-16.16s  %02X:%02X:%02X:%02X:%02X:%02X",
+               i + 1, safeVendor,
                probeList[i].mac[0], probeList[i].mac[1], probeList[i].mac[2],
                probeList[i].mac[3], probeList[i].mac[4], probeList[i].mac[5]);
+               
       tft.drawString(metaStr, 10, y + 5);
 
       // Right-aligned Hit Counter
@@ -2784,6 +2976,7 @@ void setup() {
   }
   Serial.println("----------------------------\n");
 }
+
 
 void loop() {
   processPendingVendors();
@@ -3682,6 +3875,7 @@ void loop() {
           bool found = false;
           float rawDistance = calculateRfDistance(liveApData[i].rssi, 0, RADIO_WIFI_24GHZ);
 
+          // A. Try to update an existing AP
           for (int j = 0; j < sessionApCount; j++) {
             if (memcmp(sessionApData[j].bssid, (void*)liveApData[i].bssid, 6) == 0) {
               
@@ -3713,10 +3907,50 @@ void loop() {
             }
           }
           
-          if (!found && sessionApCount < MAX_AP_RECORDS) {
-             memcpy((void*)&sessionApData[sessionApCount], (void*)&liveApData[i], sizeof(ApRecord));
-             sessionApData[sessionApCount].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
-             sessionApCount++;
+          // B. If it's a completely new AP, claim a new slot OR Evict
+          if (!found) {
+            int targetIndex = -1;
+
+            if (sessionApCount < MAX_AP_RECORDS) {
+              // Space available, claim the next slot
+              targetIndex = sessionApCount;
+              sessionApCount++;
+            } else {
+              // ==========================================
+              // THE STALE & WEAK HYBRID EVICTION (Sync)
+              // ==========================================
+              unsigned long now = millis();
+              int stalest_idx = 0;
+              int weakest_idx = 0;
+              unsigned long oldest_time = 0xFFFFFFFF;
+              int lowest_rssi = 127;
+
+              for (int k = 0; k < MAX_AP_RECORDS; k++) {
+                if (sessionApData[k].last_seen < oldest_time) {
+                  oldest_time = sessionApData[k].last_seen;
+                  stalest_idx = k;
+                }
+                if (sessionApData[k].rssi < lowest_rssi) {
+                  lowest_rssi = sessionApData[k].rssi;
+                  weakest_idx = k;
+                }
+              }
+
+              // 1. The Ghost Hunt
+              if ((now - oldest_time) > 60000) {
+                targetIndex = stalest_idx;
+              } 
+              // 2. The Weakest Link
+              else if (liveApData[i].rssi > lowest_rssi) {
+                targetIndex = weakest_idx;
+              }
+            }
+
+            // If we claimed a slot, pull the data from the live buffer!
+            if (targetIndex != -1) {
+               memcpy((void*)&sessionApData[targetIndex], (void*)&liveApData[i], sizeof(ApRecord));
+               sessionApData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
+            }
           }
         }
         
@@ -3847,7 +4081,27 @@ void loop() {
           }
           sortChannelData[j + 1] = key;
         }
-        
+
+        // --- DYNAMIC INSERTION SORT: CHANNEL SESSION (SEEN DEVICES) ---
+        for (int i = 1; i < sessionChannelCount; i++) {
+          ChannelRecord key = sessionChannelData[i];
+          double key_val = getChannelMetric(key, currentSortMode);
+          int j = i - 1;
+          
+          if (sort_descending) {
+              while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) < key_val) {
+                sessionChannelData[j + 1] = sessionChannelData[j];
+                j = j - 1;
+              }
+          } else {
+              while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) > key_val && key_val != 0) {
+                sessionChannelData[j + 1] = sessionChannelData[j];
+                j = j - 1;
+              }
+          }
+          sessionChannelData[j + 1] = key;
+        }
+                
         // 5. Calculate "Other" Bytes for channels beyond the top 8
         sortOtherBytes = 0; 
         for(int i = 8; i < sortChannelCount; i++) {
