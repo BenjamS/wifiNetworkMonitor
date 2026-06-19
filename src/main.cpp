@@ -22,6 +22,12 @@ enum RadioProtocol {
     RADIO_WIFI_24GHZ,
     RADIO_WIFI_5GHZ
 };
+// ==========================================
+// OSINT PROBE TRACKER GLOBALS
+// ==========================================
+enum ProbeSortMode { PROBE_SORT_HITS, PROBE_SORT_DIST, PROBE_SORT_SSIDS, PROBE_SORT_AGE };
+ProbeSortMode currentProbeSortMode = PROBE_SORT_HITS;
+bool probe_sort_descending = true;
 
 /**
  * Universal Log-Distance Path Loss Calculator
@@ -33,7 +39,7 @@ enum RadioProtocol {
  */
 
 int ap_current_page = 0;
-const int APS_PER_PAGE = 8; // Number of APs that fit safely between the header and footer
+const int APS_PER_PAGE = 5; // Number of APs that fit safely between the header and footer
 
 int target_rssi = 0;
 
@@ -57,15 +63,15 @@ const int RSSI_DROP_THRESHOLD = 12; // dBm drop to trigger body-block alert
 
 // --- Forward Declarations for OSINT Probe Tracker ---
 int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &added, uint8_t current_count);
-void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor = "");
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor = "", int8_t rssi = -100);
 
 enum UIState { SCREEN_CHART, SCREEN_MENU, SCREEN_AP_SCAN,
    SCREEN_DEVICE_LIST, SCREEN_PROBE_TRACKER, SCREEN_FOXHUNT };
 UIState currentState = SCREEN_CHART;
 
-const int MAX_PROBE_SLOTS = 10;     // Max unique devices tracked
-const int TOTAL_SSID_POOL = 60;     // Total unique SSID strings shared among all devices
-const int EMERGENCY_CUTOFF = 5;    // Max SSIDs a single device can claim
+const int MAX_PROBE_SLOTS = 45;     // Max unique devices tracked
+const int TOTAL_SSID_POOL = 150;     // Total unique SSID strings shared among all devices
+const int EMERGENCY_CUTOFF = 15;    // Max SSIDs a single device can claim
 
 struct SSIDNode {
   char text[33];
@@ -74,8 +80,10 @@ struct SSIDNode {
 
 struct ProbeRecordShared {
   // 4-byte variables first
+  unsigned long first_seen; 
   unsigned long last_seen;
   int first_ssid_idx;               
+  float smoothedDistance;   // <--- NEW: 4-byte physics variable
   
   // 2-byte variables
   uint16_t hits;
@@ -86,6 +94,7 @@ struct ProbeRecordShared {
   uint8_t ssid_count;
   uint8_t generation = 0;
   bool needs_lookup = false;
+  int8_t rssi;              // <--- NEW: 1-byte physics variable
 };
 
 // Fixed, static memory blocks
@@ -189,6 +198,7 @@ struct ChannelRecord {
   float ema_cov;      // The autocorrelation tracker
 };
 
+int total_sniffed_probes = 0;
 int device_current_page = 0;
 const int DEVICES_PER_PAGE = 13; // 9pt font with 18px line spacing fits 13 devices perfectly
 
@@ -740,9 +750,9 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
         // ONLY pass the Tag 221 guess if the MAC is randomized!
         // If it is a physical MAC, pass an empty string so Core 1 checks the SD Card.
         if (is_randomized) {
-          processProbeRequestShared(addr2, final_ssid, ie_vendor);
+          processProbeRequestShared(addr2, final_ssid, ie_vendor, pkt->rx_ctrl.rssi);
         } else {
-          processProbeRequestShared(addr2, final_ssid, ""); 
+          processProbeRequestShared(addr2, final_ssid, "", pkt->rx_ctrl.rssi); 
         }
         
       }
@@ -1301,6 +1311,60 @@ double getBleSortMetric(BLERecord& record, BleSortMode mode) {
     return 0.0;
 }
 
+// ==========================================
+// PROBE REQUEST SORTING
+// ==========================================
+
+double getProbeMetric(ProbeRecordShared record, ProbeSortMode mode) {
+    if (mode == PROBE_SORT_HITS) return (double)record.hits;
+    if (mode == PROBE_SORT_SSIDS) return (double)record.ssid_count;
+    if (mode == PROBE_SORT_AGE) return (double)record.last_seen;
+    
+    if (mode == PROBE_SORT_DIST) {
+        // Push devices with 0.0 distance (unknown/calculating) to the bottom
+        if (record.smoothedDistance <= 0.0) return 99999.0; 
+        return (double)record.smoothedDistance;
+    }
+    return 0.0;
+}
+
+void sortProbeList() {
+    for (int i = 1; i < MAX_PROBE_SLOTS; i++) {
+        ProbeRecordShared key = probeList[i];
+        
+        // Skip moving empty slots up the list
+        bool key_empty = true;
+        for(int b=0; b<6; b++) if(key.mac[b]!=0) { key_empty=false; break; }
+        if (key_empty) continue; 
+
+        double key_val = getProbeMetric(key, currentProbeSortMode);
+        int j = i - 1;
+
+        if (probe_sort_descending) {
+            while (j >= 0) {
+                bool j_empty = true;
+                for(int b=0; b<6; b++) if(probeList[j].mac[b]!=0) { j_empty=false; break; }
+                
+                if (j_empty || getProbeMetric(probeList[j], currentProbeSortMode) < key_val) {
+                    probeList[j + 1] = probeList[j];
+                    j--;
+                } else break;
+            }
+        } else {
+            while (j >= 0) {
+                bool j_empty = true;
+                for(int b=0; b<6; b++) if(probeList[j].mac[b]!=0) { j_empty=false; break; }
+                
+                if (j_empty || getProbeMetric(probeList[j], currentProbeSortMode) > key_val) {
+                    probeList[j + 1] = probeList[j];
+                    j--;
+                } else break;
+            }
+        }
+        probeList[j + 1] = key;
+    }
+}
+
 void drawChartFooter() {
   // 1. Draw the top bounding line (separating it from the waterfall)
   //tft.drawLine(0, 295, 480, 295, TFT_WHITE);
@@ -1418,11 +1482,12 @@ void drawApScanner() {
   tft.fillRect(0, 0, 480, 30, TFT_BLUE);
   tft.drawString("SELECT TARGET AP", 240, 15);
 
-  tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+  // THE FIX: Bumped the global list font to 11pt!
+  tft.setFreeFont(&UbuntuMono_Regular11pt7b);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_GREEN);
-  tft.drawRect(0, 40, 480, 25, TFT_DARKGREY);
-  tft.drawString("[*] SNIFF ALL (Free Airspace)", 5, 45);
+  tft.drawRect(0, 40, 480, 35, TFT_DARKGREY); // Matched height to 35px for symmetry
+  tft.drawString("[*] SNIFF ALL (Free Airspace)", 5, 50);
 
   tft.setTextColor(TFT_WHITE);
   
@@ -1430,7 +1495,7 @@ void drawApScanner() {
   // LIST GENERATION
   // ==========================================
   if (n == 0) {
-    tft.drawString("No networks found in airspace.", 5, 75);
+    tft.drawString("No networks found in airspace.", 5, 90);
   } else {
     int start_idx = ap_current_page * APS_PER_PAGE;
 
@@ -1444,12 +1509,13 @@ void drawApScanner() {
 
     int row = 0;
     for (int i = start_idx; i < end_idx; ++i) {
-      int y = 70 + (row * 25);
+      // Y-math updated to account for the larger header row
+      int y = 80 + (row * 35); 
 
       // 1. Get the raw BSSID bytes and the SSID string
       uint8_t* bssid = WiFi.BSSID(i);
       String raw_ssid = WiFi.SSID(i);
-      char tactical_ssid[22]; 
+      char tactical_ssid[26]; // Expanded buffer slightly for safety
 
       // 2. Determine if this SSID is a duplicate in the airspace
       bool has_clone = false;
@@ -1466,28 +1532,27 @@ void drawApScanner() {
       if (raw_ssid.length() == 0) {
         snprintf(tactical_ssid, sizeof(tactical_ssid), "<HIDDEN> [%02X%02X]", bssid[4], bssid[5]);
       } else if (has_clone) {
-        char temp_ssid[13];
-        strncpy(temp_ssid, raw_ssid.c_str(), 12);
-        temp_ssid[12] = '\0';
+        char temp_ssid[16]; // Allowed a few more characters since we dropped the MAC!
+        strncpy(temp_ssid, raw_ssid.c_str(), 15);
+        temp_ssid[15] = '\0';
         snprintf(tactical_ssid, sizeof(tactical_ssid), "%s~%02X%02X", temp_ssid, bssid[4], bssid[5]);
       } else {
-        // Unique network! Give it more characters since we don't need the suffix.
-        char temp_ssid[18]; 
-        strncpy(temp_ssid, raw_ssid.c_str(), 17);
-        temp_ssid[17] = '\0';
+        char temp_ssid[22]; 
+        strncpy(temp_ssid, raw_ssid.c_str(), 21);
+        temp_ssid[21] = '\0';
         snprintf(tactical_ssid, sizeof(tactical_ssid), "%s", temp_ssid);
       }
 
-      // 4. Print the row using the new tactical_ssid
+      // 4. Print the row using the new, cleaner format
       char apRowStr[80];
-      snprintf(apRowStr, sizeof(apRowStr), "CH:%02d  %-20s %4ddBm  %s",
+      // Removed the MAC string at the end and slightly expanded the SSID spacing
+      snprintf(apRowStr, sizeof(apRowStr), "CH:%02d  %-22s %4ddBm",
                WiFi.channel(i),
                tactical_ssid,
-               WiFi.RSSI(i),
-               WiFi.BSSIDstr(i).c_str());
+               WiFi.RSSI(i));
 
-      tft.drawString(apRowStr, 5, y + 5);
-      tft.drawRect(0, y, 480, 25, TFT_DARKGREY);
+      tft.drawString(apRowStr, 5, y + 10);
+      tft.drawRect(0, y, 480, 35, TFT_DARKGREY);
       row++;
     }
   }
@@ -1495,6 +1560,7 @@ void drawApScanner() {
   // ==========================================
   // FOOTER & NAVIGATION (Always renders!)
   // ==========================================
+  // Dropped footer back to 9pt so the buttons don't crowd each other
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
   tft.setTextDatum(TL_DATUM);
 
@@ -1748,7 +1814,11 @@ void drawDeviceList() {
 
         bool is_randomized = (sessionData[i].mac[0] & 0x02) != 0;
         char safeVendor[20]; 
-        if (is_randomized) {
+        
+        if (strstr(sessionData[i].vendor, "(IE)") != nullptr) {
+            // VIP ACCESS: Bypass the randomization mask
+            snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", sessionData[i].vendor);
+        } else if (is_randomized) {
             snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", "<Randomized>");
         } else if (sessionData[i].vendor[2] == ':' || strlen(sessionData[i].vendor) == 0) {
             snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", "Unknown Device");
@@ -2046,6 +2116,42 @@ void drawDeviceList() {
   }
 }
 
+float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
+    // Protection against invalid/corrupt packets. 
+    // Returning -1.0 prevents the EMA filter from dragging the average down to 0!
+    if (rssi >= 0 || rssi < -100) return -1.0; 
+
+    float measuredPowerAtOneMeter;
+    float pathLossExponent;
+
+    // Set baselines based on the physical frequency and protocol
+    switch (protocol) {
+        case RADIO_BLE_24GHZ:
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.2; // Standard indoor
+            break;
+
+        case RADIO_WIFI_24GHZ:
+            // Wi-Fi transmits significantly louder than BLE standard beacons
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 65.0 : -45.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.0; 
+            break;
+
+        case RADIO_WIFI_5GHZ:
+            // 5GHz absorbs into the environment much faster than 2.4GHz
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 68.0 : -50.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.8; // Heavy indoor attenuation
+            break;
+
+        default:
+            return -1.0;
+    }
+    
+    // The core Log-Distance Formula: d = 10 ^ ((A - RSSI) / 10n)
+    float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
+    return std::pow(10.0, ratio);
+}
+/*
 float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol) {
     if (rssi >= 0 || rssi < -100) return -1.0; // Protection against invalid packets
 
@@ -2075,7 +2181,6 @@ float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol) {
     }
 }
 
-/*
 float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
     if (rssi >= 0) return 0.0; // Protection against invalid/corrupt packets
 
@@ -2494,7 +2599,7 @@ int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &ad
   }
 }
 
-void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor) {
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor, int8_t rssi) {
   int target_slot = -1;
   unsigned long oldest_time = 0xFFFFFFFF;
   int oldest_slot = 0;
@@ -2534,7 +2639,7 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
     probeList[target_slot].hits = 0;
     probeList[target_slot].ssid_count = 0;
     probeList[target_slot].first_ssid_idx = -1;
-    
+    probeList[target_slot].first_seen = millis();
     // CRITICAL: Increment generation to invalidate any in-flight SD lookups for this slot (ABA fix)
     probeList[target_slot].generation++; 
     
@@ -2553,8 +2658,19 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
     // ==========================================
   }
 
+  // 1. Standard Updates
   probeList[target_slot].hits++;
   probeList[target_slot].last_seen = millis();
+  probeList[target_slot].rssi = rssi;
+  // 2. EMA Physics Engine
+  float rawDistance = calculateRfDistance(rssi, 0, RADIO_WIFI_24GHZ);
+  if (rawDistance > 0) {
+      if (probeList[target_slot].hits == 1) {
+          probeList[target_slot].smoothedDistance = rawDistance; // First hit is absolute
+      } else {
+          probeList[target_slot].smoothedDistance = (0.2 * rawDistance) + (0.8 * probeList[target_slot].smoothedDistance);
+      }
+  }
 
   bool already_exists = false;
   bool added = false;
@@ -2617,24 +2733,80 @@ void drawProbeTracker() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1);
 
-  // 1. Draw Header (Dark Purple/Magenta theme for OSINT mode)
-  tft.setFreeFont(&UbuntuMono_Regular11pt7b);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE);
-  uint16_t osintHeaderColor = hex24to565(0x4A148C); // Deep purple
-  tft.fillRect(0, 0, 480, 30, osintHeaderColor);
-  tft.drawString("PROBES SNIFFED", 240, 15);
+  // ==========================================
+  // 1. DYNAMIC HEADER BANNER (Unified UI)
+  // ==========================================
+  sortProbeList();
 
-  tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+  int active_probes = 0;
+  for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
+    for (int b = 0; b < 6; b++) {
+      if (probeList[i].mac[b] != 0) {
+        active_probes++;
+        break; 
+      }
+    }
+  }
+  total_sniffed_probes = active_probes;
+
+  tft.setFreeFont(&UbuntuMono_B9pt7b);
   tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE);
+  uint16_t osintHeaderColor = hex24to565(0x4A148C); 
+  tft.fillRect(0, 0, 480, 24, osintHeaderColor);
+  
+  char headerStr[64];
+  snprintf(headerStr, sizeof(headerStr), "SNIFFED PROBES (%d)", active_probes);
+  tft.drawString(headerStr, 0, 5); // Flush Left
 
-  // 2. Calculate Pagination Boundaries
+  // --- INJECT SORT UI BUTTONS ---
+  char metricStr[32];
+  uint16_t metricColor = TFT_YELLOW;
+
+  if (currentProbeSortMode == PROBE_SORT_HITS) strcpy(metricStr, "SORT:HITS");
+  else if (currentProbeSortMode == PROBE_SORT_DIST) strcpy(metricStr, "SORT:DIST");
+  else if (currentProbeSortMode == PROBE_SORT_SSIDS) strcpy(metricStr, "SORT:#SSIDs");
+  else if (currentProbeSortMode == PROBE_SORT_AGE) strcpy(metricStr, "SORT:AGE");
+
+  // Draw Metric Button Outline and Text
+  tft.fillRoundRect(275, 2, 130, 20, 3, TFT_BLACK); 
+  tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
+  tft.setTextColor(metricColor);
+  tft.drawString(metricStr, 282, 4);
+
+  // Draw Direction Button Outline and Text
+  tft.fillRoundRect(410, 2, 65, 20, 3, TFT_BLACK); 
+  tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
+  
+  if (probe_sort_descending) {
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("DESC", 423, 4);
+  } else {
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("ASC", 427, 4);
+  }
+  
+  // Reset for the rest of the list
+  tft.setTextColor(TFT_WHITE);
+
+  // ==========================================
+  // 2. DUAL-LINE COLUMN HEADERS
+  // ==========================================
+  tft.setTextColor(TFT_GREEN);
+  tft.setFreeFont(&UbuntuMono_B9pt7b);
+  tft.drawString("ID VENDOR           FIRST|LAST    RSSI  DIST   HITS", 0, 26); // Flush Left
+  tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+  tft.drawString("MAC ADDRESS       CAPTURED SSIDs", 0, 41); // Flush Left
+  tft.drawLine(0, 57, 480, 57, TFT_WHITE); 
+
+  // ==========================================
+  // 3. DATA ROWS (3-Line Data Injection)
+  // ==========================================
   int start_idx = probe_current_page * PROBES_PER_PAGE;
   int end_idx = start_idx + PROBES_PER_PAGE;
 
   int row = 0;
   for (int i = start_idx; i < end_idx; i++) {
-    // Check if the slot has a valid, recorded MAC (not empty/all zeros)
     bool is_slot_empty = true;
     for (int b = 0; b < 6; b++) {
       if (probeList[i].mac[b] != 0) {
@@ -2643,99 +2815,133 @@ void drawProbeTracker() {
       }
     }
 
-    int y = 35 + (row * 50); // Each entry block gets 50px of vertical height
+    int y = 60 + (row * 46); 
 
     if (!is_slot_empty) {
-// --- LINE 1: Metadata (Vendor, MAC, & Hit Count) ---
+      // --- LINE 1: Metadata ---
       tft.setTextColor(TFT_GREEN);
       
-      // 1. The Vendor Formatting Logic
       bool is_randomized = (probeList[i].mac[0] & 0x02) != 0;
       char safeVendor[20];
       
-      // Check for ongoing resolution, randomization, colons (MAC fallback), or empty/Unknown strings
       if (strcmp(probeList[i].vendor, "Resolving...") == 0) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "Resolving...");
+          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "Resolving...");
+      } else if (strstr(probeList[i].vendor, "(IE)") != nullptr) {
+          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", probeList[i].vendor);
       } else if (is_randomized) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "<Randomized>");
+          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "<Randomized>");
       } else if (probeList[i].vendor[2] == ':' || strcmp(probeList[i].vendor, "Unknown") == 0 || strlen(probeList[i].vendor) == 0) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", "Unknown Device");
+          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "Unknown Device");
       } else {
-          snprintf(safeVendor, sizeof(safeVendor), "%-16.16s", probeList[i].vendor);
+          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", probeList[i].vendor);
       }
 
-      // 2. The String Assembly (Upgraded to handle the 16-character vendor width)
-      char metaStr[60];
-      snprintf(metaStr, sizeof(metaStr), "[%02d] %-16.16s  %02X:%02X:%02X:%02X:%02X:%02X",
-               i + 1, safeVendor,
+      char ageCombo[16];
+      char firstSeenStr[8], lastSeenStr[8];
+      getAgeString(probeList[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
+      getAgeString(probeList[i].last_seen, lastSeenStr, sizeof(lastSeenStr));
+      snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr);
+
+      char metaStr[80];
+      // Changed to %02d to eliminate the blank space indent for numbers 1-9
+      snprintf(metaStr, sizeof(metaStr), "%02d.%-15.15s %13s %4d %4.0fm %5u",
+               i + 1, safeVendor, ageCombo, probeList[i].rssi, probeList[i].smoothedDistance, probeList[i].hits);
+               
+      tft.setFreeFont(&UbuntuMono_B9pt7b);
+      tft.drawString(metaStr, 0, y); // Flush Left
+
+      // --- LINES 2 & 3: MAC Address & Smart SSID Word Wrapper ---
+      tft.setTextColor(TFT_WHITE);
+      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+      
+      // Draw MAC Address on Line 2
+      char macStr[32];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
                probeList[i].mac[0], probeList[i].mac[1], probeList[i].mac[2],
                probeList[i].mac[3], probeList[i].mac[4], probeList[i].mac[5]);
-               
-      tft.drawString(metaStr, 10, y + 5);
+      tft.drawString(macStr, 0, y + 16); // Flush Left
 
-      // Right-aligned Hit Counter
-      tft.setTextColor(TFT_YELLOW);
-      char hitStr[16];
-      snprintf(hitStr, sizeof(hitStr), "Pkt: %u", probeList[i].hits);
-      tft.setTextDatum(TR_DATUM);
-      tft.drawString(hitStr, 470, y + 5);
-      tft.setTextDatum(TL_DATUM); // Reset to Top-Left datum
-
-      // --- LINE 2: SSID Chain Traversal ---
-      tft.setTextColor(TFT_WHITE);
-      char ssidListStr[256] = ""; // Temporary assembly buffer
+      char line1[64] = ""; 
+      char line2[80] = ""; 
       int current_node = probeList[i].first_ssid_idx;
-      bool first = true;
+      int ssids_drawn = 0;
+      int total_ssids = probeList[i].ssid_count;
+      bool on_line2 = false;
 
-      // Follow the pointer index chain through the shared pool
       while (current_node != -1) {
-        if (!first) {
-          strlcat(ssidListStr, ", ", sizeof(ssidListStr));
+        char next_str[36];
+        snprintf(next_str, sizeof(next_str), "%s", ssidPool[current_node].text);
+        
+        char addition[40];
+        if (ssids_drawn == 0) snprintf(addition, sizeof(addition), "%s", next_str); 
+        else snprintf(addition, sizeof(addition), "|%s", next_str);
+
+        // Fits on first SSID line? (Adjusted down to 32 chars since X was bumped to 185)
+        if (!on_line2) {
+            if (strlen(line1) + strlen(addition) <= 37) {
+                strlcat(line1, addition, sizeof(line1));
+                ssids_drawn++;
+            } else {
+                on_line2 = true; 
+            }
         }
-        strlcat(ssidListStr, ssidPool[current_node].text, sizeof(ssidListStr));
-        first = false;
+
+        if (on_line2) {
+            if (strlen(line2) == 0) snprintf(addition, sizeof(addition), "%s", next_str);
+            else snprintf(addition, sizeof(addition), "|%s", next_str);
+
+            if (strlen(line2) + strlen(addition) <= 53) { 
+                strlcat(line2, addition, sizeof(line2));
+                ssids_drawn++;
+            } else {
+                break; 
+            }
+        }
+        
         current_node = ssidPool[current_node].next_node_idx;
       }
 
-      if (strlen(ssidListStr) == 0) {
-        strncpy(ssidListStr, "<no SSIDs captured>", sizeof(ssidListStr));
+      if (ssids_drawn == 0) {
+        strlcat(line1, "<no SSIDs captured>", sizeof(line1));
+      } else if (ssids_drawn < total_ssids) {
+        char plusStr[8];
+        snprintf(plusStr, sizeof(plusStr), "|+%d", (total_ssids - ssids_drawn));
+        if (on_line2 || strlen(line1) > 32) {
+            strlcat(line2, plusStr, sizeof(line2));
+        } else {
+            strlcat(line1, plusStr, sizeof(line1));
+        }
       }
 
-      // Truncate cleanly with an ellipsis if string exceeds screen width capability
-      if (strlen(ssidListStr) > 52) {
-        ssidListStr[49] = '.';
-        ssidListStr[50] = '.';
-        ssidListStr[51] = '.';
-        ssidListStr[52] = '\0';
-      }
+      // X=185 ensures a generous 15+ pixel gap after the flush-left MAC address
+      tft.drawString(line1, 165, y + 16);
       
-      tft.drawString(ssidListStr, 30, y + 25);
-
-    } else {
-      // Clear visual placeholder for empty tracking slots
-      tft.setTextColor(hex24to565(0x333333));
-      char emptyStr[24];
-      snprintf(emptyStr, sizeof(emptyStr), "[%02d] -- EMPTY SLOT --", i + 1);
-      tft.drawString(emptyStr, 10, y + 15);
+      if (strlen(line2) > 0) {
+        tft.drawString(line2, 0, y + 30); // Flush Left
+      }
+      tft.drawLine(0, y + 45, 480, y + 45, hex24to565(0x222222));
     }
-
-    // Draw row separator line
-    tft.drawLine(0, y + 49, 480, y + 49, hex24to565(0x222222));
     row++;
   }
 
-  // --- FOOTER AND NAVIGATION NAVIGATION ---
-  tft.drawLine(0, 285, 480, 285, TFT_WHITE);
+  // ==========================================
+  // 4. UNIFIED NAVIGATION FOOTER
+  // ==========================================
+  tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+  tft.drawLine(0, 294, 480, 294, TFT_WHITE); 
+
+  if (probe_current_page > 0 && total_sniffed_probes > 0) {
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("<- PREV", 20, 300);
+  }
   
   tft.setTextColor(TFT_RED);
-  tft.drawString("BACK", 215, 295);
+  tft.drawString("BACK", 215, 300); 
 
-  tft.setTextColor(TFT_WHITE);
-  if (probe_current_page > 0) {
-    tft.drawString("<- PREV", 20, 295);
-  }
-  if (end_idx < MAX_PROBE_SLOTS) {
-    tft.drawString("NEXT ->", 360, 295);
+  // Mathematically identical to drawDeviceList()
+  if (((probe_current_page + 1) * PROBES_PER_PAGE) < total_sniffed_probes) {
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("NEXT ->", 360, 300);
   }
 }
 
@@ -2744,11 +2950,14 @@ void initProbeTracker() {
   for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
     memset(probeList[i].mac, 0, 6);
     probeList[i].hits = 0;
+    probeList[i].first_seen = 0;
     probeList[i].last_seen = 0;
     probeList[i].ssid_count = 0;
-    probeList[i].first_ssid_idx = -1; // THE CRITICAL FIX
+    probeList[i].first_ssid_idx = -1; 
     probeList[i].generation = 0;
     probeList[i].needs_lookup = false;
+    probeList[i].rssi = -100;           // <--- NEW
+    probeList[i].smoothedDistance = 0.0; // <--- NEW
     strncpy(probeList[i].vendor, "Unknown", 25);
   }
 
@@ -3183,8 +3392,31 @@ void loop() {
     // 3. OSINT PROBE TRACKER TOUCH LOGIC
     // ==========================================
     else if (currentState == SCREEN_PROBE_TRACKER) {
-      // FIXED: Shifted from 260 to 285 to perfectly match the UI footer line
-      if (t_y > 285) {
+      
+      // HEADER TOUCH (SORT CONTROLS)
+      if (t_y <= 30) {
+        // ZONE 1: Sort Metric (X: 275 to 410)
+        if (t_x >= 275 && t_x < 410) {
+          if (currentProbeSortMode == PROBE_SORT_HITS) currentProbeSortMode = PROBE_SORT_DIST;
+          else if (currentProbeSortMode == PROBE_SORT_DIST) currentProbeSortMode = PROBE_SORT_SSIDS;
+          else if (currentProbeSortMode == PROBE_SORT_SSIDS) currentProbeSortMode = PROBE_SORT_AGE;
+          else currentProbeSortMode = PROBE_SORT_HITS;
+          
+          probe_current_page = 0; // Snap list back to page 1 upon resorting
+          drawProbeTracker();
+          delay(200);
+        }
+        // ZONE 2: Sort Direction (X: 410 to 480)
+        else if (t_x >= 410) {
+          probe_sort_descending = !probe_sort_descending;
+          probe_current_page = 0;
+          drawProbeTracker();
+          delay(200);
+        }
+      }
+      
+      // FOOTER TOUCH (NAVIGATION)
+      else if (t_y > 285) {
         // PREV PAGE (Left Third)
         if (t_x < 160 && probe_current_page > 0) {
           probe_current_page--;
@@ -3192,7 +3424,7 @@ void loop() {
           delay(250);
         }
         // NEXT PAGE (Right Third)
-        else if (t_x > 320 && (probe_current_page + 1) * PROBES_PER_PAGE < MAX_PROBE_SLOTS) {
+        else if (t_x > 320 && ((probe_current_page + 1) * PROBES_PER_PAGE) < total_sniffed_probes) {
           probe_current_page++;
           drawProbeTracker();
           delay(250);
@@ -3222,9 +3454,12 @@ void loop() {
         delay(300);
       }
       
-      // 2. AP SELECTION LIST ROWS (y: 70 to 280)
-      else if (t_y >= 70 && t_y < 280) {
-        int clicked_row = (t_y - 70) / 25;
+      // 2. AP SELECTION LIST ROWS (y: 80 to 255)
+      else if (t_y >= 80 && t_y < 255) {
+        
+        // Match the Y-offset so Row 0 starts exactly at pixel 80
+        int clicked_row = (t_y - 80) / 35; 
+        
         int actual_index = (ap_current_page * APS_PER_PAGE) + clicked_row;
         int n = WiFi.scanComplete();
 
