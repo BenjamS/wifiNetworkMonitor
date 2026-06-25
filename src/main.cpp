@@ -11,6 +11,7 @@
 #include "ble_uuids.h"
 #include "UbuntuMono_Regular11pt7b.h"
 #include "UbuntuMono_Regular9pt7b.h"
+#include "UbuntuMono_Regular8pt7b.h"
 #include "UbuntuMono_B9pt7b.h"
 #include "UbuntuMono_RI9pt7b.h"
 #include <cmath>
@@ -39,7 +40,7 @@ bool probe_sort_descending = true;
  */
 
 int ap_current_page = 0;
-const int APS_PER_PAGE = 5; // Number of APs that fit safely between the header and footer
+const int APS_PER_PAGE = 6; // Number of APs that fit safely between the header and footer
 
 int target_rssi = 0;
 
@@ -63,7 +64,7 @@ const int RSSI_DROP_THRESHOLD = 12; // dBm drop to trigger body-block alert
 
 // --- Forward Declarations for OSINT Probe Tracker ---
 int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &added, uint8_t current_count);
-void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor = "", int8_t rssi = -100);
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor = "", int8_t rssi = -100, uint32_t hw_hash = 0);
 
 enum UIState { SCREEN_CHART, SCREEN_MENU, SCREEN_AP_SCAN,
    SCREEN_DEVICE_LIST, SCREEN_PROBE_TRACKER, SCREEN_FOXHUNT };
@@ -79,22 +80,27 @@ struct SSIDNode {
 };
 
 struct ProbeRecordShared {
-  // 4-byte variables first
+  // --- 8-byte variables ---
+  uint64_t pnl_hash;        // <--- NEW: 64-bit SSID Bloom Filter
+  
+  // --- 4-byte variables ---
+  uint32_t hardware_hash;   // <--- NEW: 32-bit IE Tag Fingerprint
   unsigned long first_seen; 
   unsigned long last_seen;
   int first_ssid_idx;               
-  float smoothedDistance;   // <--- NEW: 4-byte physics variable
+  float smoothedDistance;   
   
-  // 2-byte variables
+  // --- 2-byte variables ---
   uint16_t hits;
   
-  // 1-byte arrays and variables
+  // --- 1-byte arrays and variables ---
   uint8_t mac[6];
   char vendor[25];
   uint8_t ssid_count;
   uint8_t generation = 0;
   bool needs_lookup = false;
-  int8_t rssi;              // <--- NEW: 1-byte physics variable
+  int8_t rssi;              
+  uint8_t mac_rotations;  // Tracks how many times this device has spoofed a new MAC
 };
 
 // Fixed, static memory blocks
@@ -216,7 +222,7 @@ int current_ch_idx = 0;
 
 const int HOP_INTERVAL = 300;                // Time spent on each channel (ms)
 const int LOCKED_UPDATE_INTERVAL = 2000;      // Refresh rate when locked to an AP (ms)
-const int MAX_MACS = 250;
+const int MAX_MACS = 200;
 
 // --- TARGET AP LOCK GLOBALS ---
 uint8_t target_bssid[6] = {0};
@@ -229,26 +235,51 @@ const int CHART_BOTTOM = 295;
 int current_x = 0;
 
 struct MacRecord {
-  // 8-byte types
-  uint64_t sum_bytes;
-  uint64_t sum_sq_bytes;
-
-  // 4-byte types 
-  uint32_t first_seen; 
-  uint32_t last_seen;  
-  uint32_t packets;
-  uint32_t tx_bytes;
-  uint32_t rx_bytes;
-  float smoothedDistance;  // <--- Moved up to group with 4-byte types
-
-  // 1-byte types & Arrays
-  uint8_t mac[6];
-  char vendor[22];         // <--- Reduced to 22 bytes to hit the magic 72-byte struct limit
-  int8_t rssi;
-  uint8_t rate;
-  bool vendorFound;
-  bool needs_lookup;
+    uint64_t sum_bytes;
+    uint64_t sum_sq_bytes;
+    uint32_t first_seen;
+    uint32_t last_seen;
+    uint32_t packets;
+    uint32_t tx_bytes;
+    uint32_t rx_bytes;
+    float smoothedDistance;
+    // uint16_t last_sequence;  <-- REMOVED
+    uint8_t mac[6];
+    char vendor[27];
+    uint8_t channel;
+    int8_t rssi;
+    int8_t rssi_min;    // <--- NEW: spatial floor
+    int8_t rssi_max;    // <--- NEW: spatial ceiling
+    uint8_t rate;
+    bool vendorFound;
+    bool needs_lookup;
 };
+//Should be 80 bytes
+
+struct OUICache {
+  uint8_t oui[3];
+  char vendor[27]; // <--- Updated to match the new MacRecord limit
+};
+
+#define MAX_BEACON_DICT 80
+struct BeaconEntry {
+    uint32_t last_seen; //  4 bytes — 4-byte type first
+    int8_t rssi;        //  1 byte
+    uint8_t bssid[6];  //  6 bytes
+    char ssid[33];      // 33 bytes
+                        // = 44 bytes, no padding needed
+};
+BeaconEntry beaconDict[MAX_BEACON_DICT];
+uint8_t beaconDictCount = 0;
+
+// ==========================================
+// OUI RAM CACHE (Ring Buffer)
+// ==========================================
+#define OUI_CACHE_SIZE 300 // Shrunk from 300 to clear SRAM
+
+OUICache vendorCache[OUI_CACHE_SIZE];
+int cacheCount = 0;
+int cacheHead = 0;
 
 // ==========================================
 // 1. LIVE BUFFER (Shared RAM)
@@ -295,6 +326,22 @@ uint16_t sessionBleCount = 0;
 uint16_t sessionApCount = 0;
 uint16_t sessionChannelCount = 0;
 
+// Everything that lives outside the union
+constexpr size_t union_size = sizeof(MacRecord) * MAX_MACS; // The union's footprint
+                                                             // (sized by largest member)
+
+constexpr size_t static_non_union =
+    union_size * 3 +                                        // live + sort + session
+    (sizeof(OUICache)          * OUI_CACHE_SIZE)      +
+    (sizeof(ProbeRecordShared) * MAX_PROBE_SLOTS)     +
+    (sizeof(SSIDNode)          * TOTAL_SSID_POOL)     +
+    (sizeof(BeaconEntry)       * MAX_BEACON_DICT);
+
+constexpr size_t osint_layer_size =
+    (sizeof(ProbeRecordShared) * MAX_PROBE_SLOTS) +
+    (sizeof(SSIDNode)          * TOTAL_SSID_POOL) +
+    (sizeof(BeaconEntry)       * MAX_BEACON_DICT);
+
 // Compile-time safety check to prevent silent memory corruption
 constexpr size_t max_wifi_size = sizeof(MacRecord) * MAX_MACS;
 static_assert(max_wifi_size >= sizeof(BLERecord) * MAX_BLE_DEVICES, 
@@ -303,19 +350,16 @@ static_assert(max_wifi_size >= sizeof(ApRecord) * MAX_AP_RECORDS,
               "FATAL: AP array exceeds union boundary.");
 static_assert(max_wifi_size >= sizeof(ChannelRecord) * MAX_CHANNEL_RECORDS, 
               "FATAL: Channel array exceeds union boundary.");
-// ==========================================
-// OUI RAM CACHE (Ring Buffer)
-// ==========================================
-#define OUI_CACHE_SIZE 300 // Shrunk from 300 to clear SRAM
+              // Persistent OSINT layer budget check
+static_assert(osint_layer_size < 20480, 
+    "FATAL: Persistent OSINT layer exceeds 20KB budget.");
+// Total known static allocation
+constexpr size_t SRAM_BUDGET = 327680;  // 320KB — conservative application budget
+                                         // leaving ~200KB for WiFi/BLE/stack/heap
 
-struct OUICache {
-  uint8_t oui[3];
-  char vendor[22]; // <--- Shrunk to match MacRecord and prevent string overflows
-};
-
-OUICache vendorCache[OUI_CACHE_SIZE];
-int cacheCount = 0;
-int cacheHead = 0;
+static_assert(static_non_union <= SRAM_BUDGET,
+    "FATAL: Static allocations exceed conservative SRAM budget. "
+    "Reduce array sizes.");
 
 // Color utility fn
 constexpr uint16_t hex24to565(uint32_t hex24) {
@@ -375,6 +419,119 @@ uint8_t getBitrateMbps(wifi_promiscuous_pkt_t *pkt) {
   }
 }
 
+bool isSameDevice(int idxA, int idxB) {
+    // GATE 1: HARDWARE (Strict pass/fail)
+    if (probeList[idxA].hardware_hash != probeList[idxB].hardware_hash) {
+        return false; 
+    }
+
+    int confidence_score = 0;
+
+    // GATE 2: BEHAVIORAL (Scoring)
+    uint64_t hashA = probeList[idxA].pnl_hash;
+    uint64_t hashB = probeList[idxB].pnl_hash;
+    
+    if (hashA == hashB && hashA != 0) {
+        confidence_score += 50; // Exact match of non-empty networks
+    } else if ((hashA & hashB) == hashB || (hashA & hashB) == hashA) {
+        confidence_score += 30; // Perfect subset match
+    }
+
+    // GATE 3: SPATIAL (Scoring)
+    int rssi_delta = abs(probeList[idxA].rssi - probeList[idxB].rssi);
+    if (rssi_delta <= 5) {
+        confidence_score += 40; // Physically occupying the same space
+    } else if (rssi_delta > 15) {
+        confidence_score -= 50; // Physics dictate these are likely different locations
+    }
+
+    // THE VERDICT
+    return (confidence_score >= 70);
+}
+
+uint8_t getSsidBitIndex(const char* ssid) {
+    unsigned long hash = 5381; // Standard djb2 seed
+    int c;
+    while ((c = *ssid++)) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+    return hash % 64; // Constrain to exactly 64 bits
+}
+
+void ingestBeacon(uint8_t* bssid, const char* ssid, int8_t rssi) {
+    // Skip hidden networks — no useful cross-reference value
+    if (ssid == nullptr || strlen(ssid) == 0) return;
+    
+    // Search for existing entry
+    for (int i = 0; i < beaconDictCount; i++) {
+        if (memcmp(beaconDict[i].bssid, bssid, 6) == 0) {
+            // Update existing
+            beaconDict[i].rssi = rssi;
+            beaconDict[i].last_seen = millis();
+            return;
+        }
+    }
+    
+    // New entry
+    if (beaconDictCount < MAX_BEACON_DICT) {
+        memcpy(beaconDict[beaconDictCount].bssid, bssid, 6);
+        strncpy(beaconDict[beaconDictCount].ssid, ssid, 32);
+        beaconDict[beaconDictCount].ssid[32] = '\0';
+        beaconDict[beaconDictCount].rssi = rssi;
+        beaconDict[beaconDictCount].last_seen = millis();
+        beaconDictCount++;
+    }
+    // No eviction needed — beacon SSIDs are stable,
+    // so a full dictionary means you've already catalogued
+    // everything in the local airspace
+}
+
+// Returns the number of SSIDs in a probe record's list
+// that have a known beacon in the dictionary
+int crossReferenceProbeToBeacons(int probe_idx, 
+                                  uint8_t* matched_bssid_out,
+                                  int8_t* ap_rssi_out) {
+    int matches = 0;
+    int best_match_rssi_diff = 999;
+    
+    // Walk the probe record's SSID linked list
+    int node = probeList[probe_idx].first_ssid_idx;
+    
+    while (node != -1) {
+        const char* probed_ssid = ssidPool[node].text;
+        
+        // Skip wildcard entries
+        if (strcmp(probed_ssid, "<Wld>") == 0 || 
+            strcmp(probed_ssid, "<Nul>") == 0) {
+            node = ssidPool[node].next_node_idx;
+            continue;
+        }
+        
+        // Search the beacon dictionary for this SSID
+        for (int i = 0; i < beaconDictCount; i++) {
+            if (strcmp(beaconDict[i].ssid, probed_ssid) == 0) {
+                matches++;
+                
+                // Find the AP whose RSSI is closest to the probe RSSI
+                // (same physical space = similar signal strength)
+                int rssi_diff = abs(probeList[probe_idx].rssi - 
+                                    beaconDict[i].rssi);
+                if (rssi_diff < best_match_rssi_diff) {
+                    best_match_rssi_diff = rssi_diff;
+                    if (matched_bssid_out) 
+                        memcpy(matched_bssid_out, beaconDict[i].bssid, 6);
+                    if (ap_rssi_out) 
+                        *ap_rssi_out = beaconDict[i].rssi;
+                }
+            }
+        }
+        
+        node = ssidPool[node].next_node_idx;
+    }
+    
+    return matches;
+}
+
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
 void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (pause_sniffing) return;
@@ -382,7 +539,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   uint16_t len = pkt->rx_ctrl.sig_len;
   uint8_t* payload = pkt->payload;
 
-  if (len < 24) return;
+  if (len < 24) return; // Safety check ensures bytes 22 and 23 exist!
 
   // Extract MAC addresses immediately since we need them for both modes
   uint8_t* addr1 = payload + 4;  // Receiver
@@ -472,6 +629,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               else if (tag_num == 3 && tag_len == 1) {
                 true_channel = payload[offset + 2];
               }
+              ingestBeacon(addr2, extracted_ssid, pkt->rx_ctrl.rssi);
               
               offset += 2 + tag_len; // Jump to the next tag
             }
@@ -497,14 +655,14 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           }
         }
 
-        // If the AP made it into the array, process the packet!
+        // If the AP made it into the array, update metadata but IGNORE TRAFFIC MATH!
         if (ap_index != -1) {
           liveApData[ap_index].last_seen = millis();
           liveApData[ap_index].rssi = pkt->rx_ctrl.rssi; 
-          liveApData[ap_index].tx_bytes += len; // Beacons are AP transmissions!
-          liveApData[ap_index].packets += 1;
-          liveApData[ap_index].sum_bytes += len;
-          liveApData[ap_index].sum_sq_bytes += ((uint64_t)len * len);
+          
+          // --- TRAFFIC COUNTERS INTENTIONALLY DELETED HERE ---
+          // We only want WIFI_PKT_DATA frames (handled below) to trigger the math engine!
+
           uint8_t current_rate = getBitrateMbps(pkt);
           if (current_rate > liveApData[ap_index].max_rate) {
               liveApData[ap_index].max_rate = current_rate;
@@ -683,7 +841,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     
     char ie_vendor[25] = "";    
     uint8_t highest_weight_found = 0; // Resets for every new packet
-    
+    uint32_t live_hw_hash = 5381;
     // 1. FIRST PASS: Parse the IE tags to build the profile
     while (offset < len - 4) {
       uint8_t tag_num = payload[offset];
@@ -691,6 +849,20 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       
       if (offset + 2 + tag_len > len) break; // Memory safety boundary
       
+      // --- BUILD THE HARDWARE HASH ---
+      // 1. Always hash the tag_num (Captures the structural skeleton)
+      live_hw_hash = ((live_hw_hash << 5) + live_hw_hash) + tag_num;
+
+      // 2. Selectively hash the payload (Captures the unchangeable DNA)
+      // Tag 45: HT Caps | Tag 127: Ext Caps | Tag 221: Vendor Specific
+      if (tag_num == 45 || tag_num == 127 || tag_num == 221) {
+          for (int p = 0; p < tag_len; p++) {
+              live_hw_hash = ((live_hw_hash << 5) + live_hw_hash) + payload[offset + 2 + p];
+          }
+      }
+      // ------------------------------------
+
+
       // Extract the SSID (Tag 0)
       if (tag_num == 0) {
         if (tag_len == 0) {
@@ -750,9 +922,9 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
         // ONLY pass the Tag 221 guess if the MAC is randomized!
         // If it is a physical MAC, pass an empty string so Core 1 checks the SD Card.
         if (is_randomized) {
-          processProbeRequestShared(addr2, final_ssid, ie_vendor, pkt->rx_ctrl.rssi);
+          processProbeRequestShared(addr2, final_ssid, ie_vendor, pkt->rx_ctrl.rssi, live_hw_hash);
         } else {
-          processProbeRequestShared(addr2, final_ssid, "", pkt->rx_ctrl.rssi); 
+          processProbeRequestShared(addr2, final_ssid, "", pkt->rx_ctrl.rssi, live_hw_hash); 
         }
         
       }
@@ -807,19 +979,37 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // 7. Update the deduplication buffer
   bool is_tx = (client_mac == addr2); // mac2
 
+  // --- NEW: CHASE TAIL SEQUENCE EXTRACTION (SUSPENDED FOR NOW)---
+  // Sequence Control field is located at bytes 22 and 23 of the 802.11 MAC header (Little Endian)
+  //uint16_t seq_ctrl = payload[22] | (payload[23] << 8);
+  // Shift right 4 bits to strip the Fragment Number, then bitmask to isolate the 12-bit Sequence Number
+  //uint16_t seq_num = (seq_ctrl >> 4) & 0x0FFF;
+  // -------------------------------------------
+
   for(int i = 0; i < liveMacCount; i++) {
     if(memcmp((void*)liveData[i].mac, client_mac, 6) == 0) {
       liveData[i].packets += 1;
       liveData[i].sum_bytes += len;
       liveData[i].sum_sq_bytes += ((uint64_t)len * len);
       liveData[i].rssi = pkt->rx_ctrl.rssi;
-      //liveData[i].rate = getBitrateMbps(pkt);
+      
+      if (liveData[i].packets == 6) {
+          // The exact moment warmup ends, seed the baselines
+          liveData[i].rssi_min = pkt->rx_ctrl.rssi;
+          liveData[i].rssi_max = pkt->rx_ctrl.rssi;
+      } else if (liveData[i].packets > 6) {
+          // Normal floor/ceiling tracking
+          if (pkt->rx_ctrl.rssi < liveData[i].rssi_min) 
+              liveData[i].rssi_min = pkt->rx_ctrl.rssi;
+          if (pkt->rx_ctrl.rssi > liveData[i].rssi_max) 
+              liveData[i].rssi_max = pkt->rx_ctrl.rssi;
+      }
+      
       uint8_t current_rate = getBitrateMbps(pkt);
       if (current_rate > liveData[i].rate) {
           liveData[i].rate = current_rate;
       }
       liveData[i].last_seen = millis();
-      
       if (is_tx) liveData[i].tx_bytes += len;
       else       liveData[i].rx_bytes += len;
       
@@ -841,6 +1031,11 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     liveData[liveMacCount].first_seen = now;
     liveData[liveMacCount].last_seen = now;
     
+    // --- NEW: INJECT FOXHUNT CHANNEL AND CHASE TAIL SEQUENCE ---
+    //Is channel also for packet periodicity tracking?
+    liveData[liveMacCount].channel = CHANNELS[current_ch_idx];     
+    // -----------------------------------------------------------
+
     // Route the first packet to TX or RX
     if (is_tx) {
       liveData[liveMacCount].tx_bytes = len;
@@ -900,8 +1095,8 @@ void resolveMacVendor(MacRecord* record) {
         vendorCache[i].oui[2] == record->mac[2]) {
       
       // Updated to 21 chars max, null terminated at [21]
-      strncpy(record->vendor, vendorCache[i].vendor, 21);
-      record->vendor[21] = '\0'; 
+      strncpy(record->vendor, vendorCache[i].vendor, 26);
+      record->vendor[26] = '\0'; 
       record->vendorFound = true;
       return; 
     }
@@ -939,11 +1134,11 @@ void resolveMacVendor(MacRecord* record) {
         }
         
         // Safely extract from the true start of the word (Updated to 21)
-        strncpy(record->vendor, &line[text_start], 21); 
-        record->vendor[21] = '\0';
+        strncpy(record->vendor, &line[text_start], 26); 
+        record->vendor[26] = '\0';
         
         // Strip trailing spaces working backward (Updated to start at 20)
-        for(int i = 20; i >= 0; i--) {         
+        for(int i = 25; i >= 0; i--) {         
           if(record->vendor[i] == ' ') record->vendor[i] = '\0';
           else break;
         }
@@ -967,9 +1162,9 @@ void resolveMacVendor(MacRecord* record) {
   vendorCache[cacheHead].oui[1] = record->mac[1];
   vendorCache[cacheHead].oui[2] = record->mac[2];
   
-  // Updated to 21 chars max, null terminated at [21]
-  strncpy(vendorCache[cacheHead].vendor, record->vendor, 21);
-  vendorCache[cacheHead].vendor[21] = '\0';
+  // Updated to 26 chars max, null terminated at [26]
+  strncpy(vendorCache[cacheHead].vendor, record->vendor, 26);
+  vendorCache[cacheHead].vendor[26] = '\0';
   
   if (cacheCount < OUI_CACHE_SIZE) cacheCount++;
   cacheHead = (cacheHead + 1) % OUI_CACHE_SIZE;
@@ -1454,6 +1649,106 @@ void drawChartFooter() {
   tft.setTextColor(TFT_WHITE);
 }
 
+float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
+    // Protection against invalid/corrupt packets. 
+    // Returning -1.0 prevents the EMA filter from dragging the average down to 0!
+    if (rssi >= 0 || rssi < -100) return -1.0; 
+
+    float measuredPowerAtOneMeter;
+    float pathLossExponent;
+
+    // Set baselines based on the physical frequency and protocol
+    switch (protocol) {
+        case RADIO_BLE_24GHZ:
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.2; // Standard indoor
+            break;
+
+        case RADIO_WIFI_24GHZ:
+            // Wi-Fi transmits significantly louder than BLE standard beacons
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 65.0 : -45.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.0; 
+            break;
+
+        case RADIO_WIFI_5GHZ:
+            // 5GHz absorbs into the environment much faster than 2.4GHz
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 68.0 : -50.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.8; // Heavy indoor attenuation
+            break;
+
+        default:
+            return -1.0;
+    }
+    
+    // The core Log-Distance Formula: d = 10 ^ ((A - RSSI) / 10n)
+    float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
+    return std::pow(10.0, ratio);
+}
+/*
+float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol) {
+    if (rssi >= 0 || rssi < -100) return -1.0; // Protection against invalid packets
+
+    // ==========================================
+    // ENGINE 1: YOUR FIELD-TESTED BLE MATH
+    // ==========================================
+    if (protocol == RADIO_BLE_24GHZ) {
+        float measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
+        float pathLossExponent = 3.2; // Your home's "magic" number
+        
+        float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
+        return pow(10.0, ratio);
+    } 
+    
+    // ==========================================
+    // ENGINE 2: ALTBEACON MATH FOR WI-FI
+    // ==========================================
+    else {
+        float measuredPowerAtOneMeter = (protocol == RADIO_WIFI_5GHZ) ? -50.0 : -45.0;
+        double ratio = (double)rssi / (double)measuredPowerAtOneMeter;
+
+        if (ratio < 1.0) {
+            return pow(ratio, 10.0);
+        } else {
+            return (0.89976 * pow(ratio, 7.7095)) + 0.111;
+        }
+    }
+}
+
+float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
+    if (rssi >= 0) return 0.0; // Protection against invalid/corrupt packets
+
+    float measuredPowerAtOneMeter;
+    float pathLossExponent;
+
+    // Set baselines based on the physical frequency and protocol
+    switch (protocol) {
+        case RADIO_BLE_24GHZ:
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.2; // Standard indoor
+            break;
+
+        case RADIO_WIFI_24GHZ:
+            // Wi-Fi transmits significantly louder than BLE standard beacons
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 65.0 : -45.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.0; 
+            break;
+
+        case RADIO_WIFI_5GHZ:
+            // 5GHz absorbs into the environment much faster than 2.4GHz
+            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 68.0 : -50.0;
+            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.8; // Heavy indoor attenuation
+            break;
+
+        default:
+            return 0.0;
+    }
+    
+    // The core Log-Distance Formula: d = 10 ^ ((A - RSSI) / 10n)
+    float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
+    return std::pow(10.0, ratio);
+}
+*/
+
 void drawApScanner() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1); 
@@ -1480,14 +1775,17 @@ void drawApScanner() {
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE);
   tft.fillRect(0, 0, 480, 30, TFT_BLUE);
-  tft.drawString("SELECT TARGET AP", 240, 15);
+  
+  // Build the dynamic header string using the 'n' variable
+  char headerStr[64];
+  snprintf(headerStr, sizeof(headerStr), "SELECT TARGET AP (%d)", n);
+  tft.drawString(headerStr, 240, 15);
 
-  // THE FIX: Bumped the global list font to 11pt!
   tft.setFreeFont(&UbuntuMono_Regular11pt7b);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_GREEN);
-  tft.drawRect(0, 40, 480, 35, TFT_DARKGREY); // Matched height to 35px for symmetry
-  tft.drawString("[*] SNIFF ALL (Free Airspace)", 5, 50);
+  tft.drawRect(0, 40, 480, 35, TFT_DARKGREY); 
+  tft.drawString("CH:ALL (Sniff Free Airspace)", 5, 50);
 
   tft.setTextColor(TFT_WHITE);
   
@@ -1509,13 +1807,12 @@ void drawApScanner() {
 
     int row = 0;
     for (int i = start_idx; i < end_idx; ++i) {
-      // Y-math updated to account for the larger header row
       int y = 80 + (row * 35); 
 
       // 1. Get the raw BSSID bytes and the SSID string
       uint8_t* bssid = WiFi.BSSID(i);
       String raw_ssid = WiFi.SSID(i);
-      char tactical_ssid[26]; // Expanded buffer slightly for safety
+      char tactical_ssid[26]; 
 
       // 2. Determine if this SSID is a duplicate in the airspace
       bool has_clone = false;
@@ -1532,7 +1829,7 @@ void drawApScanner() {
       if (raw_ssid.length() == 0) {
         snprintf(tactical_ssid, sizeof(tactical_ssid), "<HIDDEN> [%02X%02X]", bssid[4], bssid[5]);
       } else if (has_clone) {
-        char temp_ssid[16]; // Allowed a few more characters since we dropped the MAC!
+        char temp_ssid[16]; 
         strncpy(temp_ssid, raw_ssid.c_str(), 15);
         temp_ssid[15] = '\0';
         snprintf(tactical_ssid, sizeof(tactical_ssid), "%s~%02X%02X", temp_ssid, bssid[4], bssid[5]);
@@ -1543,41 +1840,53 @@ void drawApScanner() {
         snprintf(tactical_ssid, sizeof(tactical_ssid), "%s", temp_ssid);
       }
 
-      // 4. Print the row using the new, cleaner format
-      char apRowStr[80];
-      // Removed the MAC string at the end and slightly expanded the SSID spacing
-      snprintf(apRowStr, sizeof(apRowStr), "CH:%02d  %-22s %4ddBm",
-               WiFi.channel(i),
-               tactical_ssid,
-               WiFi.RSSI(i));
+      // 4. Calculate Distance dynamically
+      float dist = calculateRfDistance(WiFi.RSSI(i), 0, RADIO_WIFI_24GHZ);
 
-      tft.drawString(apRowStr, 5, y + 10);
+      // 5. SPLIT DRAWING LOGIC FOR PERFECT ALIGNMENT
+      
+      // Build the Left String (Channel & SSID)
+      char leftStr[60];
+      snprintf(leftStr, sizeof(leftStr), "CH:%02d %s", WiFi.channel(i), tactical_ssid);
+
+      // Build the Right String (RSSI & Distance) with rigid width padding
+      char rightStr[30];
+      snprintf(rightStr, sizeof(rightStr), "%4ddBm %3.0fm", WiFi.RSSI(i), dist);
+
+      // Paint Left Side (Flush Left at X=5)
+      tft.setTextDatum(TL_DATUM);
+      tft.drawString(leftStr, 5, y + 10);
+
+      // Paint Right Side (Flush Right at X=475)
+      tft.setTextDatum(TR_DATUM);
+      tft.drawString(rightStr, 475, y + 10); 
+
       tft.drawRect(0, y, 480, 35, TFT_DARKGREY);
       row++;
     }
   }
 
   // ==========================================
-  // FOOTER & NAVIGATION (Always renders!)
+  // FOOTER & NAVIGATION (Synced to Y=294)
   // ==========================================
-  // Dropped footer back to 9pt so the buttons don't crowd each other
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-  tft.setTextDatum(TL_DATUM);
+  tft.setTextDatum(TL_DATUM); 
 
-  tft.drawLine(0, 285, 480, 285, TFT_WHITE);
+  // THE FIX: Pushed down from 285 to perfectly match the Probe Tracker footer
+  tft.drawLine(0, 294, 480, 294, TFT_WHITE);
   
   tft.setTextColor(TFT_RED);
-  tft.drawString("BACK", 215, 295);
+  tft.drawString("BACK", 215, 300);
 
   if (n > APS_PER_PAGE) {
     tft.setTextColor(TFT_WHITE);
 
     if (ap_current_page > 0) {
-      tft.drawString("<- PREV", 20, 295);
+      tft.drawString("<- PREV", 20, 300);
     }
     
     if (((ap_current_page + 1) * APS_PER_PAGE) < n) {
-      tft.drawString("NEXT ->", 360, 295);
+      tft.drawString("NEXT ->", 360, 300);
     }
   }
 }
@@ -1664,7 +1973,6 @@ void drawDeviceList() {
     tft.fillRect(0, 0, 480, 24, TFT_RED); 
     char huntStr[64];
     const char* modeName = (currentRadioMode == RADIO_WIFI) ? "WI-FI" : (currentRadioMode == RADIO_BLE) ? "BLE" : "NETWORKS";
-    // Slightly abbreviated to ensure buttons fit on the right
     snprintf(huntStr, sizeof(huntStr), " FOXHUNT TARGET (%s)", modeName);
     tft.drawString(huntStr, 5, 5);
   } else {
@@ -1685,7 +1993,6 @@ void drawDeviceList() {
     
     tft.fillRect(0, 0, 480, 24, headerColor);
     char headerStr[64];
-    // Removed "Total:" to free up space for the buttons
     snprintf(headerStr, sizeof(headerStr), " SNIFFED %s (%d)", modeStr, total_devices);
     tft.drawString(headerStr, 5, 5); 
   } 
@@ -1730,7 +2037,6 @@ void drawDeviceList() {
   tft.drawString(metricStr, 282, 4);
 
   // Draw Direction Button Outline and Text
-  // FIX: Updated X coordinate to 410 and Width to 65
   tft.fillRoundRect(410, 2, 65, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
   
@@ -1765,7 +2071,8 @@ void drawDeviceList() {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
       tft.drawString("     VENDOR                 MAC            RSSI TOTAL", 5, 26); 
       tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      tft.drawString("    FIRST | LAST   DIST Mbps  AVG    CV%    TX | RX", 5, 41);
+      // --- UPDATED WIFI HEADER WITH Per(s) ---
+      tft.drawString("Per(s) FIRST | LAST DIST Mbps  AVG    CV%    TX | RX", 5, 41);
     } 
     else if (currentRadioMode == RADIO_AP) {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
@@ -1775,10 +2082,8 @@ void drawDeviceList() {
     }
     else if (currentRadioMode == RADIO_CHANNELS) {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
-      // 'PWR(AVG|STD)' replaces the old raw RSSI column
       tft.drawString("     CHANNEL           PWR(AVG dBm|STD)         TOTAL", 5, 26);       
       tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      // 'STATE' replaces the blank space
       tft.drawString("    FIRST | LAST         STATE   AVG  CV%    DN | UP", 5, 41);
     }
     else {
@@ -1816,7 +2121,6 @@ void drawDeviceList() {
         char safeVendor[20]; 
         
         if (strstr(sessionData[i].vendor, "(IE)") != nullptr) {
-            // VIP ACCESS: Bypass the randomization mask
             snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", sessionData[i].vendor);
         } else if (is_randomized) {
             snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", "<Randomized>");
@@ -1853,11 +2157,21 @@ void drawDeviceList() {
         char avgStr[6];
         formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
 
+        // --- NEW: CALCULATE PERIODICITY (Keep-Alive Interval) ---
+        int keep_alive_s = 0;
+        if (sessionData[i].packets > 1) {
+            unsigned long duration_ms = sessionData[i].last_seen - sessionData[i].first_seen;
+            keep_alive_s = (duration_ms / sessionData[i].packets) / 1000;
+            if (keep_alive_s > 99) keep_alive_s = 99; // Cap at 99 to protect double-digit UI bounds
+        }
+        // --------------------------------------------------------
+
         snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
                  (i + 1), safeVendor, macStr, sessionData[i].rssi, totStr);
 
-        snprintf(line2, sizeof(line2), "    %13s %4.0fm %3d  %-5.5s %4.0f%%   %9s", 
-                 ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
+        // --- UPDATED WIFI LINE 2 WITH %02d REPLACING INDENT ---
+        snprintf(line2, sizeof(line2), "  %02d  %13s %4.0fm %3d  %-5.5s %4.0f%%   %9s", 
+                 keep_alive_s, ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
                  avgStr, cv_percent, trafficCombo);
 
         tft.setFreeFont(&UbuntuMono_B9pt7b);
@@ -2042,16 +2356,15 @@ void drawDeviceList() {
         
         // Calculate Autocorrelation (rho)
         float rho = 0.0;
-        if (sessionChannelData[i].ema_variance > 0.01) { // Prevent divide-by-zero
+        if (sessionChannelData[i].ema_variance > 0.01) { 
             rho = sessionChannelData[i].ema_cov / sessionChannelData[i].ema_variance;
         }
 
-        // Translate rho into a human-readable diagnostic state
         char stateStr[10];
-        if (sessionChannelData[i].packets < 5) strcpy(stateStr, "CALC.."); // Gathering data
-        else if (rho > 0.6) strcpy(stateStr, "DRIFT");   // Mobile/Shifting interference
-        else if (rho > 0.2) strcpy(stateStr, "ACTIVE");  // Standard bursting traffic
-        else strcpy(stateStr, "STATIC");                 // Stationary/Thermal noise
+        if (sessionChannelData[i].packets < 5) strcpy(stateStr, "CALC.."); 
+        else if (rho > 0.6) strcpy(stateStr, "DRIFT");   
+        else if (rho > 0.2) strcpy(stateStr, "ACTIVE");  
+        else strcpy(stateStr, "STATIC");                 
 
         // 3. STRING FORMATTING
         char avgStr[6];
@@ -2067,26 +2380,20 @@ void drawDeviceList() {
         formatTotalUnit(total_bytes, totStr, sizeof(totStr));
 
         char txStr[6], rxStr[6], trafficCombo[12];
-        formatShortUnit(sessionChannelData[i].tx_bytes, txStr, sizeof(txStr)); // Downlink
-        formatShortUnit(sessionChannelData[i].rx_bytes, rxStr, sizeof(rxStr)); // Uplink
+        formatShortUnit(sessionChannelData[i].tx_bytes, txStr, sizeof(txStr)); 
+        formatShortUnit(sessionChannelData[i].rx_bytes, rxStr, sizeof(rxStr)); 
         snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); 
 
-        // Format the combined Power String (e.g., "-65|±3")
         char pwrStr[16];
         if (sessionChannelData[i].packets == 0) strcpy(pwrStr, "N/A");
         else snprintf(pwrStr, sizeof(pwrStr), "%3.0f|~%-2.0f", avg_rssi, std_dev_rssi);
-        //replace "~" with "±" if your font supports it, or keep as is for clarity on the small screen
 
-        // --- PERFECTLY JUSTIFIED UI STRINGS ---
-        // 14-char spacer to align Power, 11-char padding to align Total to the far right
         snprintf(line1, sizeof(line1), "%3d. CHANNEL %02d %14s %-11.11s   %-5.5s", 
                  (i + 1), sessionChannelData[i].channel, "", pwrStr, totStr);
 
-        // Aligns Age, State, Byte Avg, Byte CV%, and Uplink/Downlink combo
         snprintf(line2, sizeof(line2), "    %13s %5s %-7.7s %-4.4s %3.0f%%   %9s", 
                  ageCombo, "", stateStr, avgStr, cv_percent, trafficCombo);
 
-        // 4. DRAW TO SCREEN
         tft.setFreeFont(&UbuntuMono_B9pt7b);
         tft.drawString(line1, 5, y);
         tft.setTextColor(TFT_LIGHTGREY);
@@ -2115,106 +2422,6 @@ void drawDeviceList() {
     tft.drawString("NEXT ->", 360, 300);
   }
 }
-
-float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
-    // Protection against invalid/corrupt packets. 
-    // Returning -1.0 prevents the EMA filter from dragging the average down to 0!
-    if (rssi >= 0 || rssi < -100) return -1.0; 
-
-    float measuredPowerAtOneMeter;
-    float pathLossExponent;
-
-    // Set baselines based on the physical frequency and protocol
-    switch (protocol) {
-        case RADIO_BLE_24GHZ:
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.2; // Standard indoor
-            break;
-
-        case RADIO_WIFI_24GHZ:
-            // Wi-Fi transmits significantly louder than BLE standard beacons
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 65.0 : -45.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.0; 
-            break;
-
-        case RADIO_WIFI_5GHZ:
-            // 5GHz absorbs into the environment much faster than 2.4GHz
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 68.0 : -50.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.8; // Heavy indoor attenuation
-            break;
-
-        default:
-            return -1.0;
-    }
-    
-    // The core Log-Distance Formula: d = 10 ^ ((A - RSSI) / 10n)
-    float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
-    return std::pow(10.0, ratio);
-}
-/*
-float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol) {
-    if (rssi >= 0 || rssi < -100) return -1.0; // Protection against invalid packets
-
-    // ==========================================
-    // ENGINE 1: YOUR FIELD-TESTED BLE MATH
-    // ==========================================
-    if (protocol == RADIO_BLE_24GHZ) {
-        float measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
-        float pathLossExponent = 3.2; // Your home's "magic" number
-        
-        float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
-        return pow(10.0, ratio);
-    } 
-    
-    // ==========================================
-    // ENGINE 2: ALTBEACON MATH FOR WI-FI
-    // ==========================================
-    else {
-        float measuredPowerAtOneMeter = (protocol == RADIO_WIFI_5GHZ) ? -50.0 : -45.0;
-        double ratio = (double)rssi / (double)measuredPowerAtOneMeter;
-
-        if (ratio < 1.0) {
-            return pow(ratio, 10.0);
-        } else {
-            return (0.89976 * pow(ratio, 7.7095)) + 0.111;
-        }
-    }
-}
-
-float calculateRfDistance(int rssi, int txPower, RadioProtocol protocol, float customLoss = 0.0) {
-    if (rssi >= 0) return 0.0; // Protection against invalid/corrupt packets
-
-    float measuredPowerAtOneMeter;
-    float pathLossExponent;
-
-    // Set baselines based on the physical frequency and protocol
-    switch (protocol) {
-        case RADIO_BLE_24GHZ:
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 62.0 : -59.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.2; // Standard indoor
-            break;
-
-        case RADIO_WIFI_24GHZ:
-            // Wi-Fi transmits significantly louder than BLE standard beacons
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 65.0 : -45.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.0; 
-            break;
-
-        case RADIO_WIFI_5GHZ:
-            // 5GHz absorbs into the environment much faster than 2.4GHz
-            measuredPowerAtOneMeter = (txPower != 0) ? (float)txPower - 68.0 : -50.0;
-            pathLossExponent = (customLoss > 0.0) ? customLoss : 3.8; // Heavy indoor attenuation
-            break;
-
-        default:
-            return 0.0;
-    }
-    
-    // The core Log-Distance Formula: d = 10 ^ ((A - RSSI) / 10n)
-    float ratio = (measuredPowerAtOneMeter - (float)rssi) / (10.0 * pathLossExponent);
-    return std::pow(10.0, ratio);
-}
-*/
 
 std::string decodeEddystoneURL(const std::string& sData) {
     // Eddystone frame type 0x10 specifically means "URL"
@@ -2599,7 +2806,7 @@ int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &ad
   }
 }
 
-void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor, int8_t rssi) {
+void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known_vendor, int8_t rssi, uint32_t hw_hash) {
   int target_slot = -1;
   unsigned long oldest_time = 0xFFFFFFFF;
   int oldest_slot = 0;
@@ -2634,12 +2841,18 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
     }
     // ==========================================
 
-    // The block you just asked about! Safely claiming the slot:
+    // Safely claiming the slot:
     memcpy(probeList[target_slot].mac, mac, 6);
     probeList[target_slot].hits = 0;
     probeList[target_slot].ssid_count = 0;
     probeList[target_slot].first_ssid_idx = -1;
     probeList[target_slot].first_seen = millis();
+    
+    // --- CRITICAL MEMORY WIPE ---
+    probeList[target_slot].pnl_hash = 0; 
+    probeList[target_slot].mac_rotations = 1;
+    // ----------------------------
+
     // CRITICAL: Increment generation to invalidate any in-flight SD lookups for this slot (ABA fix)
     probeList[target_slot].generation++; 
     
@@ -2662,6 +2875,11 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
   probeList[target_slot].hits++;
   probeList[target_slot].last_seen = millis();
   probeList[target_slot].rssi = rssi;
+  
+  // --- NEW: INJECT THE HARDWARE HASH HERE ---
+  probeList[target_slot].hardware_hash = hw_hash;
+  // ------------------------------------------
+
   // 2. EMA Physics Engine
   float rawDistance = calculateRfDistance(rssi, 0, RADIO_WIFI_24GHZ);
   if (rawDistance > 0) {
@@ -2681,6 +2899,12 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
   
   if (added) {
     probeList[target_slot].ssid_count++;
+  }
+  
+  // 3. Update the Bloom Filter
+  if (strcmp(ssid, "<Wld>") != 0 && strcmp(ssid, "<Nul>") != 0) {
+      uint8_t bit_idx = getSsidBitIndex(ssid);
+      probeList[target_slot].pnl_hash |= (1ULL << bit_idx);
   }
 }
 
@@ -2756,8 +2980,8 @@ void drawProbeTracker() {
   tft.fillRect(0, 0, 480, 24, osintHeaderColor);
   
   char headerStr[64];
-  snprintf(headerStr, sizeof(headerStr), "SNIFFED PROBES (%d)", active_probes);
-  tft.drawString(headerStr, 0, 5); // Flush Left
+  snprintf(headerStr, sizeof(headerStr), "PHYSICAL TARGETS (%d)", active_probes);
+  tft.drawString(headerStr, 0, 5); 
 
   // --- INJECT SORT UI BUTTONS ---
   char metricStr[32];
@@ -2768,13 +2992,11 @@ void drawProbeTracker() {
   else if (currentProbeSortMode == PROBE_SORT_SSIDS) strcpy(metricStr, "SORT:#SSIDs");
   else if (currentProbeSortMode == PROBE_SORT_AGE) strcpy(metricStr, "SORT:AGE");
 
-  // Draw Metric Button Outline and Text
   tft.fillRoundRect(275, 2, 130, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
   tft.setTextColor(metricColor);
   tft.drawString(metricStr, 282, 4);
 
-  // Draw Direction Button Outline and Text
   tft.fillRoundRect(410, 2, 65, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
   
@@ -2786,17 +3008,15 @@ void drawProbeTracker() {
     tft.drawString("ASC", 427, 4);
   }
   
-  // Reset for the rest of the list
-  tft.setTextColor(TFT_WHITE);
-
   // ==========================================
   // 2. DUAL-LINE COLUMN HEADERS
   // ==========================================
   tft.setTextColor(TFT_GREEN);
   tft.setFreeFont(&UbuntuMono_B9pt7b);
-  tft.drawString("ID VENDOR           FIRST|LAST    RSSI  DIST   HITS", 0, 26); // Flush Left
+  // --- UPDATED: Realigned spacing and injected #MAC column ---
+  tft.drawString("ID VENDOR        FIRST|LAST   RSSI DIST #MAC HITS", 0, 26); 
   tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-  tft.drawString("MAC ADDRESS       CAPTURED SSIDs", 0, 41); // Flush Left
+  tft.drawString("MAC ADDRESS       CAPTURED SSIDs", 0, 41); 
   tft.drawLine(0, 57, 480, 57, TFT_WHITE); 
 
   // ==========================================
@@ -2818,23 +3038,34 @@ void drawProbeTracker() {
     int y = 60 + (row * 46); 
 
     if (!is_slot_empty) {
-      // --- LINE 1: Metadata ---
-      tft.setTextColor(TFT_GREEN);
       
+      // --- LINE 1: Metadata ---
+      if (probeList[i].mac_rotations > 1) {
+          tft.setTextColor(TFT_ORANGE); 
+      } else {
+          tft.setTextColor(TFT_GREEN);  
+      }
+
       bool is_randomized = (probeList[i].mac[0] & 0x02) != 0;
       char safeVendor[20];
+      char rawVendor[20];
       
       if (strcmp(probeList[i].vendor, "Resolving...") == 0) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "Resolving...");
+          strcpy(rawVendor, "Resolving...");
       } else if (strstr(probeList[i].vendor, "(IE)") != nullptr) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", probeList[i].vendor);
+          strncpy(rawVendor, probeList[i].vendor, 19);
+          rawVendor[19] = '\0';
       } else if (is_randomized) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "<Randomized>");
+          strcpy(rawVendor, "<Randomized>");
       } else if (probeList[i].vendor[2] == ':' || strcmp(probeList[i].vendor, "Unknown") == 0 || strlen(probeList[i].vendor) == 0) {
-          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", "Unknown Device");
+          strcpy(rawVendor, "Unknown Device");
       } else {
-          snprintf(safeVendor, sizeof(safeVendor), "%-15.15s", probeList[i].vendor);
+          strncpy(rawVendor, probeList[i].vendor, 19);
+          rawVendor[19] = '\0';
       }
+
+      // Reduced from 15 to 13 to make room for the new #MAC column
+      snprintf(safeVendor, sizeof(safeVendor), "%-13.13s", rawVendor);
 
       char ageCombo[16];
       char firstSeenStr[8], lastSeenStr[8];
@@ -2843,42 +3074,63 @@ void drawProbeTracker() {
       snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr);
 
       char metaStr[80];
-      // Changed to %02d to eliminate the blank space indent for numbers 1-9
-      snprintf(metaStr, sizeof(metaStr), "%02d.%-15.15s %13s %4d %4.0fm %5u",
-               i + 1, safeVendor, ageCombo, probeList[i].rssi, probeList[i].smoothedDistance, probeList[i].hits);
+      // --- UPDATED: Injected mac_rotations into the Line 1 format string ---
+      snprintf(metaStr, sizeof(metaStr), "%02d.%-13.13s %13s %4d %4.0fm %4d %4u",
+               i + 1, safeVendor, ageCombo, probeList[i].rssi, probeList[i].smoothedDistance, probeList[i].mac_rotations, probeList[i].hits);
                
       tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString(metaStr, 0, y); // Flush Left
+      tft.drawString(metaStr, 0, y); 
 
       // --- LINES 2 & 3: MAC Address & Smart SSID Word Wrapper ---
-      tft.setTextColor(TFT_WHITE);
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+      tft.setFreeFont(&UbuntuMono_Regular8pt7b); 
       
-      // Draw MAC Address on Line 2
-      char macStr[32];
+      // Keep MAC Orange if it's a rotated device to act as a visual anchor
+      if (probeList[i].mac_rotations > 1) {
+          tft.setTextColor(TFT_ORANGE);
+      } else {
+          tft.setTextColor(TFT_WHITE);
+      }
+      
+      // --- UPDATED: Flush left MAC address string ---
+      char macStr[20];
       snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", 
                probeList[i].mac[0], probeList[i].mac[1], probeList[i].mac[2],
                probeList[i].mac[3], probeList[i].mac[4], probeList[i].mac[5]);
-      tft.drawString(macStr, 0, y + 16); // Flush Left
+      tft.drawString(macStr, 0, y + 16); 
 
-      char line1[64] = ""; 
-      char line2[80] = ""; 
+      tft.setTextColor(TFT_WHITE);
+      char line1[80] = ""; 
+      char line2[100] = ""; 
+      
+      int true_total_ssids = 0;
+      int temp_node = probeList[i].first_ssid_idx;
+      while (temp_node != -1) {
+          if (strlen(ssidPool[temp_node].text) > 0) {
+              true_total_ssids++;
+          }
+          temp_node = ssidPool[temp_node].next_node_idx;
+      }
+
       int current_node = probeList[i].first_ssid_idx;
       int ssids_drawn = 0;
-      int total_ssids = probeList[i].ssid_count;
       bool on_line2 = false;
 
       while (current_node != -1) {
         char next_str[36];
         snprintf(next_str, sizeof(next_str), "%s", ssidPool[current_node].text);
         
+        if (strlen(next_str) == 0) {
+            current_node = ssidPool[current_node].next_node_idx;
+            continue; 
+        }
+        
         char addition[40];
         if (ssids_drawn == 0) snprintf(addition, sizeof(addition), "%s", next_str); 
         else snprintf(addition, sizeof(addition), "|%s", next_str);
 
-        // Fits on first SSID line? (Adjusted down to 32 chars since X was bumped to 185)
+        // --- UPDATED: Expanded Line 1 limit to 41 chars ---
         if (!on_line2) {
-            if (strlen(line1) + strlen(addition) <= 37) {
+            if (strlen(line1) + strlen(addition) <= 41) { 
                 strlcat(line1, addition, sizeof(line1));
                 ssids_drawn++;
             } else {
@@ -2890,34 +3142,35 @@ void drawProbeTracker() {
             if (strlen(line2) == 0) snprintf(addition, sizeof(addition), "%s", next_str);
             else snprintf(addition, sizeof(addition), "|%s", next_str);
 
-            if (strlen(line2) + strlen(addition) <= 53) { 
+            if (strlen(line2) + strlen(addition) <= 58) { 
                 strlcat(line2, addition, sizeof(line2));
                 ssids_drawn++;
             } else {
                 break; 
             }
         }
-        
         current_node = ssidPool[current_node].next_node_idx;
       }
 
       if (ssids_drawn == 0) {
         strlcat(line1, "<no SSIDs captured>", sizeof(line1));
-      } else if (ssids_drawn < total_ssids) {
+      } else if (ssids_drawn < true_total_ssids) {
         char plusStr[8];
-        snprintf(plusStr, sizeof(plusStr), "|+%d", (total_ssids - ssids_drawn));
-        if (on_line2 || strlen(line1) > 32) {
+        snprintf(plusStr, sizeof(plusStr), "|+%d", (true_total_ssids - ssids_drawn));
+        
+        // --- UPDATED: Increased Line 1 safety check to 36 for the +X tag ---
+        if (on_line2 || strlen(line1) > 36) { 
             strlcat(line2, plusStr, sizeof(line2));
         } else {
             strlcat(line1, plusStr, sizeof(line1));
         }
       }
 
-      // X=185 ensures a generous 15+ pixel gap after the flush-left MAC address
-      tft.drawString(line1, 165, y + 16);
+      // --- UPDATED: Moved starting coordinate from 165 to 145 ---
+      tft.drawString(line1, 145, y + 16);
       
       if (strlen(line2) > 0) {
-        tft.drawString(line2, 0, y + 30); // Flush Left
+        tft.drawString(line2, 0, y + 30); 
       }
       tft.drawLine(0, y + 45, 480, y + 45, hex24to565(0x222222));
     }
@@ -2938,7 +3191,6 @@ void drawProbeTracker() {
   tft.setTextColor(TFT_RED);
   tft.drawString("BACK", 215, 300); 
 
-  // Mathematically identical to drawDeviceList()
   if (((probe_current_page + 1) * PROBES_PER_PAGE) < total_sniffed_probes) {
     tft.setTextColor(TFT_WHITE);
     tft.drawString("NEXT ->", 360, 300);
@@ -2956,8 +3208,15 @@ void initProbeTracker() {
     probeList[i].first_ssid_idx = -1; 
     probeList[i].generation = 0;
     probeList[i].needs_lookup = false;
-    probeList[i].rssi = -100;           // <--- NEW
-    probeList[i].smoothedDistance = 0.0; // <--- NEW
+    probeList[i].rssi = -100;           
+    probeList[i].smoothedDistance = 0.0; 
+    
+    // --- INITIALIZE FINGERPRINTING & GROUP DATA ---
+    probeList[i].pnl_hash = 0;
+    probeList[i].hardware_hash = 0;
+    probeList[i].mac_rotations = 1;
+    // ---------------------------------------------------
+
     strncpy(probeList[i].vendor, "Unknown", 25);
   }
 
@@ -2971,48 +3230,97 @@ void initProbeTracker() {
 void drawFoxhuntScreen() {
   tft.fillScreen(TFT_BLACK);
   
-  // 1. Header
-  tft.fillRect(0, 0, 480, 30, TFT_DARKGREY);
+  // 1. Header (Dynamic Color by Protocol)
+  tft.fillRect(0, 0, 480, 30, (currentRadioMode == RADIO_BLE) ? TFT_PURPLE : TFT_RED);
   tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(MC_DATUM);
   tft.setFreeFont(&UbuntuMono_Regular11pt7b);
-  tft.drawString("TACTICAL FOXHUNT", 240, 15);
+  tft.drawString((currentRadioMode == RADIO_BLE) ? "BLE FOXHUNT" : "WIFI FOXHUNT", 240, 15);
 
-  // 2. Target Info
+  // 2. Target Info (Shifted up to clear room)
   tft.setTextColor(TFT_CYAN);
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
   char targetStr[64];
   snprintf(targetStr, sizeof(targetStr), "TARGET: %02X:%02X:%02X:%02X:%02X:%02X", 
            foxhunt_target_mac[0], foxhunt_target_mac[1], foxhunt_target_mac[2], 
            foxhunt_target_mac[3], foxhunt_target_mac[4], foxhunt_target_mac[5]);
-  tft.drawString(targetStr, 240, 60);
-  tft.drawString(foxhunt_target_vendor, 240, 85);
+  tft.drawString(targetStr, 240, 50);
+  
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString(foxhunt_target_vendor, 240, 70);
 
   // 3. Massive RSSI Display
   tft.setTextColor(TFT_WHITE);
+  tft.setFreeFont(&UbuntuMono_B9pt7b); 
   char rssiStr[32];
   snprintf(rssiStr, sizeof(rssiStr), "SIG: %d dBm", (int)smoothed_rssi);
-  tft.drawString(rssiStr, 240, 150);
+  tft.drawString(rssiStr, 240, 110);
 
-  // 4. The Alert Banner (Overrides the middle of the screen)
+  // ==========================================
+  // 4. SPATIAL DYNAMICS DASHBOARD (WI-FI ONLY)
+  // ==========================================
+  if (currentRadioMode == RADIO_WIFI) {
+     int target_idx = -1;
+     for (int i = 0; i < sessionMacCount; i++) {
+         if (memcmp(sessionData[i].mac, foxhunt_target_mac, 6) == 0) {
+             target_idx = i;
+             break;
+         }
+     }
+
+     tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+
+     // Only draw the readout if the spatial bounds have been successfully seeded (> 6 packets)
+     if (target_idx != -1 && sessionData[target_idx].packets > 6) {
+         int t_min = sessionData[target_idx].rssi_min;
+         int t_max = sessionData[target_idx].rssi_max;
+         int delta = t_max - t_min;
+
+         char boundStr[64];
+         snprintf(boundStr, sizeof(boundStr), "FLOOR: %d dBm  |  CEILING: %d dBm", t_min, t_max);
+         tft.setTextColor(TFT_GREEN);
+         tft.drawString(boundStr, 240, 145);
+
+         char deltaStr[32];
+         snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
+         tft.setTextColor(TFT_YELLOW);
+         tft.drawString(deltaStr, 240, 170);
+
+         char stateStr[32];
+         if (delta < 8) {
+             strcpy(stateStr, "STATE: STATIONARY TARGET");
+             tft.setTextColor(TFT_DARKGREY);
+         } else {
+             strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
+             tft.setTextColor(TFT_ORANGE);
+         }
+         tft.drawString(stateStr, 240, 195);
+     } else {
+         tft.setTextColor(TFT_DARKGREY);
+         tft.drawString("CALCULATING SPATIAL BOUNDS...", 240, 160);
+     }
+  }
+
+  // 5. The Alert Banner (Shifted down to Y=220)
   if (target_behind_alert) {
-    tft.fillRect(50, 180, 380, 60, TFT_RED);
+    tft.fillRect(50, 220, 380, 50, TFT_RED);
     tft.setTextColor(TFT_WHITE);
-    // Draw a thick white border around the red box
-    tft.drawRect(50, 180, 380, 60, TFT_WHITE); 
-    tft.drawString("! TARGET BEHIND YOU !", 240, 210);
+    tft.drawRect(50, 220, 380, 50, TFT_WHITE); 
+    tft.setFreeFont(&UbuntuMono_B9pt7b);
+    tft.drawString("! TARGET BEHIND YOU !", 240, 245);
     
-    // Clear alert after 3 seconds
+    // Clear alert after 3 seconds and reset local baseline
     if (millis() - alert_start_time > 3000) {
       target_behind_alert = false;
-      baseline_rssi = (int)smoothed_rssi; // Reset baseline to prevent continuous looping
+      baseline_rssi = (int)smoothed_rssi; 
     }
   }
 
-  // 5. Footer (Exit Button)
+  // 6. Footer (Exit Button)
   tft.drawLine(0, 285, 480, 285, TFT_WHITE);
   tft.drawRoundRect(190, 292, 100, 24, 3, TFT_RED);
   tft.setTextColor(TFT_WHITE);
+  tft.setFreeFont(&UbuntuMono_Regular9pt7b);
   tft.drawString("ABORT", 240, 304);
 }
 
@@ -3023,20 +3331,51 @@ void updateFoxhuntSignal(int packet_rssi) {
   
   if (currentRadioMode == RADIO_WIFI) {
     current_alpha = 0.2;       // Stable, slow-moving for high-noise Wi-Fi
-    drop_threshold = 12;       // Requires a massive 12 dBm drop to trigger
+    
+    // --- NEW: SPATIAL VOLATILITY TUNING ---
+    int t_min = 0;
+    int t_max = 0;
+    
+    // Retrieve the target's spatial bounds from the session array
+    for (int i = 0; i < sessionMacCount; i++) {
+        if (memcmp(sessionData[i].mac, foxhunt_target_mac, 6) == 0) {
+            t_min = sessionData[i].rssi_min;
+            t_max = sessionData[i].rssi_max;
+            break;
+        }
+    }
+
+    drop_threshold = 12; // Fallback default
+    
+    if (t_min < 0 && t_max < 0) { // Ensure bounds are fully seeded
+        int spatial_delta = t_max - t_min;
+        
+        // Dynamically scale the alert sensitivity based on environmental chaos
+        if (spatial_delta > 20) {
+            drop_threshold = 16; // Highly volatile / moving target -> Suppress false alarms
+        } else if (spatial_delta > 8) {
+            drop_threshold = 10; // Normal room dynamics -> Standard sensitivity
+        } else {
+            drop_threshold = 6;  // Highly stable / stationary target -> Hair-trigger sensitivity
+        }
+    }
+    // --------------------------------------
+
   } else {
-    current_alpha = 0.55;      // Twitchy, fast-moving for sparse BLE packets
-    drop_threshold = 7;        // Only requires a 7 dBm drop to trigger alert
+    // BLE FALLBACK: Working perfectly, left untouched.
+    current_alpha = 0.55;      
+    drop_threshold = 7;        
   }
 
   // 2. Initialize or Smooth the signal
   if (smoothed_rssi == -100.0) {
     smoothed_rssi = packet_rssi;
+    baseline_rssi = packet_rssi; // Initialize baseline safely
   } else {
     smoothed_rssi = (current_alpha * packet_rssi) + ((1.0 - current_alpha) * smoothed_rssi);
   }
 
-  // 3. Track the Baseline (strongest recent signal)
+  // 3. Track the Local Baseline (For body-block RF shadow detection)
   if ((int)smoothed_rssi > baseline_rssi) {
     baseline_rssi = (int)smoothed_rssi;
   }
@@ -3153,6 +3492,11 @@ void setup() {
   pinMode(15, OUTPUT); digitalWrite(15, HIGH);
   pinMode(21, OUTPUT); digitalWrite(21, HIGH);
   pinMode(5, OUTPUT);  digitalWrite(5, HIGH);
+
+  Serial.printf("[MEM] Static footprint:  %u bytes\n", static_non_union);
+  Serial.printf("[MEM] Free heap at boot: %u bytes\n", esp_get_free_heap_size());
+  Serial.printf("[MEM] Free SRAM minimum: %u bytes\n", 
+              esp_get_minimum_free_heap_size());
 
   initProbeTracker();
 
@@ -3438,7 +3782,9 @@ void loop() {
       }
     }
 
-// 3. AP SCANNER TOUCH LOGIC
+    // ==========================================
+    // 3. AP SCANNER TOUCH LOGIC
+    // ==========================================
     else if (currentState == SCREEN_AP_SCAN) {
       
       // 1. SNIFF ALL BUTTON (Free Airspace)
@@ -3454,10 +3800,10 @@ void loop() {
         delay(300);
       }
       
-      // 2. AP SELECTION LIST ROWS (y: 80 to 255)
-      else if (t_y >= 80 && t_y < 255) {
+      // 2. AP SELECTION LIST ROWS (y: 80 to 290)
+      // THE FIX: Stretched the hot zone down to 290 to cover the 6th row
+      else if (t_y >= 80 && t_y < 290) {
         
-        // Match the Y-offset so Row 0 starts exactly at pixel 80
         int clicked_row = (t_y - 80) / 35; 
         
         int actual_index = (ap_current_page * APS_PER_PAGE) + clicked_row;
@@ -3474,7 +3820,6 @@ void loop() {
           uint8_t* bssid = WiFi.BSSID(actual_index);
           String raw_ssid = WiFi.SSID(actual_index);
 
-          // 1. Re-run the clone check for the network we just tapped
           bool has_clone = false;
           if (raw_ssid.length() > 0) {
             for (int j = 0; j < n; ++j) {
@@ -3485,7 +3830,6 @@ void loop() {
             }
           }
 
-          // 2. Build the tactical string directly into the global target_ssid variable
           if (raw_ssid.length() == 0) {
             snprintf(target_ssid, sizeof(target_ssid), "<HIDDEN>~%02X%02X", bssid[4], bssid[5]);
           } else if (has_clone) {
@@ -3517,7 +3861,8 @@ void loop() {
       }
 
       // 3. PAGINATION & BACK FOOTER
-      else if (t_y >= 280) {
+      // THE FIX: Pushed down from 280 to 290 so it doesn't overlap row 6
+      else if (t_y >= 290) {
         int total_aps = WiFi.scanComplete();
         
         // PREV PAGE
@@ -3824,6 +4169,8 @@ void loop() {
             updateFoxhuntSignal(liveData[i].rssi);
             if (!target_locked) {
               target_locked = true; 
+              target_channel = CHANNELS[current_ch_idx];
+              esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
             }
           }
 
@@ -3846,7 +4193,14 @@ void loop() {
                   sessionData[j].rate = liveData[i].rate;
               }
               sessionData[j].last_seen = liveData[i].last_seen;
-              
+              sessionData[j].channel = liveData[i].channel;
+              if (liveData[i].rssi_min < sessionData[j].rssi_min) {
+                  sessionData[j].rssi_min = liveData[i].rssi_min;
+              }
+              if (liveData[i].rssi_max > sessionData[j].rssi_max || sessionData[j].rssi_max == 0) {
+                  sessionData[j].rssi_max = liveData[i].rssi_max;
+              }
+
               // EMA Distance Filter
               if (rawDistance > 0) {
                   sessionData[j].smoothedDistance = 
@@ -4658,6 +5012,78 @@ void loop() {
             }
           }
       }
+
+  // ==========================================
+  // THE BACKGROUND CORRELATION & MERGE ENGINE
+  // ==========================================
+  static unsigned long last_correlation_run = 0;
+  
+  if (millis() - last_correlation_run > 5000) { 
+    last_correlation_run = millis();
+    
+    for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
+      if (probeList[i].generation == 0) continue; 
+      if ((probeList[i].mac[0] & 0x02) == 0) continue; // Only process randomized MACs
+
+      for (int j = i + 1; j < MAX_PROBE_SLOTS; j++) {
+         if (probeList[j].generation == 0) continue;
+         if ((probeList[j].mac[0] & 0x02) == 0) continue; 
+
+         // --- THE MERGE TRIGGER ---
+         if (isSameDevice(i, j)) {
+             
+             // 1. Update Rotations & Hits
+             probeList[i].mac_rotations++;
+             probeList[i].hits += probeList[j].hits;
+             
+             // 2. Adopt the most recent MAC address and timestamps
+             if (probeList[j].last_seen > probeList[i].last_seen) {
+                 probeList[i].last_seen = probeList[j].last_seen;
+                 memcpy(probeList[i].mac, probeList[j].mac, 6); // Stay current with the target's rotation
+             }
+             
+             // 3. Merge the Behavioral PNL Fingerprint
+             probeList[i].pnl_hash |= probeList[j].pnl_hash;
+
+             // 4. Safely extract and deduplicate SSIDs from J into I
+             int node_to_copy = probeList[j].first_ssid_idx;
+             while (node_to_copy != -1) {
+                 
+                 // --- ADD THIS CHECK: Block ghost nodes from migrating ---
+                 if (strlen(ssidPool[node_to_copy].text) > 0) {
+                     bool already_exists = false;
+                     bool added = false;
+                     probeList[i].first_ssid_idx = addSsidToPool(ssidPool[node_to_copy].text, 
+                                                                 probeList[i].first_ssid_idx, 
+                                                                 already_exists, added, 
+                                                                 probeList[i].ssid_count);
+                     if (added) probeList[i].ssid_count++;
+                 }
+                 // --------------------------------------------------------
+                 
+                 node_to_copy = ssidPool[node_to_copy].next_node_idx;
+             }
+
+             // 5. THE BURN PROTOCOL: Wipe Slot J to reclaim the SRAM
+             // First, run the Garbage Collector on J's old SSID pointers
+             int node_to_wipe = probeList[j].first_ssid_idx;
+             int fail_safe = 0; 
+             while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
+                 int next = ssidPool[node_to_wipe].next_node_idx;
+                 ssidPool[node_to_wipe].text[0] = '\0'; 
+                 ssidPool[node_to_wipe].next_node_idx = -1; 
+                 node_to_wipe = next;
+                 fail_safe++;
+             }
+             
+             // Second, wipe the array slot
+             memset(probeList[j].mac, 0, 6);
+             probeList[j].generation = 0; 
+         }
+      }
+    }
+  }
+  // ==========================================
 
       current_x += 2;
       if (current_x >= 478) current_x = 0;
