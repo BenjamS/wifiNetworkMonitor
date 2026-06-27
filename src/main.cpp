@@ -106,7 +106,6 @@ struct ProbeRecordShared {
 // Fixed, static memory blocks
 ProbeRecordShared probeList[MAX_PROBE_SLOTS];
 SSIDNode ssidPool[TOTAL_SSID_POOL];
-int nextFreeSsidIdx = 0;            // Points to the next unused slot in the pool
 
 int probe_current_page = 0; 
 const int PROBES_PER_PAGE = 5;
@@ -182,7 +181,8 @@ struct ApRecord {
   uint8_t channel;
   uint8_t max_rate;
   int8_t rssi;
-  char ssid[31];         // 31 chars locks the struct exactly at 80 bytes
+  char ssid[28];
+  char country[3];
 };
 
 #define MAX_CHANNEL_RECORDS 100
@@ -261,7 +261,7 @@ struct OUICache {
   char vendor[27]; // <--- Updated to match the new MacRecord limit
 };
 
-#define MAX_BEACON_DICT 80
+#define MAX_BEACON_DICT 80 // MAX POSSIBLE IS 255 given uint8_t beaconDictCount
 struct BeaconEntry {
     uint32_t last_seen; //  4 bytes — 4-byte type first
     int8_t rssi;        //  1 byte
@@ -603,6 +603,14 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           // If we successfully claimed a slot (either a new one or an evicted one)
           if (ap_index != -1) {
             
+            // --- NEW: EVICTION SAFETY INIT ---
+            // Explicitly clear the country memory before the IE walk so 
+            // the new AP doesn't inherit a stale code from the previous occupant.
+            liveApData[ap_index].country[0] = '\0';
+            liveApData[ap_index].country[1] = '\0';
+            liveApData[ap_index].country[2] = '\0';
+            // ---------------------------------
+
             // ==========================================
             // THE BEACON DECODER (Extract True Channel & SSID)
             // ==========================================
@@ -629,6 +637,20 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               else if (tag_num == 3 && tag_len == 1) {
                 true_channel = payload[offset + 2];
               }
+              // --- NEW: TAG 7 COUNTRY CODE PARSER ---
+              else if (tag_num == 7 && tag_len >= 2) {
+                uint8_t c0 = payload[offset + 2];
+                uint8_t c1 = payload[offset + 3];
+                
+                // Sanity check: valid ISO country codes are uppercase ASCII letters
+                if (c0 >= 'A' && c0 <= 'Z' && c1 >= 'A' && c1 <= 'Z') {
+                    liveApData[ap_index].country[0] = c0;
+                    liveApData[ap_index].country[1] = c1;
+                    liveApData[ap_index].country[2] = '\0';
+                }
+              }
+              // --------------------------------------
+
               ingestBeacon(addr2, extracted_ssid, pkt->rx_ctrl.rssi);
               
               offset += 2 + tag_len; // Jump to the next tag
@@ -651,7 +673,13 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
             liveApData[ap_index].rssi = pkt->rx_ctrl.rssi;
             
             liveApData[ap_index].channel = true_channel; // <--- INJECT THE TRUE CHANNEL
-            strcpy((char*)liveApData[ap_index].ssid, extracted_ssid); // <--- INJECT THE PARSED SSID
+            
+            // --- NEW: SAFETY BOUNDARY FOR TRUNCATED SSID ---
+            // Because we trimmed ApRecord.ssid to 28 bytes to maintain the 80-byte struct,
+            // we must use strncpy to prevent a 32-byte SSID from overflowing into the country code.
+            strncpy((char*)liveApData[ap_index].ssid, extracted_ssid, 27); 
+            liveApData[ap_index].ssid[27] = '\0'; 
+            // -----------------------------------------------
           }
         }
 
@@ -2076,7 +2104,7 @@ void drawDeviceList() {
     } 
     else if (currentRadioMode == RADIO_AP) {
       tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString("     SSID                 BSSID            RSSI TOTAL", 5, 26);       
+      tft.drawString("     SSID                 BSSID         CC RSSI TOTAL", 5, 26);       
       tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
       tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%    TX | RX", 5, 41);
     }
@@ -2316,9 +2344,15 @@ void drawDeviceList() {
         formatShortUnit(sessionApData[i].tx_bytes, txStr, sizeof(txStr));
         formatShortUnit(sessionApData[i].rx_bytes, rxStr, sizeof(rxStr));
         snprintf(trafficCombo, sizeof(trafficCombo), "%s|%s", txStr, rxStr); 
+        
+        char safeCountry[3] = "--";
+        if (sessionApData[i].country[0] != '\0') {
+            safeCountry[0] = sessionApData[i].country[0];
+            safeCountry[1] = sessionApData[i].country[1];
+        }
 
-        snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
-                 (i + 1), safeSsid, bssidStr, sessionApData[i].rssi, totStr);
+        snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %2s %4d %-5.5s", 
+                 (i + 1), safeSsid, bssidStr, safeCountry, sessionApData[i].rssi, totStr);
 
         snprintf(line2, sizeof(line2), "    %13s %3.0fm %02d %3uM %-4.4s %3.0f%%   %9s", 
                  ageCombo, sessionApData[i].smoothedDistance, sessionApData[i].channel, 
@@ -2872,7 +2906,10 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
   }
 
   // 1. Standard Updates
-  probeList[target_slot].hits++;
+  // In processProbeRequestShared:
+  if (probeList[target_slot].hits < 65535) {
+      probeList[target_slot].hits++;
+  }
   probeList[target_slot].last_seen = millis();
   probeList[target_slot].rssi = rssi;
   
@@ -4477,6 +4514,11 @@ void loop() {
               sessionApData[j].last_seen = liveApData[i].last_seen;
               sessionApData[j].rssi = liveApData[i].rssi;
               sessionApData[j].channel = liveApData[i].channel;
+              if (sessionApData[j].country[0] == '\0' && liveApData[i].country[0] != '\0') {
+                  sessionApData[j].country[0] = liveApData[i].country[0];
+                  sessionApData[j].country[1] = liveApData[i].country[1];
+                  sessionApData[j].country[2] = '\0';
+              }
               
               // Only overwrite the historical rate if the new one is faster
               if (liveApData[i].max_rate > sessionApData[j].max_rate) {
@@ -5033,7 +5075,7 @@ void loop() {
          if (isSameDevice(i, j)) {
              
              // 1. Update Rotations & Hits
-             probeList[i].mac_rotations++;
+             probeList[i].mac_rotations += probeList[j].mac_rotations;
              probeList[i].hits += probeList[j].hits;
              
              // 2. Adopt the most recent MAC address and timestamps
@@ -5045,27 +5087,29 @@ void loop() {
              // 3. Merge the Behavioral PNL Fingerprint
              probeList[i].pnl_hash |= probeList[j].pnl_hash;
 
-             // 4. Safely extract and deduplicate SSIDs from J into I
-             int node_to_copy = probeList[j].first_ssid_idx;
-             while (node_to_copy != -1) {
-                 
-                 // --- ADD THIS CHECK: Block ghost nodes from migrating ---
-                 if (strlen(ssidPool[node_to_copy].text) > 0) {
-                     bool already_exists = false;
-                     bool added = false;
-                     probeList[i].first_ssid_idx = addSsidToPool(ssidPool[node_to_copy].text, 
-                                                                 probeList[i].first_ssid_idx, 
-                                                                 already_exists, added, 
-                                                                 probeList[i].ssid_count);
-                     if (added) probeList[i].ssid_count++;
+             // ==========================================
+             // 4. THE STACK-BUFFERED MERGE PROTOCOL
+             // ==========================================
+             // MAX_MERGE_SSIDS matches EMERGENCY_CUTOFF so no valid SSIDs
+             // should be truncated. If j_ssid_count hits the cap, remaining
+             // nodes are freed in 4b without migration — acceptable data loss
+             // from a corrupted chain that exceeded the per-device limit.
+             const int MAX_MERGE_SSIDS = EMERGENCY_CUTOFF;
+             char j_ssids[MAX_MERGE_SSIDS][33];
+             uint8_t j_ssid_count = 0;
+             int node = probeList[j].first_ssid_idx;
+             
+             // 4a. Pre-collect J's SSIDs onto the stack
+             while (node != -1 && j_ssid_count < MAX_MERGE_SSIDS) {
+                 if (strlen(ssidPool[node].text) > 0) {
+                     strncpy(j_ssids[j_ssid_count], ssidPool[node].text, 32);
+                     j_ssids[j_ssid_count][32] = '\0';
+                     j_ssid_count++;
                  }
-                 // --------------------------------------------------------
-                 
-                 node_to_copy = ssidPool[node_to_copy].next_node_idx;
+                 node = ssidPool[node].next_node_idx;
              }
 
-             // 5. THE BURN PROTOCOL: Wipe Slot J to reclaim the SRAM
-             // First, run the Garbage Collector on J's old SSID pointers
+             // 4b. THE BURN PROTOCOL: Free J's pool nodes FIRST to reclaim SRAM
              int node_to_wipe = probeList[j].first_ssid_idx;
              int fail_safe = 0; 
              while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
@@ -5076,9 +5120,25 @@ void loop() {
                  fail_safe++;
              }
              
-             // Second, wipe the array slot
-             memset(probeList[j].mac, 0, 6);
-             probeList[j].generation = 0; 
+             // 4c. Wipe J's array slot completely (The Sentinel Burn)
+             memset(&probeList[j], 0, sizeof(ProbeRecordShared));
+             
+             // Restore the critical sentinels that cannot be 0
+             probeList[j].first_ssid_idx = -1; 
+             probeList[j].rssi = -100;         
+             strncpy(probeList[j].vendor, "Unknown", 25);
+
+             // 4d. Re-allocate unique SSIDs from the stack into I
+             for (int s = 0; s < j_ssid_count; s++) {
+                 bool already_exists = false;
+                 bool added = false;
+                 probeList[i].first_ssid_idx = addSsidToPool(j_ssids[s], 
+                                                             probeList[i].first_ssid_idx, 
+                                                             already_exists, added, 
+                                                             probeList[i].ssid_count);
+                 if (added) probeList[i].ssid_count++;
+             }
+             // (Old Step 5 was successfully deleted from here)
          }
       }
     }
