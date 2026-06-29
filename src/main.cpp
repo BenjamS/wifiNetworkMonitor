@@ -1057,6 +1057,16 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // 2. The Target AP Lock Gate
   if (target_locked) {
     bool belongs_to_target = false;
+    // --- NEW: THE FOXHUNT EXCEPTION ---
+    // If we are actively hunting a Wi-Fi client, bypass the strict BSSID filter
+    // and let ANY packet involving the hunted MAC through!
+    if (is_foxhunting && currentRadioMode == RADIO_WIFI) {
+        if (memcmp(addr1, foxhunt_target_mac, 6) == 0 || 
+            memcmp(addr2, foxhunt_target_mac, 6) == 0 || 
+            memcmp(mac3, foxhunt_target_mac, 6) == 0) {
+            belongs_to_target = true;
+        }
+    }
     if (memcmp(addr1, target_bssid, 6) == 0) belongs_to_target = true;
     else if (memcmp(addr2, target_bssid, 6) == 0) belongs_to_target = true;
     else if (memcmp(mac3, target_bssid, 6) == 0) belongs_to_target = true;
@@ -3763,20 +3773,18 @@ void loop() {
           else if (currentRadioMode == RADIO_BLE) foxhunt_available = (sessionBleCount > 0);
           else if (currentRadioMode == RADIO_AP) foxhunt_available = (sessionApCount > 0);
 
+          // 1. THE GATE
           if (!foxhunt_available) {
-              delay(200); // Debounce only
-              // Optionally flash hint text here
-          } else {
-              is_selecting_target = true;
-              currentState = SCREEN_DEVICE_LIST;
-              drawDeviceList();
-              delay(200);
+              return; // The button is cold. Ignore the touch entirely.
           }
           
+          // 2. THE EXECUTION
           is_selecting_target = true;
           currentState = SCREEN_DEVICE_LIST;
           drawDeviceList();
-          delay(200);
+          
+          // 3. THE DEBOUNCE
+          delay(400); // Wait 400ms before accepting new touches
       }
       // Probe Request Tracker Button
       else if (t_x > 300 && t_x < 450 && t_y > 140 && t_y < 180) {
