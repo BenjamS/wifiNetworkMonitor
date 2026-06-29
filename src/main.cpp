@@ -64,12 +64,12 @@ unsigned long last_foxhunt_update = 0;
 bool target_behind_alert = false;
 unsigned long alert_start_time = 0;
 
-// BUG 1 FIX: Cached spatial bounds — written from Core 1 only,
+// Cached spatial bounds — written from Core 1 only,
 // read from Core 0 ISR via updateFoxhuntSignal. Avoids sessionData
 // scan inside ISR callback path.
-int foxhunt_rssi_min = 0;
-int foxhunt_rssi_max = 0;
-bool foxhunt_bounds_seeded = false;
+volatile int8_t foxhunt_rssi_min = -100;
+volatile int8_t foxhunt_rssi_max = -100;
+volatile bool foxhunt_bounds_seeded = false;
 
 // --- Forward Declarations for OSINT Probe Tracker ---
 int addSsidToPool(const char* ssid, int head_idx, bool &already_exists, bool &added, uint8_t current_count);
@@ -549,7 +549,7 @@ void updateFoxhuntSignal(int packet_rssi) {
   float current_alpha;
   int drop_threshold = 12; // Safe fallback for all modes
 
-  if (currentRadioMode == RADIO_WIFI) {
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
     current_alpha = 0.2;
 
     // BUG 1 FIX: Use cached globals instead of scanning sessionData.
@@ -1416,9 +1416,16 @@ void drawMenu() {
   // ==========================================
   tft.setTextDatum(MC_DATUM);
 
-  bool foxhunt_available = (currentRadioMode == RADIO_BLE) || 
-                           (currentRadioMode == RADIO_WIFI && target_locked) ||
-                           (currentRadioMode == RADIO_AP && target_locked);
+  bool foxhunt_available = false;
+
+  if (currentRadioMode == RADIO_WIFI)
+      foxhunt_available = (sessionMacCount > 0);
+
+  else if (currentRadioMode == RADIO_BLE)
+      foxhunt_available = (sessionBleCount > 0);
+
+  else if (currentRadioMode == RADIO_AP)
+      foxhunt_available = (sessionApCount > 0);
 
   if (foxhunt_available) {
       // Draw active red button
@@ -1436,10 +1443,10 @@ void drawMenu() {
       // Hint text
       tft.setFreeFont(&UbuntuMono_Regular9pt7b);
       tft.setTextColor(hex24to565(0x444444));
-      tft.drawString("(lock AP first)", 150, 125);
+      tft.drawString("(no targets yet)", 150, 125);
   }
   
-  tft.setTextDatum(TL_DATUM); // Reset datum to Top-Left for the rest of the menu!
+  // (The premature TL_DATUM reset was deleted from here)
 
   // ==========================================
   // PROBE REQUEST BUTTON (Right Column)
@@ -1486,10 +1493,10 @@ void drawMenu() {
     tft.fillRect(300, 190, 150, 40, TFT_PURPLE);
   } 
   else if (currentRadioMode == RADIO_AP) {
-    tft.fillRect(300, 190, 150, 40, TFT_DARKGREEN); // New color for AP mode
+    tft.fillRect(300, 190, 150, 40, TFT_DARKGREEN); 
   }
   else if (currentRadioMode == RADIO_CHANNELS) {
-    tft.fillRect(300, 190, 150, 40, TFT_ORANGE); // New color for channel spectrum mode
+    tft.fillRect(300, 190, 150, 40, TFT_ORANGE); 
   }
 
   // 2. Draw the universal white border
@@ -1514,6 +1521,9 @@ void drawMenu() {
   tft.drawRect(300, 240, 150, 40, TFT_WHITE);
   tft.setTextColor(TFT_WHITE);
   tft.drawString("EXIT", 375, 260);
+  
+  // THE FIX: Reset datum to Top-Left for the rest of the UI ONLY at the very end!
+  tft.setTextDatum(TL_DATUM); 
 }
 
 void drawChartHeader() {
@@ -2611,6 +2621,20 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice* advertisedDevice) {
     if (pause_sniffing) return; 
 
+    // ==========================================
+    // BLE FOXHUNT ISR FEEDER
+    // Runs immediately on every advertisement from the target device.
+    // Replaces the deferred render-pipeline update (every 2 seconds)
+    // with per-packet updates, matching WiFi foxhunt responsiveness.
+    // ==========================================
+    if (is_foxhunting) {
+        const uint8_t* rawMac = advertisedDevice->getAddress().getNative();
+        if (memcmp(rawMac, foxhunt_target_mac, 6) == 0) {
+            updateFoxhuntSignal(advertisedDevice->getRSSI());
+        }
+    }
+    // ==========================================
+
     std::string macStr = advertisedDevice->getAddress().toString();
     
     // ==========================================
@@ -2636,7 +2660,6 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
     // ==========================================
     std::string newName = "";
     uint8_t newNamePriority = 0;
-    // The new, memory-efficient IDs
     uint8_t newTrackerType = TRACKER_NONE; 
     uint16_t newAppearanceId = 0;          
     uint16_t newServiceId = 0;
@@ -2654,7 +2677,6 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
         uint16_t companyId = (uint8_t)mfg[1] << 8 | (uint8_t)mfg[0];
         std::string resolvedCompany = resolveBleCompanyId(mfg);
         
-        // --- HIGH-VALUE OSINT INTERCEPTS ---
         if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x12) newTrackerType = TRACKER_APPLE_FINDMY;
         else if (companyId == 0x004C && mfg.length() >= 3 && mfg[2] == 0x02) newTrackerType = TRACKER_APPLE_IBEACON;
         else if (companyId == 0x00E0 && mfg.length() >= 3 && mfg[2] == 0xFC) newTrackerType = TRACKER_GOOGLE_FASTPAIR;
@@ -2662,18 +2684,13 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
         else if (companyId == 0x0075 && mfg.length() >= 3 && mfg[2] == 0x42) newTrackerType = TRACKER_SAMSUNG_SMARTTAG;
         else if (companyId == 0x0006 && mfg.length() >= 3 && mfg[2] == 0x09) newTrackerType = TRACKER_MS_SWIFTPAIR;
         
-        // --- PRIORITY 1: TARGETED COMPANY NAME FALLBACK ---
         if (newName == "" && resolvedCompany != "") {
-            
-            // 1. If we successfully resolved the protocol, promote it to the Name slot!
             if (newTrackerType == TRACKER_APPLE_FINDMY) newName = "Apple Find My";
             else if (newTrackerType == TRACKER_APPLE_IBEACON) newName = "Apple iBeacon";
             else if (newTrackerType == TRACKER_GOOGLE_FASTPAIR) newName = "Google FastPair";
             else if (newTrackerType == TRACKER_SAMSUNG_SMARTTAG) newName = "Samsung SmartTag";
             else if (newTrackerType == TRACKER_TILE) newName = "Tile Tracker";
             else if (newTrackerType == TRACKER_MS_SWIFTPAIR) newName = "MS Swift Pair";
-            
-            // 2. If it is an unknown proprietary protocol, leave the hex diagnostic!
             else {
                 if (mfg.length() >= 3) {
                     char fallbackName[25];
@@ -2684,7 +2701,7 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
                     newName = resolvedCompany.substr(0, 24);
                 }
             }
-            newNamePriority = 1; // Secure the Priority Rank!
+            newNamePriority = 1;
         }
       }
     }
@@ -2698,17 +2715,14 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
       if (sdUUID.bitSize() == 16) {
         uint16_t uuid16 = sdUUID.getNative()->u16.value;
         
-        // THE EDDYSTONE INTERCEPT
         if (uuid16 == 0xFEAA) {
           newTrackerType = TRACKER_EDDYSTONE;
-          // If we don't have a name, promote the URL to the name column
           if (newName == "") {
               newName = decodeEddystoneURL(advertisedDevice->getServiceData(k)).substr(0, 24);
           }
           break; 
         }
 
-        // If it's a generic 16-bit service data, save it so the UI can resolve the Member Name later
         if (newServiceId == 0) {
             newServiceId = uuid16; 
         }
@@ -2718,7 +2732,6 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
     // ==========================================
     // STEP 3: Appearance (0x19)
     // ==========================================
-    // No more strings! Just grab the raw ID.
     if (advertisedDevice->haveAppearance()) {
       newAppearanceId = advertisedDevice->getAppearance();
     } 
@@ -2726,7 +2739,6 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
     // ==========================================
     // STEP 4: Standard Services (0x02/0x03)
     // ==========================================
-    // Grab the first 16-bit Service UUID we find
     if (advertisedDevice->haveServiceUUID()) {
       NimBLEUUID sUUID = advertisedDevice->getServiceUUID();
       if (sUUID.bitSize() == 16 && newServiceId == 0) {
@@ -2747,13 +2759,11 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
         liveBleData[i].rssi = rssi;
         liveBleData[i].txPower = txPower; 
 
-        // Safely update the Name string if a new one arrived
         if (newName != "") {
           strncpy((char*)liveBleData[i].name, newName.c_str(), 24);
           liveBleData[i].name[24] = '\0';
         }
         
-        // Update IDs if we found new ones
         if (newTrackerType != TRACKER_NONE) liveBleData[i].trackerType = newTrackerType;
         if (newAppearanceId != 0) liveBleData[i].appearanceId = newAppearanceId;
         if (newServiceId != 0) liveBleData[i].serviceId = newServiceId;
@@ -2763,14 +2773,12 @@ class BLEPassiveCallbacks: public BLEAdvertisedDeviceCallbacks {
       }
     }
 
-    // Add New Device to the live buffer
     if (!found && liveBleCount < MAX_BLE_DEVICES) {
       memcpy((void*)(uint8_t*)liveBleData[liveBleCount].mac, rawMac, 6);
 
       strncpy((char*)liveBleData[liveBleCount].name, newName.c_str(), 24);
       liveBleData[liveBleCount].name[24] = '\0';
 
-      // Drop the integers directly into the struct
       liveBleData[liveBleCount].trackerType = newTrackerType;
       liveBleData[liveBleCount].appearanceId = newAppearanceId;
       liveBleData[liveBleCount].serviceId = newServiceId;
@@ -3404,9 +3412,10 @@ void drawFoxhuntScreen() {
     tft.setTextColor(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
     tft.setFreeFont(&UbuntuMono_Regular11pt7b);
-    tft.drawString(
-        (currentRadioMode == RADIO_BLE) ? "BLE FOXHUNT" : "WIFI FOXHUNT", 
-        240, 15);
+    const char* huntLabel = "WIFI FOXHUNT";
+    if (currentRadioMode == RADIO_BLE) huntLabel = "BLE FOXHUNT";
+    else if (currentRadioMode == RADIO_AP) huntLabel = "AP FOXHUNT";
+    tft.drawString(huntLabel, 240, 15);
 
     // 2. TARGET MAC (static)
     tft.setFreeFont(&UbuntuMono_Regular9pt7b);
@@ -3431,50 +3440,69 @@ void drawFoxhuntScreen() {
     tft.drawString("SIGNAL", 240, 82);
     // Note: No RSSI value drawn here — loop() updater owns Y=88-128
 
-    // 5. SPATIAL DYNAMICS DASHBOARD (static, WiFi only)
+    // 5. SPATIAL DYNAMICS DASHBOARD (WiFi and AP modes)
+if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+    int target_idx = -1;
+    int t_min = 0, t_max = 0;
+    uint32_t target_packets = 0;
+
+    // Mode-specific lookup — only the source struct differs
     if (currentRadioMode == RADIO_WIFI) {
-        int target_idx = -1;
         for (int i = 0; i < sessionMacCount; i++) {
             if (memcmp(sessionData[i].mac, foxhunt_target_mac, 6) == 0) {
-                target_idx = i;
-                break;
+                target_idx = i; break;
             }
         }
-
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-
-        if (target_idx != -1 && sessionData[target_idx].packets > 6) {
-            int t_min = sessionData[target_idx].rssi_min;
-            int t_max = sessionData[target_idx].rssi_max;
-            int delta = t_max - t_min;
-
-            char boundStr[64];
-            snprintf(boundStr, sizeof(boundStr), 
-                     "FLOOR: %d dBm  |  CEILING: %d dBm", t_min, t_max);
-            tft.setTextColor(TFT_GREEN);
-            tft.drawString(boundStr, 240, 140);
-
-            char deltaStr[32];
-            snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
-            tft.setTextColor(TFT_YELLOW);
-            tft.drawString(deltaStr, 240, 163);
-
-            char stateStr[32];
-            if (delta < 8) {
-                strcpy(stateStr, "STATE: STATIONARY TARGET");
-                tft.setTextColor(TFT_DARKGREY);
-            } else {
-                strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
-                tft.setTextColor(TFT_ORANGE);
+        if (target_idx != -1) {
+            t_min = sessionData[target_idx].rssi_min;
+            t_max = sessionData[target_idx].rssi_max;
+            target_packets = sessionData[target_idx].packets;
+        }
+    } else { // RADIO_AP
+        for (int i = 0; i < sessionApCount; i++) {
+            if (memcmp(sessionApData[i].bssid, foxhunt_target_mac, 6) == 0) {
+                target_idx = i; break;
             }
-            tft.drawString(stateStr, 240, 186);
-
-        } else {
-            tft.setTextColor(TFT_DARKGREY);
-            tft.drawString("CALCULATING SPATIAL BOUNDS...", 240, 163);
+        }
+        if (target_idx != -1) {
+            t_min = sessionApData[target_idx].rssi_min;
+            t_max = sessionApData[target_idx].rssi_max;
+            target_packets = sessionApData[target_idx].packets;
         }
     }
-    // Note: Alert banner (Y=220-275) NOT drawn here — owned by loop() updater
+
+    // Shared drawing code — runs identically for both modes
+    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+
+    if (target_idx != -1 && target_packets > 6) {
+        int delta = t_max - t_min;
+
+        char boundStr[64];
+        snprintf(boundStr, sizeof(boundStr),
+                 "FLOOR: %d dBm  |  CEILING: %d dBm", t_min, t_max);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString(boundStr, 240, 140);
+
+        char deltaStr[32];
+        snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
+        tft.setTextColor(TFT_YELLOW);
+        tft.drawString(deltaStr, 240, 163);
+
+        char stateStr[32];
+        if (delta < 8) {
+            strcpy(stateStr, "STATE: STATIONARY TARGET");
+            tft.setTextColor(TFT_DARKGREY);
+        } else {
+            strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
+            tft.setTextColor(TFT_ORANGE);
+        }
+        tft.drawString(stateStr, 240, 186);
+
+    } else {
+        tft.setTextColor(TFT_DARKGREY);
+        tft.drawString("CALCULATING SPATIAL BOUNDS...", 240, 163);
+    }
+}
 
     // 6. FOOTER (static)
     tft.drawLine(0, 285, 480, 285, TFT_WHITE);
@@ -3729,8 +3757,21 @@ void loop() {
       
       // FOXHUNT BUTTON TOUCH ZONE
       if (t_x > 50 && t_x < 250 && t_y > 90 && t_y < 130) {
-          // --- NEW: THE GATE ---
-          if (currentRadioMode != RADIO_BLE && !target_locked) return; // Button is cold, ignore touch
+          
+          bool foxhunt_available = false;
+          if (currentRadioMode == RADIO_WIFI) foxhunt_available = (sessionMacCount > 0);
+          else if (currentRadioMode == RADIO_BLE) foxhunt_available = (sessionBleCount > 0);
+          else if (currentRadioMode == RADIO_AP) foxhunt_available = (sessionApCount > 0);
+
+          if (!foxhunt_available) {
+              delay(200); // Debounce only
+              // Optionally flash hint text here
+          } else {
+              is_selecting_target = true;
+              currentState = SCREEN_DEVICE_LIST;
+              drawDeviceList();
+              delay(200);
+          }
           
           is_selecting_target = true;
           currentState = SCREEN_DEVICE_LIST;
@@ -3991,7 +4032,9 @@ void loop() {
       // Abort Button (Bottom Center)
       if (t_x > 190 && t_x < 290 && t_y > 290) {
         is_foxhunting = false;
-        target_locked = false;
+        is_selecting_target = false;
+        target_locked = false;      // Release channel lock
+        foxhunt_bounds_seeded = false; // Clear stale bounds
         currentState = SCREEN_MENU; // Route back to MENU
         drawMenu();
         delay(300);
@@ -4126,8 +4169,12 @@ void loop() {
                 foxhunt_rssi_min = sessionData[tapped_array_index].rssi_min;
                 foxhunt_rssi_max = sessionData[tapped_array_index].rssi_max;
                 foxhunt_bounds_seeded = (sessionData[tapped_array_index].packets > 6);
+            } else if (currentRadioMode == RADIO_AP) {
+                foxhunt_rssi_min = sessionApData[tapped_array_index].rssi_min;
+                foxhunt_rssi_max = sessionApData[tapped_array_index].rssi_max;
+                foxhunt_bounds_seeded = (sessionApData[tapped_array_index].packets > 6);
             } else {
-                // BLE has no spatial bounds yet
+            // BLE has no spatial bounds yet
                 foxhunt_rssi_min = 0;
                 foxhunt_rssi_max = 0;
                 foxhunt_bounds_seeded = false;
@@ -4282,9 +4329,9 @@ void loop() {
           float rawDistance = calculateRfDistance(liveData[i].rssi, 0, RADIO_WIFI_24GHZ);
           
           // A. Inner j loop — session sync + bounds refresh
-    for (int j = 0; j < sessionMacCount; j++) {
-        if (memcmp(sessionData[j].mac, (void*)liveData[i].mac, 6) == 0) {
-            sessionData[j].packets += liveData[i].packets;
+          for (int j = 0; j < sessionMacCount; j++) {
+           if (memcmp(sessionData[j].mac, (void*)liveData[i].mac, 6) == 0) {
+                 sessionData[j].packets += liveData[i].packets;
             sessionData[j].tx_bytes += liveData[i].tx_bytes;
             sessionData[j].rx_bytes += liveData[i].rx_bytes;
             sessionData[j].sum_bytes += liveData[i].sum_bytes;
@@ -4318,7 +4365,7 @@ void loop() {
             found = true;
             break;
         }
-    }
+     }
           
           // CORRECT LOCATION for target_locked detection:
           if (is_foxhunting && 
@@ -4443,12 +4490,6 @@ void loop() {
         for (int i = 0; i < liveBleCount; i++) {
           // --- INJECT FOXHUNT TRACKER ---
           // Notice the explicit (void*) cast added to the MAC
-          // TODO: Move to BLEPassiveCallbacks::onResult for per-packet updates.
-          // Remove this block once onResult injection is confirmed working.
-          if (is_foxhunting && memcmp((void*)liveBleData[i].mac, foxhunt_target_mac, 6) == 0) {
-            updateFoxhuntSignal(liveBleData[i].rssi);
-          }
-          
           bool found = false;
           float rawDistance = calculateRfDistance(liveBleData[i].rssi, liveBleData[i].txPower, RADIO_BLE_24GHZ);
           
@@ -4838,6 +4879,96 @@ void loop() {
         }
       }
 
+      // ==========================================
+  // THE BACKGROUND CORRELATION & MERGE ENGINE
+  // ==========================================
+  static unsigned long last_correlation_run = 0;
+  
+  if (millis() - last_correlation_run > 5000) { 
+    last_correlation_run = millis();
+    
+    for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
+      if (probeList[i].generation == 0) continue; 
+      if ((probeList[i].mac[0] & 0x02) == 0) continue; // Only process randomized MACs
+
+      for (int j = i + 1; j < MAX_PROBE_SLOTS; j++) {
+         if (probeList[j].generation == 0) continue;
+         if ((probeList[j].mac[0] & 0x02) == 0) continue; 
+
+         // --- THE MERGE TRIGGER ---
+         if (isSameDevice(i, j)) {
+             
+             // 1. Update Rotations & Hits
+             probeList[i].mac_rotations += probeList[j].mac_rotations;
+             probeList[i].hits += probeList[j].hits;
+             
+             // 2. Adopt the most recent MAC address and timestamps
+             if (probeList[j].last_seen > probeList[i].last_seen) {
+                 probeList[i].last_seen = probeList[j].last_seen;
+                 memcpy(probeList[i].mac, probeList[j].mac, 6); // Stay current with the target's rotation
+             }
+             
+             // 3. Merge the Behavioral PNL Fingerprint
+             probeList[i].pnl_hash |= probeList[j].pnl_hash;
+
+             // ==========================================
+             // 4. THE STACK-BUFFERED MERGE PROTOCOL
+             // ==========================================
+             // MAX_MERGE_SSIDS matches EMERGENCY_CUTOFF so no valid SSIDs
+             // should be truncated. If j_ssid_count hits the cap, remaining
+             // nodes are freed in 4b without migration — acceptable data loss
+             // from a corrupted chain that exceeded the per-device limit.
+             const int MAX_MERGE_SSIDS = EMERGENCY_CUTOFF;
+             char j_ssids[MAX_MERGE_SSIDS][33];
+             uint8_t j_ssid_count = 0;
+             int node = probeList[j].first_ssid_idx;
+             
+             // 4a. Pre-collect J's SSIDs onto the stack
+             while (node != -1 && j_ssid_count < MAX_MERGE_SSIDS) {
+                 if (strlen(ssidPool[node].text) > 0) {
+                     strncpy(j_ssids[j_ssid_count], ssidPool[node].text, 32);
+                     j_ssids[j_ssid_count][32] = '\0';
+                     j_ssid_count++;
+                 }
+                 node = ssidPool[node].next_node_idx;
+             }
+
+             // 4b. THE BURN PROTOCOL: Free J's pool nodes FIRST to reclaim SRAM
+             int node_to_wipe = probeList[j].first_ssid_idx;
+             int fail_safe = 0; 
+             while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
+                 int next = ssidPool[node_to_wipe].next_node_idx;
+                 ssidPool[node_to_wipe].text[0] = '\0'; 
+                 ssidPool[node_to_wipe].next_node_idx = -1; 
+                 node_to_wipe = next;
+                 fail_safe++;
+             }
+             
+             // 4c. Wipe J's array slot completely (The Sentinel Burn)
+             memset(&probeList[j], 0, sizeof(ProbeRecordShared));
+             
+             // Restore the critical sentinels that cannot be 0
+             probeList[j].first_ssid_idx = -1; 
+             probeList[j].rssi = -100;         
+             strncpy(probeList[j].vendor, "Unknown", 25);
+
+             // 4d. Re-allocate unique SSIDs from the stack into I
+             for (int s = 0; s < j_ssid_count; s++) {
+                 bool already_exists = false;
+                 bool added = false;
+                 probeList[i].first_ssid_idx = addSsidToPool(j_ssids[s], 
+                                                             probeList[i].first_ssid_idx, 
+                                                             already_exists, added, 
+                                                             probeList[i].ssid_count);
+                 if (added) probeList[i].ssid_count++;
+             }
+             // (Old Step 5 was successfully deleted from here)
+         }
+      }
+    }
+  }
+  // ==========================================
+
       pause_sniffing = false;
 
       if (currentState == SCREEN_CHART) {
@@ -5152,96 +5283,6 @@ void loop() {
             }
           }
       }
-
-  // ==========================================
-  // THE BACKGROUND CORRELATION & MERGE ENGINE
-  // ==========================================
-  static unsigned long last_correlation_run = 0;
-  
-  if (millis() - last_correlation_run > 5000) { 
-    last_correlation_run = millis();
-    
-    for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
-      if (probeList[i].generation == 0) continue; 
-      if ((probeList[i].mac[0] & 0x02) == 0) continue; // Only process randomized MACs
-
-      for (int j = i + 1; j < MAX_PROBE_SLOTS; j++) {
-         if (probeList[j].generation == 0) continue;
-         if ((probeList[j].mac[0] & 0x02) == 0) continue; 
-
-         // --- THE MERGE TRIGGER ---
-         if (isSameDevice(i, j)) {
-             
-             // 1. Update Rotations & Hits
-             probeList[i].mac_rotations += probeList[j].mac_rotations;
-             probeList[i].hits += probeList[j].hits;
-             
-             // 2. Adopt the most recent MAC address and timestamps
-             if (probeList[j].last_seen > probeList[i].last_seen) {
-                 probeList[i].last_seen = probeList[j].last_seen;
-                 memcpy(probeList[i].mac, probeList[j].mac, 6); // Stay current with the target's rotation
-             }
-             
-             // 3. Merge the Behavioral PNL Fingerprint
-             probeList[i].pnl_hash |= probeList[j].pnl_hash;
-
-             // ==========================================
-             // 4. THE STACK-BUFFERED MERGE PROTOCOL
-             // ==========================================
-             // MAX_MERGE_SSIDS matches EMERGENCY_CUTOFF so no valid SSIDs
-             // should be truncated. If j_ssid_count hits the cap, remaining
-             // nodes are freed in 4b without migration — acceptable data loss
-             // from a corrupted chain that exceeded the per-device limit.
-             const int MAX_MERGE_SSIDS = EMERGENCY_CUTOFF;
-             char j_ssids[MAX_MERGE_SSIDS][33];
-             uint8_t j_ssid_count = 0;
-             int node = probeList[j].first_ssid_idx;
-             
-             // 4a. Pre-collect J's SSIDs onto the stack
-             while (node != -1 && j_ssid_count < MAX_MERGE_SSIDS) {
-                 if (strlen(ssidPool[node].text) > 0) {
-                     strncpy(j_ssids[j_ssid_count], ssidPool[node].text, 32);
-                     j_ssids[j_ssid_count][32] = '\0';
-                     j_ssid_count++;
-                 }
-                 node = ssidPool[node].next_node_idx;
-             }
-
-             // 4b. THE BURN PROTOCOL: Free J's pool nodes FIRST to reclaim SRAM
-             int node_to_wipe = probeList[j].first_ssid_idx;
-             int fail_safe = 0; 
-             while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
-                 int next = ssidPool[node_to_wipe].next_node_idx;
-                 ssidPool[node_to_wipe].text[0] = '\0'; 
-                 ssidPool[node_to_wipe].next_node_idx = -1; 
-                 node_to_wipe = next;
-                 fail_safe++;
-             }
-             
-             // 4c. Wipe J's array slot completely (The Sentinel Burn)
-             memset(&probeList[j], 0, sizeof(ProbeRecordShared));
-             
-             // Restore the critical sentinels that cannot be 0
-             probeList[j].first_ssid_idx = -1; 
-             probeList[j].rssi = -100;         
-             strncpy(probeList[j].vendor, "Unknown", 25);
-
-             // 4d. Re-allocate unique SSIDs from the stack into I
-             for (int s = 0; s < j_ssid_count; s++) {
-                 bool already_exists = false;
-                 bool added = false;
-                 probeList[i].first_ssid_idx = addSsidToPool(j_ssids[s], 
-                                                             probeList[i].first_ssid_idx, 
-                                                             already_exists, added, 
-                                                             probeList[i].ssid_count);
-                 if (added) probeList[i].ssid_count++;
-             }
-             // (Old Step 5 was successfully deleted from here)
-         }
-      }
-    }
-  }
-  // ==========================================
 
       current_x += 2;
       if (current_x >= 478) current_x = 0;
