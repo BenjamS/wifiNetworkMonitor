@@ -52,7 +52,7 @@ SdFs sd;
 bool is_selecting_target = false; 
 bool is_foxhunting = false;
 uint8_t foxhunt_target_mac[6] = {0};
-char foxhunt_target_vendor[25] = "Unknown";
+char foxhunt_target_vendor[26] = "Unknown";
 
 // Foxhunt Math & Alert State
 float smoothed_rssi = -100.0f;
@@ -618,15 +618,24 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Extract MAC addresses immediately since we need them for both modes
   uint8_t* addr1 = payload + 4;  // Receiver
   uint8_t* addr2 = payload + 10; // Transmitter
+  uint8_t* mac3 = payload + 16;  // BSSID / Source / Dest
 
   // ==========================================
   // DIRECT FOXHUNT ISR FEEDER (GLOBAL)
   // ==========================================
-  // At the top — AP mode only (BSSID is always addr1 or addr2):
-  if (is_foxhunting && currentRadioMode == RADIO_AP) {
-      if (memcmp(addr2, foxhunt_target_mac, 6) == 0 || 
-          memcmp(addr1, foxhunt_target_mac, 6) == 0) {
-          updateFoxhuntSignal(pkt->rx_ctrl.rssi);
+  if (is_foxhunting) {
+      // Pre-calculate to keep the ISR blazing fast
+      bool target_is_tx = (memcmp(addr2, foxhunt_target_mac, 6) == 0);
+
+      if (currentRadioMode == RADIO_AP || currentRadioMode == RADIO_WIFI) {
+          
+          // THE PHYSICS FIX (Signal Strength)
+          // ONLY feed the math engine if our target is the physical transmitter.
+          // Because we require an AP lock first, the channel is already frozen.
+          // We don't need any dynamic channel-locking logic here!
+          if (target_is_tx) {
+              updateFoxhuntSignal(pkt->rx_ctrl.rssi);
+          }
       }
   }
   // ==========================================
@@ -1052,26 +1061,25 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // 1. Filter out everything except Data Frames (Type 0x08)
   if ((payload[0] & 0x0C) != 0x08) return;
 
-  uint8_t* mac3 = payload + 16; // Source / Destination
-
   // 2. The Target AP Lock Gate
   if (target_locked) {
     bool belongs_to_target = false;
-    // --- NEW: THE FOXHUNT EXCEPTION ---
-    // If we are actively hunting a Wi-Fi client, bypass the strict BSSID filter
-    // and let ANY packet involving the hunted MAC through!
-    if (is_foxhunting && currentRadioMode == RADIO_WIFI) {
+
+    // --- THE UNIVERSAL FOXHUNT EXCEPTION ---
+    if (is_foxhunting && (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP)) {
         if (memcmp(addr1, foxhunt_target_mac, 6) == 0 || 
             memcmp(addr2, foxhunt_target_mac, 6) == 0 || 
             memcmp(mac3, foxhunt_target_mac, 6) == 0) {
             belongs_to_target = true;
         }
     }
+
+    // Legacy AP Scanner Lock
     if (memcmp(addr1, target_bssid, 6) == 0) belongs_to_target = true;
     else if (memcmp(addr2, target_bssid, 6) == 0) belongs_to_target = true;
     else if (memcmp(mac3, target_bssid, 6) == 0) belongs_to_target = true;
 
-    if (!belongs_to_target) return;
+    if (!belongs_to_target) return; // The Ruthless Drop
   }
 
   // 3. Extract DS Flags to determine traffic direction
@@ -1124,20 +1132,19 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       liveData[i].packets += 1;
       liveData[i].sum_bytes += len;
       liveData[i].sum_sq_bytes += ((uint64_t)len * len);
-      liveData[i].rssi = pkt->rx_ctrl.rssi;
       
-      if (liveData[i].packets <= 6) {
-          // Warmup period — update both bounds freely so the range
-          // self-corrects across the first 6 packets rather than
-          // locking in a single arbitrary packet's RSSI at packet 6
-          liveData[i].rssi_min = pkt->rx_ctrl.rssi;
-          liveData[i].rssi_max = pkt->rx_ctrl.rssi;
-      } else {
-          // Warmed up — normal floor/ceiling tracking
-          if (pkt->rx_ctrl.rssi < liveData[i].rssi_min) 
+      // THE FIX 1: Pure Window Stretching
+      // Track the absolute min/max for this 2-second window without ever 
+      // deleting history. Only updates when the target is transmitting.
+      if (is_tx) {
+          liveData[i].rssi = pkt->rx_ctrl.rssi;
+          
+          if (liveData[i].rssi_min == 0 || pkt->rx_ctrl.rssi < liveData[i].rssi_min) {
               liveData[i].rssi_min = pkt->rx_ctrl.rssi;
-          if (pkt->rx_ctrl.rssi > liveData[i].rssi_max) 
+          }
+          if (liveData[i].rssi_max == -100 || pkt->rx_ctrl.rssi > liveData[i].rssi_max) {
               liveData[i].rssi_max = pkt->rx_ctrl.rssi;
+          }
       }
       
       uint8_t current_rate = getBitrateMbps(pkt);
@@ -1166,8 +1173,19 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     liveData[liveMacCount].first_seen = now;
     liveData[liveMacCount].last_seen = now;
     
+    // THE FIX 2: Dynamic Initializer
+    // Seed the bounds directly to the first packet if it's a physical transmission.
+    // Otherwise, use the safe defaults so they stretch correctly later.
+    if (is_tx) {
+        liveData[liveMacCount].rssi_min = pkt->rx_ctrl.rssi;
+        liveData[liveMacCount].rssi_max = pkt->rx_ctrl.rssi;
+    } else {
+        liveData[liveMacCount].rssi_min = 0; 
+        liveData[liveMacCount].rssi_max = -100; 
+    }
+    
     // --- NEW: INJECT FOXHUNT CHANNEL AND CHASE TAIL SEQUENCE ---
-    //Is channel also for packet periodicity tracking?
+    // (Logs the hopper's current channel at the moment of discovery)
     liveData[liveMacCount].channel = CHANNELS[current_ch_idx];     
     // -----------------------------------------------------------
 
@@ -1429,7 +1447,7 @@ void drawMenu() {
   bool foxhunt_available = false;
 
   if (currentRadioMode == RADIO_WIFI)
-      foxhunt_available = (sessionMacCount > 0);
+      foxhunt_available = (target_locked && sessionMacCount > 0);
 
   else if (currentRadioMode == RADIO_BLE)
       foxhunt_available = (sessionBleCount > 0);
@@ -3769,7 +3787,7 @@ void loop() {
       if (t_x > 50 && t_x < 250 && t_y > 90 && t_y < 130) {
           
           bool foxhunt_available = false;
-          if (currentRadioMode == RADIO_WIFI) foxhunt_available = (sessionMacCount > 0);
+          if (currentRadioMode == RADIO_WIFI) foxhunt_available = (target_locked && sessionMacCount > 0);
           else if (currentRadioMode == RADIO_BLE) foxhunt_available = (sessionBleCount > 0);
           else if (currentRadioMode == RADIO_AP) foxhunt_available = (sessionApCount > 0);
 
@@ -4041,14 +4059,14 @@ void loop() {
       if (t_x > 190 && t_x < 290 && t_y > 290) {
         is_foxhunting = false;
         is_selecting_target = false;
-        target_locked = false;      // Release channel lock
         foxhunt_bounds_seeded = false; // Clear stale bounds
+        
         currentState = SCREEN_MENU; // Route back to MENU
         drawMenu();
         delay(300);
       }
     }
-
+    
     // 4. SEEN DEVICES TOUCH LOGIC
     else if (currentState == SCREEN_DEVICE_LIST) {
       
@@ -4150,21 +4168,6 @@ void loop() {
         if (tapped_screen_row < 7 && tapped_array_index < total_devices) {
           if (is_selecting_target) {
             // --- TARGET ACQUIRED: LAUNCH FOXHUNT ---
-            if (currentRadioMode == RADIO_WIFI) {
-              memcpy(foxhunt_target_mac, sessionData[tapped_array_index].mac, 6);
-              strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, 25);
-            } else if (currentRadioMode == RADIO_BLE) {
-              memcpy(foxhunt_target_mac, sessionBleData[tapped_array_index].mac, 6);
-              strncpy(foxhunt_target_vendor, sessionBleData[tapped_array_index].name, 25);
-              if (foxhunt_target_vendor[0] == '\0') {
-                strncpy(foxhunt_target_vendor, "<Unnamed BLE>", 25);
-              }
-            } else if (currentRadioMode == RADIO_AP) {
-              // Allows Foxhunting routers from the AP list!
-              memcpy(foxhunt_target_mac, sessionApData[tapped_array_index].bssid, 6);
-              strncpy(foxhunt_target_vendor, sessionApData[tapped_array_index].ssid, 25);
-            }
-
             is_selecting_target = false;
             is_foxhunting = true;
             smoothed_rssi = -100.0f;
@@ -4172,23 +4175,62 @@ void loop() {
             last_displayed_rssi = -999;      // Force frame 1 redraw
             target_behind_alert = false;
 
-            // Seed spatial bounds from current session data
             if (currentRadioMode == RADIO_WIFI) {
-                foxhunt_rssi_min = sessionData[tapped_array_index].rssi_min;
-                foxhunt_rssi_max = sessionData[tapped_array_index].rssi_max;
-                foxhunt_bounds_seeded = (sessionData[tapped_array_index].packets > 6);
+              memcpy(foxhunt_target_mac, sessionData[tapped_array_index].mac, 6);
+              strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, 25);
+              foxhunt_target_vendor[25] = '\0'; // Safe null termination
+              
+              foxhunt_rssi_min = sessionData[tapped_array_index].rssi_min;
+              foxhunt_rssi_max = sessionData[tapped_array_index].rssi_max;
+              foxhunt_bounds_seeded = (sessionData[tapped_array_index].packets > 6);
+              
+              // THE CLEANUP: 
+              // We are already locked to the AP's channel. target_locked is ALREADY true.
+              // There is absolutely nothing we need to do to the channel hopper here!
+
             } else if (currentRadioMode == RADIO_AP) {
-                foxhunt_rssi_min = sessionApData[tapped_array_index].rssi_min;
-                foxhunt_rssi_max = sessionApData[tapped_array_index].rssi_max;
-                foxhunt_bounds_seeded = (sessionApData[tapped_array_index].packets > 6);
-            } else {
-            // BLE has no spatial bounds yet
-                foxhunt_rssi_min = 0;
-                foxhunt_rssi_max = 0;
-                foxhunt_bounds_seeded = false;
+              // Allows Foxhunting routers from the AP list!
+              memcpy(foxhunt_target_mac, sessionApData[tapped_array_index].bssid, 6);
+              strncpy(foxhunt_target_vendor, sessionApData[tapped_array_index].ssid, 25);
+              foxhunt_target_vendor[25] = '\0'; // Safe null termination
+              
+              foxhunt_rssi_min = sessionApData[tapped_array_index].rssi_min;
+              foxhunt_rssi_max = sessionApData[tapped_array_index].rssi_max;
+              foxhunt_bounds_seeded = (sessionApData[tapped_array_index].packets > 6);
+
+              // THE INSTANT LOCK STRATEGY (Routers are Stationary)
+              target_locked = true; 
+              target_channel = sessionApData[tapped_array_index].channel;
+              esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
+
+            } else if (currentRadioMode == RADIO_BLE) {
+              memcpy(foxhunt_target_mac, sessionBleData[tapped_array_index].mac, 6);
+              strncpy(foxhunt_target_vendor, sessionBleData[tapped_array_index].name, 25);
+              if (foxhunt_target_vendor[0] == '\0') {
+                strncpy(foxhunt_target_vendor, "<Unnamed BLE>", 25);
+              }
+              foxhunt_target_vendor[25] = '\0'; // Safe null termination
+              
+              // BLE has no spatial bounds yet. Sentinels set to -100 to match globals.
+              foxhunt_rssi_min = -100;
+              foxhunt_rssi_max = -100;
+              foxhunt_bounds_seeded = false;
+              
+              // BLE does not use the channel hopper
+              target_locked = false;
             }
 
             currentState = SCREEN_FOXHUNT;
+            
+            // ==========================================
+            // --- THE AWAKENING FIX ---
+            // Wake the radio back up before drawing the radar!
+            if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+                esp_wifi_set_promiscuous(true);
+            }
+            pause_sniffing = false;
+            // ==========================================
+
             drawFoxhuntScreen(); 
             delay(200);
           }
@@ -4338,52 +4380,54 @@ void loop() {
           
           // A. Inner j loop — session sync + bounds refresh
           for (int j = 0; j < sessionMacCount; j++) {
-           if (memcmp(sessionData[j].mac, (void*)liveData[i].mac, 6) == 0) {
-                 sessionData[j].packets += liveData[i].packets;
-            sessionData[j].tx_bytes += liveData[i].tx_bytes;
-            sessionData[j].rx_bytes += liveData[i].rx_bytes;
-            sessionData[j].sum_bytes += liveData[i].sum_bytes;
-            sessionData[j].sum_sq_bytes += liveData[i].sum_sq_bytes;
-            sessionData[j].rssi = liveData[i].rssi;
-            if (liveData[i].rate > 0) {
-                sessionData[j].rate = liveData[i].rate;
-            }
-            sessionData[j].last_seen = liveData[i].last_seen;
-            sessionData[j].channel = liveData[i].channel;
-            if (liveData[i].rssi_min < sessionData[j].rssi_min) {
-                sessionData[j].rssi_min = liveData[i].rssi_min;
-            }
-            if (liveData[i].rssi_max > sessionData[j].rssi_max || 
-                sessionData[j].rssi_max == 0) {
-                sessionData[j].rssi_max = liveData[i].rssi_max;
-            }
-            if (rawDistance > 0) {
-                sessionData[j].smoothedDistance = 
-                    (0.2 * rawDistance) + (0.8 * sessionData[j].smoothedDistance);
-            }
+            if (memcmp(sessionData[j].mac, (void*)liveData[i].mac, 6) == 0) {
+                sessionData[j].packets += liveData[i].packets;
+                sessionData[j].tx_bytes += liveData[i].tx_bytes;
+                sessionData[j].rx_bytes += liveData[i].rx_bytes;
+                sessionData[j].sum_bytes += liveData[i].sum_bytes;
+                sessionData[j].sum_sq_bytes += liveData[i].sum_sq_bytes;
+                sessionData[j].rssi = liveData[i].rssi;
+                
+                if (liveData[i].rate > 0) {
+                    sessionData[j].rate = liveData[i].rate;
+                }
+                sessionData[j].last_seen = liveData[i].last_seen;
+                sessionData[j].channel = liveData[i].channel;
+                
+                // THE FIX: The Empty Window Gate
+                // Only stretch the session bounds if the liveData window actually
+                // captured a valid physical transmission (!= 0 and != -100).
+                // The `|| sessionData[j]... == 0` ensures it breaks out of the initial C++ ghost state.
+                if (liveData[i].rssi_min != 0) {
+                    if (liveData[i].rssi_min < sessionData[j].rssi_min || sessionData[j].rssi_min == 0) {
+                        sessionData[j].rssi_min = liveData[i].rssi_min;
+                    }
+                }
+                
+                if (liveData[i].rssi_max != -100) {
+                    if (liveData[i].rssi_max > sessionData[j].rssi_max || sessionData[j].rssi_max == 0) {
+                        sessionData[j].rssi_max = liveData[i].rssi_max;
+                    }
+                }
 
-            // Bounds refresh — reads AFTER rssi_min/max updated above
-            if (is_foxhunting && 
-                memcmp(sessionData[j].mac, foxhunt_target_mac, 6) == 0) {
-                foxhunt_rssi_min = sessionData[j].rssi_min;
-                foxhunt_rssi_max = sessionData[j].rssi_max;
-                foxhunt_bounds_seeded = (sessionData[j].packets > 6);
-            }
+                if (rawDistance > 0) {
+                    sessionData[j].smoothedDistance = 
+                        (0.2 * rawDistance) + (0.8 * sessionData[j].smoothedDistance);
+                }
 
-            found = true;
-            break;
-        }
-     }
-          
-          // CORRECT LOCATION for target_locked detection:
-          if (is_foxhunting && 
-              memcmp((void*)liveData[i].mac, foxhunt_target_mac, 6) == 0) {
-              if (!target_locked) {
-                  target_locked = true;
-                  target_channel = CHANNELS[current_ch_idx];
-                  esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
-              }
+                // Bounds refresh — reads AFTER rssi_min/max updated above
+                if (is_foxhunting && 
+                    memcmp(sessionData[j].mac, foxhunt_target_mac, 6) == 0) {
+                    foxhunt_rssi_min = sessionData[j].rssi_min;
+                    foxhunt_rssi_max = sessionData[j].rssi_max;
+                    foxhunt_bounds_seeded = (sessionData[j].packets > 6);
+                }
+
+                found = true;
+                break;
+            }
           }
+
           // B. If it's a completely new MAC, claim a new slot OR Evict
           if (!found) {
             int targetIndex = 0;
