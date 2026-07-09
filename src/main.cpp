@@ -60,9 +60,10 @@ int baseline_rssi = -100;
 int last_displayed_rssi = -999;  // Sentinel: forces redraw on first frame.
                                   // Must differ from -100.0f initial smoothed_rssi
                                   // so updater redraws before first packet arrives.
-unsigned long last_foxhunt_update = 0;
-bool target_behind_alert = false;
-unsigned long alert_start_time = 0;
+int last_drawn_min = 0;          // NEW: Sentinel for bounds redraw
+int last_drawn_max = 0;          // NEW: Sentinel for bounds redraw
+volatile bool target_behind_alert = false;
+volatile unsigned long alert_start_time = 0;
 
 // Cached spatial bounds — written from Core 1 only,
 // read from Core 0 ISR via updateFoxhuntSignal. Avoids sessionData
@@ -604,7 +605,21 @@ void updateFoxhuntSignal(int packet_rssi) {
       alert_start_time = millis();
     }
   }
-}
+
+  // ==========================================
+  // 5. REAL-TIME TACTICAL STRETCHING (Option B)
+  // ==========================================
+  // Stretch the UI boundaries instantly on the ISR core.
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+      if (foxhunt_rssi_min == 0 || packet_rssi < foxhunt_rssi_min) {
+          foxhunt_rssi_min = packet_rssi;
+      }
+      if (foxhunt_rssi_max == -100 || packet_rssi > foxhunt_rssi_max) {
+          foxhunt_rssi_max = packet_rssi;
+          foxhunt_bounds_seeded = true; // Instantly activates the adaptive threshold
+      }
+  }
+} // <-- End of updateFoxhuntSignal function
 
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
 void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -3419,8 +3434,10 @@ void initProbeTracker() {
 }
 
 void drawFoxhuntScreen() {
-   last_displayed_rssi = -999; // Force redraw on every full screen draw
-   tft.fillScreen(TFT_BLACK);
+    last_displayed_rssi = -999; // Force redraw on every full screen draw
+    last_drawn_min = 0;         // NEW: Force bounds redraw 
+    last_drawn_max = 0;         // NEW: Force bounds redraw
+    tft.fillScreen(TFT_BLACK);
     
     // ==========================================
     // ZONE MAP (non-overlapping):
@@ -3429,7 +3446,7 @@ void drawFoxhuntScreen() {
     // Y=58-75:   Vendor (static, truncated)
     // Y=80-100:  "SIGNAL:" label (static)
     // Y=100-130: RSSI value (DYNAMIC — owned by loop() updater)
-    // Y=135-215: Spatial dashboard (static, WiFi only)
+    // Y=130-195: Spatial dashboard (DYNAMIC — owned by loop() updater)
     // Y=220-275: Alert banner (DYNAMIC — owned by loop() updater)
     // Y=285-320: Footer (static)
     // ==========================================
@@ -3468,69 +3485,7 @@ void drawFoxhuntScreen() {
     tft.drawString("SIGNAL", 240, 82);
     // Note: No RSSI value drawn here — loop() updater owns Y=88-128
 
-    // 5. SPATIAL DYNAMICS DASHBOARD (WiFi and AP modes)
-if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-    int target_idx = -1;
-    int t_min = 0, t_max = 0;
-    uint32_t target_packets = 0;
-
-    // Mode-specific lookup — only the source struct differs
-    if (currentRadioMode == RADIO_WIFI) {
-        for (int i = 0; i < sessionMacCount; i++) {
-            if (memcmp(sessionData[i].mac, foxhunt_target_mac, 6) == 0) {
-                target_idx = i; break;
-            }
-        }
-        if (target_idx != -1) {
-            t_min = sessionData[target_idx].rssi_min;
-            t_max = sessionData[target_idx].rssi_max;
-            target_packets = sessionData[target_idx].packets;
-        }
-    } else { // RADIO_AP
-        for (int i = 0; i < sessionApCount; i++) {
-            if (memcmp(sessionApData[i].bssid, foxhunt_target_mac, 6) == 0) {
-                target_idx = i; break;
-            }
-        }
-        if (target_idx != -1) {
-            t_min = sessionApData[target_idx].rssi_min;
-            t_max = sessionApData[target_idx].rssi_max;
-            target_packets = sessionApData[target_idx].packets;
-        }
-    }
-
-    // Shared drawing code — runs identically for both modes
-    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-
-    if (target_idx != -1 && target_packets > 6) {
-        int delta = t_max - t_min;
-
-        char boundStr[64];
-        snprintf(boundStr, sizeof(boundStr),
-                 "FLOOR: %d dBm  |  CEILING: %d dBm", t_min, t_max);
-        tft.setTextColor(TFT_GREEN);
-        tft.drawString(boundStr, 240, 140);
-
-        char deltaStr[32];
-        snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
-        tft.setTextColor(TFT_YELLOW);
-        tft.drawString(deltaStr, 240, 163);
-
-        char stateStr[32];
-        if (delta < 8) {
-            strcpy(stateStr, "STATE: STATIONARY TARGET");
-            tft.setTextColor(TFT_DARKGREY);
-        } else {
-            strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
-            tft.setTextColor(TFT_ORANGE);
-        }
-        tft.drawString(stateStr, 240, 186);
-
-    } else {
-        tft.setTextColor(TFT_DARKGREY);
-        tft.drawString("CALCULATING SPATIAL BOUNDS...", 240, 163);
-    }
-}
+    // (BLOCK 5 DELETED — The Spatial Dashboard is now handled dynamically in loop())
 
     // 6. FOOTER (static)
     tft.drawLine(0, 285, 480, 285, TFT_WHITE);
@@ -4248,7 +4203,7 @@ void loop() {
     if (millis() - last_radar_update > 300) {
         int current_display_val = (int)smoothed_rssi;
 
-        // RSSI VALUE — owns Y=88 to Y=128 exclusively
+        // 1. RSSI VALUE — owns Y=88 to Y=128 exclusively
         if (current_display_val != last_displayed_rssi) {
             tft.fillRect(0, 88, 480, 40, TFT_BLACK); // Clear full width
             tft.setTextDatum(MC_DATUM);
@@ -4266,7 +4221,48 @@ void loop() {
             last_displayed_rssi = current_display_val;
         }
 
-        // ALERT BANNER — owns Y=220 to Y=275 exclusively
+        // ==========================================
+        // 2. THE DYNAMIC BOUNDS UPDATER (Y=135 to 195)
+        // ==========================================
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+            // Using the global trackers so a screen wipe safely forces a redraw!
+            if (foxhunt_rssi_min != last_drawn_min || foxhunt_rssi_max != last_drawn_max) {
+                
+                tft.fillRect(0, 130, 480, 70, TFT_BLACK); // Clear bounds area
+                tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+                tft.setTextDatum(MC_DATUM);
+
+                int delta = foxhunt_rssi_max - foxhunt_rssi_min;
+
+                char boundStr[64];
+                snprintf(boundStr, sizeof(boundStr), 
+                         "FLOOR: %d dBm  |  CEILING: %d dBm", foxhunt_rssi_min, foxhunt_rssi_max);
+                tft.setTextColor(TFT_GREEN);
+                tft.drawString(boundStr, 240, 140);
+
+                char deltaStr[32];
+                snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
+                tft.setTextColor(TFT_YELLOW);
+                tft.drawString(deltaStr, 240, 163);
+
+                char stateStr[32];
+                if (delta < 8) {
+                    strcpy(stateStr, "STATE: STATIONARY TARGET");
+                    tft.setTextColor(TFT_DARKGREY);
+                } else {
+                    strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
+                    tft.setTextColor(TFT_ORANGE);
+                }
+                tft.drawString(stateStr, 240, 186);
+                tft.setTextDatum(TL_DATUM);
+
+                last_drawn_min = foxhunt_rssi_min;
+                last_drawn_max = foxhunt_rssi_max;
+            }
+        }
+        // ==========================================
+
+        // 3. ALERT BANNER — owns Y=220 to Y=275 exclusively
         if (target_behind_alert) {
             tft.fillRect(50, 220, 380, 50, TFT_RED);
             tft.drawRect(50, 220, 380, 50, TFT_WHITE);
@@ -4283,7 +4279,7 @@ void loop() {
             }
         }
 
-        // BASELINE DECAY
+        // 4. BASELINE DECAY
         static unsigned long last_decay_time = 0;
         if (millis() - last_decay_time > 2000) {
             if (baseline_rssi > -100) baseline_rssi--;
@@ -4413,14 +4409,6 @@ void loop() {
                 if (rawDistance > 0) {
                     sessionData[j].smoothedDistance = 
                         (0.2 * rawDistance) + (0.8 * sessionData[j].smoothedDistance);
-                }
-
-                // Bounds refresh — reads AFTER rssi_min/max updated above
-                if (is_foxhunting && 
-                    memcmp(sessionData[j].mac, foxhunt_target_mac, 6) == 0) {
-                    foxhunt_rssi_min = sessionData[j].rssi_min;
-                    foxhunt_rssi_max = sessionData[j].rssi_max;
-                    foxhunt_bounds_seeded = (sessionData[j].packets > 6);
                 }
 
                 found = true;
@@ -4715,14 +4703,6 @@ void loop() {
               
               if (strcmp(sessionApData[j].ssid, "<UNKNOWN>") == 0 && strcmp((char*)liveApData[i].ssid, "<UNKNOWN>") != 0) {
                 strcpy((char*)sessionApData[j].ssid, (char*)liveApData[i].ssid);
-              }
-
-              // AP foxhunt bounds refresh:
-              if (is_foxhunting && 
-                  memcmp(sessionApData[j].bssid, foxhunt_target_mac, 6) == 0) {
-                  foxhunt_rssi_min = sessionApData[j].rssi_min;
-                  foxhunt_rssi_max = sessionApData[j].rssi_max;
-                  foxhunt_bounds_seeded = (sessionApData[j].packets > 6);
               }
               
               found = true; break;
