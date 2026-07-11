@@ -62,8 +62,6 @@ int last_displayed_rssi = -999;  // Sentinel: forces redraw on first frame.
                                   // so updater redraws before first packet arrives.
 int last_drawn_min = 0;          // NEW: Sentinel for bounds redraw
 int last_drawn_max = 0;          // NEW: Sentinel for bounds redraw
-volatile bool target_behind_alert = false;
-volatile unsigned long alert_start_time = 0;
 
 // Cached spatial bounds — written from Core 1 only,
 // read from Core 0 ISR via updateFoxhuntSignal. Avoids sessionData
@@ -547,79 +545,31 @@ int crossReferenceProbeToBeacons(int probe_idx,
 
 void updateFoxhuntSignal(int packet_rssi) {
   // 1. Set dynamic tuning parameters
-  float current_alpha;
-  int drop_threshold = 12; // Safe fallback for all modes
+  float current_alpha = 0.2; // Default for WiFi/AP
 
-  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-    current_alpha = 0.2;
-
-    // BUG 1 FIX: Use cached globals instead of scanning sessionData.
-    // The sessionData loop was an O(MAX_MACS) scan running at packet
-    // rate inside the ISR callback path, creating both a data race
-    // against Core 1 and measurable ISR latency.
-    // foxhunt_bounds_seeded, foxhunt_rssi_min, foxhunt_rssi_max are
-    // populated when the target is selected and refreshed each render
-    // cycle in the WiFi session sync pipeline — never from ISR context.
-    if (foxhunt_bounds_seeded) {
-      int spatial_delta = foxhunt_rssi_max - foxhunt_rssi_min;
-
-      if      (spatial_delta > 20) drop_threshold = 16; // Mobile/volatile — suppress false alarms
-      else if (spatial_delta > 8)  drop_threshold = 10; // Normal room dynamics
-      else                         drop_threshold = 6;  // Stationary — hair-trigger sensitivity
-    }
-
-  } else {
-    // BLE: Fixed parameters — working correctly, no spatial data available
-    // in BLERecord yet. Revisit if rssi_min/rssi_max added to BLERecord.
+  if (currentRadioMode == RADIO_BLE) {
     current_alpha = 0.55;
-    drop_threshold = 7;
   }
 
-  // 2. Initialize or smooth the signal
-  // BUG 3 FIX: Safe float equality against a sentinel we control at
-  // exactly two write sites (global init and touch handler reset).
-  // Both sites write exactly -100.0f so == comparison is reliable here.
-  // A range check of <= -99.0 would incorrectly re-initialize on a
-  // legitimate weak-signal packet at -99 or -100 dBm, discarding
-  // accumulated EMA history at the worst possible moment.
+  // 2. Initialize or smooth the signal safely
   if (smoothed_rssi == -100.0f) {
     smoothed_rssi = (float)packet_rssi;
-    baseline_rssi = packet_rssi; // Seed baseline on first packet to
-                                  // prevent immediate false body-block alert
   } else {
     smoothed_rssi = (current_alpha * (float)packet_rssi) +
                     ((1.0f - current_alpha) * smoothed_rssi);
   }
 
-  // 3. Track local baseline (highest recent smoothed signal)
-  if ((int)smoothed_rssi > baseline_rssi) {
-    baseline_rssi = (int)smoothed_rssi;
-  }
-
-  // 4. Body-block trigger
-  // Fires when signal drops significantly below the strongest
-  // recent reading, suggesting the target has moved behind the operator.
-  if ((baseline_rssi - (int)smoothed_rssi) >= drop_threshold) {
-    if (!target_behind_alert) {
-      target_behind_alert = true;
-      alert_start_time = millis();
-    }
-  }
-
-  // ==========================================
-  // 5. REAL-TIME TACTICAL STRETCHING (Option B)
-  // ==========================================
-  // Stretch the UI boundaries instantly on the ISR core.
+  // 3. REAL-TIME TACTICAL STRETCHING (Option B)
   if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
       if (foxhunt_rssi_min == 0 || packet_rssi < foxhunt_rssi_min) {
           foxhunt_rssi_min = packet_rssi;
       }
       if (foxhunt_rssi_max == -100 || packet_rssi > foxhunt_rssi_max) {
           foxhunt_rssi_max = packet_rssi;
-          foxhunt_bounds_seeded = true; // Instantly activates the adaptive threshold
+          foxhunt_bounds_seeded = true;
       }
   }
-} // <-- End of updateFoxhuntSignal function
+}
 
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
 void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -1461,18 +1411,29 @@ void drawMenu() {
 
   bool foxhunt_available = false;
 
-  if (currentRadioMode == RADIO_WIFI)
-      foxhunt_available = (target_locked && sessionMacCount > 0);
-
-  else if (currentRadioMode == RADIO_BLE)
-      foxhunt_available = (sessionBleCount > 0);
-
-  else if (currentRadioMode == RADIO_AP)
-      foxhunt_available = (sessionApCount > 0);
+  // 1. BLE MODE EVALUATION
+  if (currentRadioMode == RADIO_BLE) {
+    if (sessionBleCount > 0) {
+        foxhunt_available = true;
+    }
+  } 
+  // 2. NETWORKS (AP) MODE EVALUATION
+  else if (currentRadioMode == RADIO_AP) {
+      if (sessionApCount > 0) {
+          foxhunt_available = true;
+      }
+  } 
+  // 3. WI-FI MODE EVALUATION (Isolated at the bottom)
+  else if (currentRadioMode == RADIO_WIFI) {
+      if (target_locked == true && sessionMacCount > 0) {
+          foxhunt_available = true;
+      }
+  }
 
   if (foxhunt_available) {
       // Draw active red button
-      tft.drawRoundRect(50, 90, 200, 40, 3, TFT_RED); 
+      tft.fillRoundRect(50, 90, 200, 40, 3, TFT_RED);   // Fill it red
+      tft.drawRoundRect(50, 90, 200, 40, 3, TFT_WHITE); // Add the crisp border
       tft.setTextColor(TFT_WHITE);
       tft.drawString("FOXHUNT", 150, 110);
   } else {
@@ -3478,14 +3439,15 @@ void drawFoxhuntScreen() {
     char safeVendor[21];
     strncpy(safeVendor, foxhunt_target_vendor, 20);
     safeVendor[20] = '\0';
-    tft.drawString(safeVendor, 240, 60);
+    tft.drawString(safeVendor, 240, 58); // Nudged up slightly for perfect spacing
 
-    // 4. SIGNAL LABEL (static — value drawn by updater)
-    tft.setTextColor(hex24to565(0x444444)); // Dark grey — placeholder feel
-    tft.drawString("SIGNAL", 240, 82);
-    // Note: No RSSI value drawn here — loop() updater owns Y=88-128
-
-    // (BLOCK 5 DELETED — The Spatial Dashboard is now handled dynamically in loop())
+    // 4. TARGET CHANNEL (Replaces the phantom "SIGNAL" label)
+    if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+        tft.setTextColor(TFT_ORANGE); 
+        char chStr[16];
+        snprintf(chStr, sizeof(chStr), "CH: %02d", target_channel);
+        tft.drawString(chStr, 240, 76);
+    }
 
     // 6. FOOTER (static)
     tft.drawLine(0, 285, 480, 285, TFT_WHITE);
@@ -3762,7 +3724,7 @@ void loop() {
       // Probe Request Tracker Button
       else if (t_x > 300 && t_x < 450 && t_y > 140 && t_y < 180) {
         currentState = SCREEN_PROBE_TRACKER;
-        probe_current_page = 0; 
+        probe_current_page = 0;
         drawProbeTracker();
         delay(300); 
       }
@@ -4077,7 +4039,7 @@ void loop() {
       // B. FOOTER NAVIGATION (Y >= 294)
       // ==========================================
       else if (t_y >= 294) { 
-        int items_per_page = 7; 
+        int items_per_page = 7;
         int total_devices = 0;
         
         if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
@@ -4126,14 +4088,27 @@ void loop() {
             is_selecting_target = false;
             is_foxhunting = true;
             smoothed_rssi = -100.0f;
-            baseline_rssi = -100;
             last_displayed_rssi = -999;      // Force frame 1 redraw
-            target_behind_alert = false;
 
             if (currentRadioMode == RADIO_WIFI) {
               memcpy(foxhunt_target_mac, sessionData[tapped_array_index].mac, 6);
-              strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, 25);
+              
+              // ==========================================
+              // Smart Vendor Fallback
+              // ==========================================
+              if (sessionData[tapped_array_index].vendorFound) {
+                  // Valid OUI match
+                  strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, 25);
+              } else {
+                  // Bitwise check for Locally Administered (Randomized) MAC addresses
+                  if ((foxhunt_target_mac[0] & 0x02) == 0x02) {
+                      strncpy(foxhunt_target_vendor, "<Randomized>", 25);
+                  } else {
+                      strncpy(foxhunt_target_vendor, "Unknown Device", 25);
+                  }
+              }
               foxhunt_target_vendor[25] = '\0'; // Safe null termination
+              // ==========================================
               
               foxhunt_rssi_min = sessionData[tapped_array_index].rssi_min;
               foxhunt_rssi_max = sessionData[tapped_array_index].rssi_max;
@@ -4191,6 +4166,7 @@ void loop() {
           }
         }
       }
+
     }
   } // <-- End of main if (pressed)
 
@@ -4203,11 +4179,14 @@ void loop() {
     if (millis() - last_radar_update > 300) {
         int current_display_val = (int)smoothed_rssi;
 
-        // 1. RSSI VALUE — owns Y=88 to Y=128 exclusively
+        // 1. RSSI VALUE — Massive Font (owns Y=88 to Y=132)
         if (current_display_val != last_displayed_rssi) {
-            tft.fillRect(0, 88, 480, 40, TFT_BLACK); // Clear full width
+            tft.fillRect(0, 88, 480, 44, TFT_BLACK); // Expanded clear box for giant text
             tft.setTextDatum(MC_DATUM);
             tft.setFreeFont(&UbuntuMono_B9pt7b);
+            
+            // THE MULTIPLIER: Scales 9pt to ~27pt
+            tft.setTextSize(3); 
 
             // Color-code by signal strength
             if      (current_display_val > -60) tft.setTextColor(TFT_GREEN);
@@ -4217,18 +4196,20 @@ void loop() {
             char rssiStr[32];
             snprintf(rssiStr, sizeof(rssiStr), "%d dBm", current_display_val);
             tft.drawString(rssiStr, 240, 110);
+            
+            // THE RESET: Crucial to prevent UI corruption!
+            tft.setTextSize(1); 
             tft.setTextDatum(TL_DATUM);
             last_displayed_rssi = current_display_val;
         }
 
         // ==========================================
-        // 2. THE DYNAMIC BOUNDS UPDATER (Y=135 to 195)
+        // 2. THE DYNAMIC BOUNDS UPDATER (Gutted)
         // ==========================================
         if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-            // Using the global trackers so a screen wipe safely forces a redraw!
             if (foxhunt_rssi_min != last_drawn_min || foxhunt_rssi_max != last_drawn_max) {
                 
-                tft.fillRect(0, 130, 480, 70, TFT_BLACK); // Clear bounds area
+                tft.fillRect(0, 135, 480, 60, TFT_BLACK); // Clean wipe
                 tft.setFreeFont(&UbuntuMono_Regular9pt7b);
                 tft.setTextDatum(MC_DATUM);
 
@@ -4238,22 +4219,13 @@ void loop() {
                 snprintf(boundStr, sizeof(boundStr), 
                          "FLOOR: %d dBm  |  CEILING: %d dBm", foxhunt_rssi_min, foxhunt_rssi_max);
                 tft.setTextColor(TFT_GREEN);
-                tft.drawString(boundStr, 240, 140);
+                tft.drawString(boundStr, 240, 150); // Shifted down for balance
 
                 char deltaStr[32];
                 snprintf(deltaStr, sizeof(deltaStr), "SPATIAL DELTA: %d dB", delta);
                 tft.setTextColor(TFT_YELLOW);
-                tft.drawString(deltaStr, 240, 163);
+                tft.drawString(deltaStr, 240, 175); // Shifted down for balance
 
-                char stateStr[32];
-                if (delta < 8) {
-                    strcpy(stateStr, "STATE: STATIONARY TARGET");
-                    tft.setTextColor(TFT_DARKGREY);
-                } else {
-                    strcpy(stateStr, "STATE: MOBILE / HIGH VARIANCE");
-                    tft.setTextColor(TFT_ORANGE);
-                }
-                tft.drawString(stateStr, 240, 186);
                 tft.setTextDatum(TL_DATUM);
 
                 last_drawn_min = foxhunt_rssi_min;
@@ -4261,30 +4233,6 @@ void loop() {
             }
         }
         // ==========================================
-
-        // 3. ALERT BANNER — owns Y=220 to Y=275 exclusively
-        if (target_behind_alert) {
-            tft.fillRect(50, 220, 380, 50, TFT_RED);
-            tft.drawRect(50, 220, 380, 50, TFT_WHITE);
-            tft.setTextColor(TFT_WHITE);
-            tft.setFreeFont(&UbuntuMono_B9pt7b);
-            tft.setTextDatum(MC_DATUM);
-            tft.drawString("! TARGET BEHIND YOU !", 240, 245);
-            tft.setTextDatum(TL_DATUM);
-
-            if (millis() - alert_start_time > 3000) {
-                target_behind_alert = false;
-                baseline_rssi = current_display_val;
-                tft.fillRect(50, 220, 380, 50, TFT_BLACK); // Clear on dismiss
-            }
-        }
-
-        // 4. BASELINE DECAY
-        static unsigned long last_decay_time = 0;
-        if (millis() - last_decay_time > 2000) {
-            if (baseline_rssi > -100) baseline_rssi--;
-            last_decay_time = millis();
-        }
 
         last_radar_update = millis();
     }
@@ -4313,19 +4261,22 @@ void loop() {
 
           esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
 
-          // Only black out the "CH: XX" part of the banner (80 pixels)
-          tft.fillRect(5, 4, 80, 15, TFT_BLACK);
-          tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-          tft.setTextDatum(TL_DATUM);
-          
-          // Match the colors we set in drawChartHeader!
-          if (currentRadioMode == RADIO_AP) tft.setTextColor(TFT_GREEN);
-          else if (currentRadioMode == RADIO_CHANNELS) tft.setTextColor(TFT_ORANGE);
-          else tft.setTextColor(TFT_WHITE);
+          // THE FIX: Only draw the channel indicator if we are on the main chart!
+          if (currentState == SCREEN_CHART) {
+              // Only black out the "CH: XX" part of the banner (80 pixels)
+              tft.fillRect(5, 4, 80, 15, TFT_BLACK);
+              tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+              tft.setTextDatum(TL_DATUM);
+              
+              // Match the colors we set in drawChartHeader!
+              if (currentRadioMode == RADIO_AP) tft.setTextColor(TFT_GREEN);
+              else if (currentRadioMode == RADIO_CHANNELS) tft.setTextColor(TFT_ORANGE);
+              else tft.setTextColor(TFT_WHITE);
 
-          char chStr[16];
-          sprintf(chStr, "CH: %02d", CHANNELS[current_ch_idx]);
-          tft.drawString(chStr, 5, 4);
+              char chStr[16];
+              sprintf(chStr, "CH: %02d", CHANNELS[current_ch_idx]);
+              tft.drawString(chStr, 5, 4);
+          }
         }
       }
       else {
@@ -4342,11 +4293,14 @@ void loop() {
         lastTimer = millis();
         should_render = true; 
         
-        tft.fillRect(5, 4, 200, 15, TFT_BLACK); 
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextColor(TFT_ORANGE);
-        tft.drawString("SNIFFING BLE DEVICES", 5, 4);
+        // THE FIX: Only draw the BLE sniffing indicator if we are on the main chart!
+        if (currentState == SCREEN_CHART) {
+            tft.fillRect(5, 4, 200, 15, TFT_BLACK); 
+            tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+            tft.setTextDatum(TL_DATUM);
+            tft.setTextColor(TFT_ORANGE);
+            tft.drawString("SNIFFING BLE DEVICES", 5, 4);
+        }
       }
     }
 
