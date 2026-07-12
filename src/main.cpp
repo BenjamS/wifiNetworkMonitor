@@ -47,6 +47,12 @@ int target_rssi = 0;
 SdFs sd;
 
 // ==========================================
+// ABSOLUTE WATERFALL GLOBALS
+// ==========================================
+uint32_t traffic_history[240] = {0}; // 480 width / 2px increments = 240 columns
+uint32_t absolute_max_traffic = 10;  // Seeded to prevent divide-by-zero
+
+// ==========================================
 // FOXHUNT STATE GLOBALS
 // ==========================================
 bool is_selecting_target = false; 
@@ -233,7 +239,7 @@ int current_ch_idx = 0;
 
 const int HOP_INTERVAL = 300;                // Time spent on each channel (ms)
 const int LOCKED_UPDATE_INTERVAL = 2000;      // Refresh rate when locked to an AP (ms)
-const int MAX_MACS = 200;
+const int MAX_MACS = 185;
 
 // --- TARGET AP LOCK GLOBALS ---
 uint8_t target_bssid[6] = {0};
@@ -254,10 +260,8 @@ struct MacRecord {
     uint32_t tx_bytes;
     uint32_t rx_bytes;
     float smoothedDistance;
-    // uint16_t last_sequence;  <-- REMOVED
     uint8_t mac[6];
-    char vendor[27];
-    uint8_t channel;
+    char vendor[28];
     int8_t rssi;
     int8_t rssi_min;    // <--- NEW: spatial floor
     int8_t rssi_max;    // <--- NEW: spatial ceiling
@@ -269,7 +273,7 @@ struct MacRecord {
 
 struct OUICache {
   uint8_t oui[3];
-  char vendor[27]; // <--- Updated to match the new MacRecord limit
+  char vendor[28]; // <--- Updated to match the new MacRecord limit
 };
 
 #define MAX_BEACON_DICT 80 // MAX POSSIBLE IS 255 given uint8_t beaconDictCount
@@ -1151,7 +1155,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     
     // --- NEW: INJECT FOXHUNT CHANNEL AND CHASE TAIL SEQUENCE ---
     // (Logs the hopper's current channel at the moment of discovery)
-    liveData[liveMacCount].channel = CHANNELS[current_ch_idx];     
+    //liveData[liveMacCount].channel = CHANNELS[current_ch_idx];     
     // -----------------------------------------------------------
 
     // Route the first packet to TX or RX
@@ -1212,9 +1216,9 @@ void resolveMacVendor(MacRecord* record) {
         vendorCache[i].oui[1] == record->mac[1] &&
         vendorCache[i].oui[2] == record->mac[2]) {
       
-      // Updated to 21 chars max, null terminated at [21]
-      strncpy(record->vendor, vendorCache[i].vendor, 26);
-      record->vendor[26] = '\0'; 
+      // Dynamically fills the array and leaves 1 byte for the null terminator
+      strncpy(record->vendor, vendorCache[i].vendor, sizeof(record->vendor) - 1);
+      record->vendor[sizeof(record->vendor) - 1] = '\0'; 
       record->vendorFound = true;
       return; 
     }
@@ -1247,18 +1251,26 @@ void resolveMacVendor(MacRecord* record) {
       if (cmp == 0) {
         // MATCH FOUND: Find where the actual text starts by skipping leading spaces/tabs
         int text_start = 7;
-        while(line[text_start] == ' ' || line[text_start] == '\t') {
+        while(text_start < 32 && (line[text_start] == ' ' || line[text_start] == '\t')) {
           text_start++;
         }
         
-        // Safely extract from the true start of the word (Updated to 21)
-        strncpy(record->vendor, &line[text_start], 26); 
-        record->vendor[26] = '\0';
+        // Calculate safe length: remaining chars in 'line' OR max capacity of 'vendor', whichever is smaller
+        int available_chars = 32 - text_start;
+        int max_capacity = sizeof(record->vendor) - 1;
+        int copy_len = (available_chars < max_capacity) ? available_chars : max_capacity;
         
-        // Strip trailing spaces working backward (Updated to start at 20)
-        for(int i = 25; i >= 0; i--) {         
-          if(record->vendor[i] == ' ') record->vendor[i] = '\0';
-          else break;
+        // Safely extract the text
+        strncpy(record->vendor, &line[text_start], copy_len); 
+        record->vendor[copy_len] = '\0';
+        
+        // Strip trailing spaces and hidden line-endings working backward
+        for(int i = copy_len - 1; i >= 0; i--) {         
+          if(record->vendor[i] == ' ' || record->vendor[i] == '\r' || record->vendor[i] == '\n') {
+              record->vendor[i] = '\0';
+          } else {
+              break;
+          }
         }
         break; 
       }
@@ -3749,6 +3761,8 @@ void loop() {
       else if (t_x > 300 && t_x < 450 && t_y > 190 && t_y < 230) {
         
         target_locked = false; // Always break target locks on mode change
+        memset(traffic_history, 0, sizeof(traffic_history)); // Clear the absolute chart memory
+        absolute_max_traffic = 10;                           // Reset the absolute scaling ceiling
 
         // 1. Determine the next mode BEFORE we switch hardware
         RadioMode nextMode;
@@ -3782,6 +3796,38 @@ void loop() {
           tft.setTextColor(TFT_WHITE);
           tft.drawString("MODE: CHANNELS", 375, 210);
         }
+
+        // ==========================================
+        // PARTIAL REDRAW FOR FOXHUNT BUTTON
+        // ==========================================
+        bool foxhunt_available = false;
+        
+        if (nextMode == RADIO_BLE) {
+            if (sessionBleCount > 0) foxhunt_available = true;
+        } else if (nextMode == RADIO_AP) {
+            if (sessionApCount > 0) foxhunt_available = true;
+        } else if (nextMode == RADIO_WIFI) {
+            if (target_locked == true && sessionMacCount > 0) foxhunt_available = true;
+        }
+
+        if (foxhunt_available) {
+            // Draw active red button
+            tft.fillRoundRect(50, 90, 200, 40, 3, TFT_RED); 
+            tft.drawRoundRect(50, 90, 200, 40, 3, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE);
+            tft.drawString("FOXHUNT", 150, 110);
+        } else {
+            // Overwrite with grey dead space
+            uint16_t deadGrey = hex24to565(0x222222);
+            tft.fillRect(50, 90, 200, 50, deadGrey); // Height expanded to 50 to erase old hint text
+            tft.drawRect(50, 90, 200, 40, TFT_DARKGREY);
+            tft.setTextColor(TFT_DARKGREY);
+            tft.drawString("FOXHUNT", 150, 110);
+            
+            tft.setTextColor(hex24to565(0x444444));
+            tft.drawString("(no targets yet)", 150, 125);
+        }
+        // ==========================================
         
         tft.setTextDatum(TL_DATUM); // Reset datum for the rest of your UI
 
@@ -4342,7 +4388,6 @@ void loop() {
                     sessionData[j].rate = liveData[i].rate;
                 }
                 sessionData[j].last_seen = liveData[i].last_seen;
-                sessionData[j].channel = liveData[i].channel;
                 
                 // THE FIX: The Empty Window Gate
                 // Only stretch the session bounds if the liveData window actually
@@ -5054,9 +5099,26 @@ void loop() {
 
       // --- WATERFALL CHART PLOTTING MATH ---
       
+      // 1. Establish the Dual-Pane boundaries
+      int chart_area_height = CHART_BOTTOM - HEADER_HEIGHT;
+      int split_y = HEADER_HEIGHT + (chart_area_height * 3) / 4; // The 75% line
+
+      // 2. Wipe the leading edge for the entire vertical column
       tft.fillRect(current_x + 2, HEADER_HEIGHT + 1, 4, CHART_BOTTOM - HEADER_HEIGHT, TFT_BLACK);
 
-      int current_y = CHART_BOTTOM;
+      // 3. Draw the X-Axis Time Ticks & Separator Line
+      if (current_x % 60 == 0) {
+          // Draw a tick mark every 60 pixels
+          tft.drawLine(current_x, split_y - 3, current_x, split_y + 3, TFT_WHITE);
+          tft.drawLine(current_x + 1, split_y - 3, current_x + 1, split_y + 3, TFT_WHITE);
+      } else {
+          // Standard subtle separator line
+          tft.drawPixel(current_x, split_y, TFT_DARKGREY);
+          tft.drawPixel(current_x + 1, split_y, TFT_DARKGREY);
+      }
+
+      int current_y = split_y - 1; // Top chart builds UP from the split line
+      uint32_t current_total_metric = 0; // Universal tracker for the bottom pane
 
       if (currentRadioMode == RADIO_WIFI) {
         // ==========================================
@@ -5066,10 +5128,11 @@ void loop() {
         for(int i = 0; i < 8 && i < sortMacCount; i++) {
           total_bytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
         }
+        
+        current_total_metric = total_bytes; 
 
         if (total_bytes > 0) {
           double log_total = 0;
-
           if (useLogScale) {
             for(int j = 0; j < 8 && j < sortMacCount; j++) {
               uint32_t device_total = sortData[j].tx_bytes + sortData[j].rx_bytes;
@@ -5082,26 +5145,21 @@ void loop() {
             double fraction;
             uint32_t current_device_bytes = sortData[i].tx_bytes + sortData[i].rx_bytes;
 
-            if (useLogScale) {
-              fraction = log10((double)current_device_bytes + 1.0) / log_total;
-            } else {
-              fraction = (double)current_device_bytes / (double)total_bytes;
-            }
+            if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
+            else fraction = (double)current_device_bytes / (double)total_bytes;
 
-            int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
-            if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+            int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
+            if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
 
             tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-
             current_y -= bar_height;
           }
 
           if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
             tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-          }
-          else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortMacCount > 0) {
+          } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortMacCount > 0) {
             tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
           }
@@ -5112,62 +5170,42 @@ void loop() {
         // BLE PLOTTING (Hits / Traffic volume)
         // ==========================================
         uint32_t total_hits = 0;
-        uint32_t other_hits = 0; // NEW: Track hits outside the top 8
+        uint32_t other_hits = 0;
         int ble_count = (sortBleCount > 8) ? 8 : sortBleCount;
 
-        // 1. Sum hits for the top 8 devices
-        for(int i = 0; i < ble_count; i++) {
-          total_hits += sortBleData[i].hits;
+        for(int i = 0; i < ble_count; i++) total_hits += sortBleData[i].hits;
+
+        if (sortBleCount > 8) {
+          for (int i = 8; i < sortBleCount; i++) other_hits += sortBleData[i].hits;
+          total_hits += other_hits; 
         }
 
-        // 2. Sum hits for the "Other" category (devices 9+)
-        if (sortBleCount > 8) {
-          for (int i = 8; i < sortBleCount; i++) {
-            other_hits += sortBleData[i].hits;
-          }
-          total_hits += other_hits; // Add to grand total for accurate fractions
-        }
+        current_total_metric = total_hits; 
 
         if (total_hits > 0) {
           double log_total = 0;
-
-          // 3. Log Scale Calculations (including 'Other')
           if (useLogScale) {
-            for(int j = 0; j < ble_count; j++) {
-              log_total += log10((double)sortBleData[j].hits + 1.0);
-            }
-            if (other_hits > 0) {
-              log_total += log10((double)other_hits + 1.0);
-            }
+            for(int j = 0; j < ble_count; j++) log_total += log10((double)sortBleData[j].hits + 1.0);
+            if (other_hits > 0) log_total += log10((double)other_hits + 1.0);
           }
 
-          // 4. Draw the Top 8 bars
           for(int i = 0; i < ble_count; i++) {
             double fraction;
+            if (useLogScale) fraction = log10((double)sortBleData[i].hits + 1.0) / log_total;
+            else fraction = (double)sortBleData[i].hits / (double)total_hits;
             
-            // Respect the UI Log/Linear Toggle for BLE
-            if (useLogScale) {
-              fraction = log10((double)sortBleData[i].hits + 1.0) / log_total;
-            } else {
-              fraction = (double)sortBleData[i].hits / (double)total_hits;
-            }
-            
-            int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
-            if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+            int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
+            if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
 
             tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-
             current_y -= bar_height;
           }
           
-          // 5. Draw the Grey "Other" Category at the very top
           if (other_hits > 0 && current_y > HEADER_HEIGHT) {
             tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-          }
-          // 6. Fill any remaining pixel gap at the top due to integer rounding (if no 'Other')
-          else if (other_hits == 0 && current_y > HEADER_HEIGHT && ble_count > 0) {
+          } else if (other_hits == 0 && current_y > HEADER_HEIGHT && ble_count > 0) {
             tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[ble_count - 1]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[ble_count - 1]);
           }
@@ -5175,17 +5213,15 @@ void loop() {
       }
       else if (currentRadioMode == RADIO_AP) {
           // ==========================================
-          // AP PLOTTING (Traffic Bytes & Log Scale)
+          // AP PLOTTING (Traffic Bytes)
           // ==========================================
           uint32_t total_bytes = sortOtherBytes;
-          for(int i = 0; i < 8 && i < sortApCount; i++) {
-            total_bytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
-          }
+          for(int i = 0; i < 8 && i < sortApCount; i++) total_bytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
+
+          current_total_metric = total_bytes; 
 
           if (total_bytes > 0) {
             double log_total = 0;
-
-            // Log Scale Calculations
             if (useLogScale) {
               for(int j = 0; j < 8 && j < sortApCount; j++) {
                 uint32_t device_total = sortApData[j].tx_bytes + sortApData[j].rx_bytes;
@@ -5194,46 +5230,38 @@ void loop() {
               log_total += log10((double)sortOtherBytes + 1.0);
             }
 
-            // Draw the Top 8 bars
             for(int i = 0; i < 8 && i < sortApCount; i++) {
               double fraction;
               uint32_t current_device_bytes = sortApData[i].tx_bytes + sortApData[i].rx_bytes;
               
-              if (useLogScale) {
-                fraction = log10((double)current_device_bytes + 1.0) / log_total;
-              } else {
-                fraction = (double)current_device_bytes / (double)total_bytes;
-              }
+              if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
+              else fraction = (double)current_device_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
-              if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+              int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
+              if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
 
               tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-
               current_y -= bar_height;
             }
 
-            // Draw the Grey "Other" Category at the top
             if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
               tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-            }
-            // Fill any remaining pixel gap
-            else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortApCount > 0) {
+            } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortApCount > 0) {
               tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortApCount - 1]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortApCount - 1]);
             }
           }
-        }
-        else if (currentRadioMode == RADIO_CHANNELS) {
+      }
+      else if (currentRadioMode == RADIO_CHANNELS) {
           // ==========================================
-          // CHANNEL PLOTTING (Log/Lin Scale)
+          // CHANNEL PLOTTING
           // ==========================================
           uint32_t total_bytes = sortOtherBytes;
-          for(int i = 0; i < 8 && i < sortChannelCount; i++) {
-            total_bytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
-          }
+          for(int i = 0; i < 8 && i < sortChannelCount; i++) total_bytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+
+          current_total_metric = total_bytes; 
 
           if (total_bytes > 0) {
             double log_total = 0;
@@ -5252,8 +5280,8 @@ void loop() {
               if (useLogScale) fraction = log10((double)current_c_bytes + 1.0) / log_total;
               else fraction = (double)current_c_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (CHART_BOTTOM - HEADER_HEIGHT));
-              if (bar_height > (CHART_BOTTOM - HEADER_HEIGHT)) bar_height = CHART_BOTTOM - HEADER_HEIGHT;
+              int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
+              if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
 
               tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
@@ -5270,6 +5298,77 @@ void loop() {
           }
       }
 
+      // ==========================================
+      // BOTTOM PANE: ABSOLUTE VOLUME GRAPH
+      // ==========================================
+      bool did_rescale = false; // Trigger for the overlay engine
+      int h_index = current_x / 2;
+      traffic_history[h_index] = current_total_metric;
+
+      if (current_total_metric > absolute_max_traffic) {
+          // --- LAZY RESCALE EVENT ---
+          absolute_max_traffic = current_total_metric + (current_total_metric / 5); 
+          did_rescale = true; 
+          
+          tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
+          
+          for (int c = 0; c < 240; c++) {
+              if (traffic_history[c] > 0) {
+                  int px = c * 2;
+                  int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+                  tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, TFT_GREEN);
+                  tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, TFT_GREEN);
+              }
+          }
+      } else {
+          // --- NORMAL OPERATION ---
+          if (current_total_metric > 0) {
+              int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+              tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, TFT_GREEN);
+              tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, TFT_GREEN);
+          }
+      }
+
+      // ==========================================
+      // PUNCH-OUT Y-AXIS OVERLAY LABELS
+      // ==========================================
+      // Only execute if the sweeping line is currently overwriting the labels,
+      // or if the bottom chart just wiped itself during a rescale.
+      if (current_x <= 44 || did_rescale) {
+          tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+          tft.setTextDatum(TL_DATUM);
+
+          // Top Pane: 100%
+          tft.fillRect(2, HEADER_HEIGHT + 4, 32, 13, TFT_BLACK);
+          tft.setTextColor(TFT_WHITE);
+          tft.drawString("100%", 2, HEADER_HEIGHT + 4);
+
+          // Top Pane: 50%
+          int mid_y = HEADER_HEIGHT + ((split_y - HEADER_HEIGHT) / 2);
+          tft.fillRect(2, mid_y - 6, 25, 13, TFT_BLACK);
+          tft.drawString("50%", 2, mid_y - 6);
+
+          // X-Axis Time Legend
+          tft.fillRect(2, split_y - 15, 42, 13, TFT_BLACK);
+          tft.setTextColor(TFT_DARKGREY);
+          if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("| = 1m", 2, split_y - 15); 
+          else tft.drawString("| = 2m", 2, split_y - 15);
+
+          // Bottom Pane: Max Volume
+          char maxStr[10];
+          if (currentRadioMode == RADIO_BLE) snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
+          else formatShortUnit(absolute_max_traffic, maxStr, sizeof(maxStr));
+          
+          tft.fillRect(2, split_y + 4, 32, 13, TFT_BLACK);
+          tft.setTextColor(TFT_GREEN);
+          tft.drawString(maxStr, 2, split_y + 4);
+
+          // Bottom Pane: 0
+          tft.fillRect(2, CHART_BOTTOM - 15, 12, 13, TFT_BLACK);
+          tft.drawString("0", 2, CHART_BOTTOM - 15);
+      }
+
+      // Move the leading edge forward
       current_x += 2;
       if (current_x >= 478) current_x = 0;
     }
