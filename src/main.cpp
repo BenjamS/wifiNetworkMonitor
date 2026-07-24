@@ -5394,19 +5394,35 @@ if (millis() - last_anim_tick > current_delay) {
       // ==========================================
       // BOTTOM PANE: ABSOLUTE VOLUME GRAPH & SCALING
       // ==========================================
-      // Local statics to track the epoch without polluting your globals
+      // Local statics to track context switches without polluting globals
       static uint32_t current_sweep_peak = 0;
       static RadioMode last_seen_mode = currentRadioMode;
+      static uint8_t last_seen_bssid[6] = {0}; // Tracks the last targeted MAC array
       
-      // Safety reset: Wipe the epoch peak if you changed radio modes mid-sweep
-      if (currentRadioMode != last_seen_mode) {
+      bool did_rescale = false; 
+
+      // Safety reset: Wipe the epoch peak, scale, and history if context changed.
+      // memcmp returns non-zero if the two arrays are different.
+      if (currentRadioMode != last_seen_mode || memcmp(target_bssid, last_seen_bssid, 6) != 0) {
+          
           current_sweep_peak = 0;
+          absolute_max_traffic = 10; // Reset ceiling to the floor limit
+          
           last_seen_mode = currentRadioMode;
+          memcpy(last_seen_bssid, target_bssid, 6); // Update the BSSID tracker
+
+          // Wipe the history array so old AP/Mode data doesn't bleed into the next sweep
+          memset(traffic_history, 0, sizeof(traffic_history));
+          
+          // Physically clear the bottom pane instantly
+          tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
+          
+          // Force the Y-axis labels to redraw immediately with the new flattened scale
+          did_rescale = true; 
       }
 
-      bool did_rescale = false; 
       int h_index = current_x / 2;
-      traffic_history[h_index] = current_total_metric;
+      traffic_history[h_index] = current_total_metric; 
 
       // 1. Track the highest traffic peak for the current sweep
       if (current_total_metric > current_sweep_peak) {

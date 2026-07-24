@@ -9,7 +9,7 @@
 
 // Fixed Anchor Points
 #define HOUND_CENTER_X 240
-#define HOUND_BASELINE_Y 288
+#define HOUND_BASELINE_Y 285
 
 // 'hound1_96', 96x96px
 const unsigned char hound1_96 [] PROGMEM = {
