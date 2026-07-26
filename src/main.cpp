@@ -5394,46 +5394,79 @@ if (millis() - last_anim_tick > current_delay) {
       // ==========================================
       // BOTTOM PANE: ABSOLUTE VOLUME GRAPH & SCALING
       // ==========================================
-      // Local statics to track context switches without polluting globals
-      static uint32_t current_sweep_peak = 0;
+      // Local statics to track context switches and sliding window
       static RadioMode last_seen_mode = currentRadioMode;
-      static uint8_t last_seen_bssid[6] = {0}; // Tracks the last targeted MAC array
+      static uint8_t last_seen_bssid[6] = {0}; 
+      
+      // Sliding window tracking
+      static uint32_t true_max = 10;
+      static uint16_t peak_h_index = 0;
       
       bool did_rescale = false; 
 
-      // Safety reset: Wipe the epoch peak, scale, and history if context changed.
-      // memcmp returns non-zero if the two arrays are different.
+      // Safety reset: Wipe the sliding window, scale, and history if context changed
       if (currentRadioMode != last_seen_mode || memcmp(target_bssid, last_seen_bssid, 6) != 0) {
-          
-          current_sweep_peak = 0;
-          absolute_max_traffic = 10; // Reset ceiling to the floor limit
+          true_max = 10;
+          peak_h_index = 0;
+          absolute_max_traffic = 10; 
           
           last_seen_mode = currentRadioMode;
-          memcpy(last_seen_bssid, target_bssid, 6); // Update the BSSID tracker
+          memcpy(last_seen_bssid, target_bssid, 6); 
 
-          // Wipe the history array so old AP/Mode data doesn't bleed into the next sweep
           memset(traffic_history, 0, sizeof(traffic_history));
-          
-          // Physically clear the bottom pane instantly
-          tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
-          
-          // Force the Y-axis labels to redraw immediately with the new flattened scale
           did_rescale = true; 
       }
 
       int h_index = current_x / 2;
       traffic_history[h_index] = current_total_metric; 
 
-      // 1. Track the highest traffic peak for the current sweep
-      if (current_total_metric > current_sweep_peak) {
-          current_sweep_peak = current_total_metric;
-      }
-
-      // 2. INSTANT UP-SCALE (The Lazy Rescale)
+      // ==========================================
+      // SLIDING WINDOW SCALING ENGINE
+      // ==========================================
       if (current_total_metric > absolute_max_traffic) {
+          // 1. INSTANT UP-SCALE (Ceiling broken)
+          true_max = current_total_metric;
+          peak_h_index = h_index;
+          
           absolute_max_traffic = current_total_metric + (current_total_metric / 5); 
           did_rescale = true; 
           
+      } else {
+          // Track if this is the highest value currently visible on screen
+          if (current_total_metric > true_max) {
+              true_max = current_total_metric;
+              peak_h_index = h_index;
+          }
+          
+          // 2. SLIDING DOWNSCALE (Old peak was overwritten)
+          // If the sweeping cursor just overwrote the old champion peak with a smaller value...
+          if (h_index == peak_h_index && current_total_metric < true_max) {
+              
+              // Rescan the entire visible array to find the NEW champion
+              true_max = 0;
+              for (int i = 0; i < 240; i++) {
+                  if (traffic_history[i] > true_max) {
+                      true_max = traffic_history[i];
+                      peak_h_index = i;
+                  }
+              }
+              
+              uint32_t next_scale = true_max + (true_max / 5);
+              if (next_scale < 10) next_scale = 10; // Floor safety
+              
+              // If the new highest peak is significantly smaller, drop the ceiling
+              if (next_scale < absolute_max_traffic) {
+                  absolute_max_traffic = next_scale;
+                  did_rescale = true; 
+              }
+          }
+      }
+
+      // ==========================================
+      // RENDERING (Consolidated for up & down scales)
+      // ==========================================
+      if (did_rescale) {
+          // A rescale triggered: Wipe and redraw the entire history array instantly
           tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
           
           for (int c = 0; c < 240; c++) {
@@ -5447,35 +5480,26 @@ if (millis() - last_anim_tick > current_delay) {
 
               if (traffic_history[c] > 0) {
                   int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-                  
-                  // Cap the bar height to protect the ticks (Stops at split_y + 4)
                   if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
                   
                   tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, TFT_GREEN);
                   tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, TFT_GREEN);
               }
           }
-      } else {
-          // Normal plot operation
-          if (current_total_metric > 0) {
-              int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-              
-              // Cap the bar height here as well
-              if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
-              
-              tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, TFT_GREEN);
-              tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, TFT_GREEN);
-          }
+      } else if (current_total_metric > 0) {
+          // Normal plotting: Just draw the current bar
+          int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+          if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
+          
+          tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, TFT_GREEN);
+          tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, TFT_GREEN);
       }
 
       // ==========================================
       // FINAL OVERLAY: WINDOW BORDERS (Z-Order Top)
       // ==========================================
-      // 1. Trailing Edge (Frames the back of the data)
       tft.drawFastVLine(current_x + 2, HEADER_HEIGHT + 1, CHART_BOTTOM - HEADER_HEIGHT, TFT_WHITE);
       
-      // 2. Leading Edge (Frames the front of the void)
-      // Drawn here so it sits cleanly on top of any full-screen rescale wipes!
       if (current_x + ERASER_WIDTH <= 480) {
           tft.drawFastVLine(current_x + ERASER_WIDTH - 1, HEADER_HEIGHT + 1, CHART_BOTTOM - HEADER_HEIGHT, TFT_WHITE);
       } else {
@@ -5486,29 +5510,22 @@ if (millis() - last_anim_tick > current_delay) {
       // ==========================================
       // PUNCH-OUT Y-AXIS OVERLAY LABELS
       // ==========================================
-      // Only execute if the sweeping line is currently in the window,
-      // or if the bottom chart just wiped itself during a rescale.
       if (current_x <= 480 - ERASER_WIDTH || did_rescale) {
           int text_x = current_x + 6; 
-          
-          // Safety: If the window is near the right edge, don't draw labels off-screen
           if (text_x > 480 - 40) text_x = 480 - 40; 
 
           tft.setFreeFont(&UbuntuMono_Regular8pt7b);
           tft.setTextDatum(TL_DATUM);
 
-          // Top Pane Labels
           tft.setTextColor(TFT_WHITE);
           tft.drawString("100%", text_x, HEADER_HEIGHT + 4);
           int mid_y = HEADER_HEIGHT + ((split_y - HEADER_HEIGHT) / 2);
           tft.drawString("50%", text_x, mid_y - 6);
 
-          // Time Legend
           tft.setTextColor(TFT_DARKGREY);
           if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
           else tft.drawString("|=2m", text_x, split_y - 15);
 
-          // Custom Text Formatter: Pure Base-2 alignment
           char maxStr[16];
           if (currentRadioMode == RADIO_BLE) {
               snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
@@ -5519,54 +5536,18 @@ if (millis() - last_anim_tick > current_delay) {
               else snprintf(maxStr, sizeof(maxStr), "%.1fG", (float)absolute_max_traffic / 1073741824.0);
           }
           
-          // Bottom Pane Labels
           tft.setTextColor(TFT_GREEN);
           tft.drawString(maxStr, text_x, split_y + 4);
           tft.drawString("0", text_x, CHART_BOTTOM - 15);
       }
 
       // ==========================================
-      // END OF SWEEP: EPOCH DOWN-SCALING
+      // END OF SWEEP
       // ==========================================
       current_x += 2;
       if (current_x >= 480) {
           current_x = 0;
-          
-          // Calculate what the ceiling SHOULD be based on the sweep that just ended
-          uint32_t next_scale = current_sweep_peak + (current_sweep_peak / 5);
-          if (next_scale < 10) next_scale = 10; // Floor safety prevents div-by-zero
-          
-          // If the traffic died down, shrink the scale so small spikes are visible again
-          if (next_scale < absolute_max_traffic) {
-              absolute_max_traffic = next_scale;
-              
-              // Wipe the bottom pane
-              tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
-              
-              // Redraw the 240-column history array mapping it upward to the lowered ceiling
-              for (int c = 0; c < 240; c++) {
-                  int px = c * 2;
-
-                  // --- THE REPAIR: Redraw the bottom half of the tick marks ---
-                  if (px % 60 == 0) {
-                      tft.drawLine(px, split_y + 1, px, split_y + 3, TFT_WHITE);
-                      tft.drawLine(px + 1, split_y + 1, px + 1, split_y + 3, TFT_WHITE);
-                  }
-
-                  if (traffic_history[c] > 0) {
-                      int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-                      
-                      // Cap the bar height to protect the ticks (Stops at split_y + 4)
-                      if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
-                      
-                      tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, TFT_GREEN);
-                      tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, TFT_GREEN);
-                  }
-              }
-          }
-          
-          // Reset the peak tracker to prepare for the new sweep
-          current_sweep_peak = 0;
+          // The old epoch down-scaling logic has been completely removed!
       }
     }
   }
