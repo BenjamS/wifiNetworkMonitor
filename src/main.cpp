@@ -255,6 +255,8 @@ char target_ssid[33] = {0}; // Store the name of the targeted network
 
 const int HEADER_HEIGHT = 108; 
 const int CHART_BOTTOM = 295;
+const int chart_start_y = HEADER_HEIGHT + 50;
+
 int current_x = 0;
 
 struct MacRecord {
@@ -1582,7 +1584,7 @@ void drawMenu() {
 }
 
 void drawChartHeader() {
-  tft.drawLine(0, HEADER_HEIGHT, 480, HEADER_HEIGHT, TFT_WHITE);
+  tft.drawLine(0, HEADER_HEIGHT - 4, 480, HEADER_HEIGHT - 4, COLOR_HOT_CHEST);
 
   // MENU BUTTON
   // 1. Draw the Button Outline
@@ -1787,7 +1789,7 @@ void drawChartFooter() {
   // ZONE 1: SORT METRIC (Center X = 72)
   // ==========================================
   // Draw the button outline
-  tft.drawRoundRect(2, 298, 141, 19, 3, TFT_WHITE); 
+  tft.drawRoundRect(2, 298, 141, 22, 3, TFT_WHITE); 
 
   char metricStr[32] = "SORT: ERR"; // Failsafe fallback
   
@@ -1825,7 +1827,7 @@ void drawChartFooter() {
   // ZONE 2: SORT DIRECTION (Center X = 217)
   // ==========================================
   // Draw the button outline (X: 147, Y: 298, W: 141, H: 19, Radius: 3)
-  tft.drawRoundRect(147, 298, 141, 19, 3, TFT_WHITE); 
+  tft.drawRoundRect(147, 298, 141, 22, 3, TFT_WHITE); 
 
   if (sort_descending) {
     tft.drawString("ORDER: DESC", 217, 308);
@@ -1839,7 +1841,7 @@ void drawChartFooter() {
   // ZONE 3: SCALE MODE (Center X = 362)
   // ==========================================
   // Draw the button outline (X: 292, Y: 298, W: 141, H: 19, Radius: 3)
-  tft.drawRoundRect(292, 298, 141, 19, 3, TFT_WHITE); 
+  tft.drawRoundRect(292, 298, 141, 22, 3, TFT_WHITE); 
 
   if (useLogScale) {
     tft.setTextColor(TFT_YELLOW); 
@@ -3608,6 +3610,170 @@ void forceSessionSort() {
   }
 }
 
+void drawTemporalLegend() {
+    int displayCount = 0;
+    if (currentRadioMode == RADIO_WIFI) displayCount = sortMacCount;
+    else if (currentRadioMode == RADIO_BLE) displayCount = sortBleCount;
+    else if (currentRadioMode == RADIO_AP) displayCount = sortApCount;
+    else if (currentRadioMode == RADIO_CHANNELS) displayCount = sortChannelCount;
+
+    // Bail early if there's nothing to draw
+    if (!(displayCount > 0 || ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) && sortOtherBytes > 0))) {
+        return; 
+    }
+
+    // 1. CALCULATE AND DRAW "OTHER" IN THE TOP MENU BANNER
+    int otherCount = 0;
+    if (displayCount > 8) {
+        otherCount = displayCount - 8;
+    }
+
+    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+    tft.setTextDatum(TL_DATUM); 
+    tft.setTextColor(colors[8]);
+    tft.fillRect(315, 4, 95, 15, TFT_BLACK);
+    char otherStr[16];
+    snprintf(otherStr, sizeof(otherStr), "OTHER:%d", otherCount);
+    tft.drawString(otherStr, 315, 4);
+
+    // 2. DRAW THE MAIN 8-DEVICE LEGEND
+    tft.fillRect(0, 18, 480, HEADER_HEIGHT - 22, TFT_BLACK);
+    tft.setFreeFont(&UbuntuMono_Regular11pt7b);
+
+    int renderCount = 0;
+    if (currentRadioMode == RADIO_WIFI) renderCount = sortMacCount;
+    else if (currentRadioMode == RADIO_BLE) renderCount = sortBleCount;
+    else if (currentRadioMode == RADIO_AP) renderCount = sortApCount;
+    else if (currentRadioMode == RADIO_CHANNELS) renderCount = sortChannelCount;
+
+    for(int i = 0; i < 8 && i < renderCount; i++) {
+        char short_text[20];
+
+        if (currentRadioMode == RADIO_WIFI) {
+            strncpy(short_text, sortData[i].vendor, 19);
+            short_text[19] = '\0';
+        } 
+        else if (currentRadioMode == RADIO_BLE) {
+            if (strlen(sortBleData[i].name) > 0) {
+                strncpy(short_text, sortBleData[i].name, 19);
+                short_text[19] = '\0';
+            } else {
+                snprintf(short_text, sizeof(short_text), "%02X:%02X:%02X:%02X:%02X:%02X", 
+                         sortBleData[i].mac[0], sortBleData[i].mac[1], sortBleData[i].mac[2], 
+                         sortBleData[i].mac[3], sortBleData[i].mac[4], sortBleData[i].mac[5]);
+            }
+        } 
+        else if (currentRadioMode == RADIO_AP) {
+            bool has_clone = false;
+            if (strcmp(sortApData[i].ssid, "<HIDDEN>") != 0 && strcmp(sortApData[i].ssid, "<UNKNOWN>") != 0) {
+                for (int j = 0; j < sortApCount; j++) {
+                    if (i != j && strcmp(sortApData[i].ssid, sortApData[j].ssid) == 0) {
+                        has_clone = true;
+                        break;
+                    }
+                }
+            }
+
+            if (strcmp(sortApData[i].ssid, "<HIDDEN>") == 0 || strcmp(sortApData[i].ssid, "<UNKNOWN>") == 0) {
+                snprintf(short_text, sizeof(short_text), "%s", sortApData[i].ssid);
+            } else if (has_clone) {
+                char temp_ssid[13];
+                strncpy(temp_ssid, sortApData[i].ssid, 12); 
+                temp_ssid[12] = '\0';
+                snprintf(short_text, sizeof(short_text), "%s~%02X%02X", 
+                         temp_ssid, sortApData[i].bssid[4], sortApData[i].bssid[5]);
+            } else {
+                strncpy(short_text, sortApData[i].ssid, 19);
+                short_text[19] = '\0';
+            }
+        }
+        else if (currentRadioMode == RADIO_CHANNELS) {
+            snprintf(short_text, sizeof(short_text), "CH %02d", sortChannelData[i].channel);
+        }
+
+        tft.setTextColor(colors[i]);
+        int x_pos = 5 + (i % 2) * 240; 
+        int y_pos = 22 + (i / 2) * 20;
+
+        tft.drawString(short_text, x_pos, y_pos);
+    }
+}
+
+void drawPersistentTopN() {
+    // 1. Claim the 48-pixel band just beneath the existing header
+    int start_y = HEADER_HEIGHT - 2; 
+    tft.fillRect(0, start_y, 480, 48, TFT_BLACK);
+
+    tft.setFreeFont(&UbuntuMono_B9pt7b);
+    //tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+    tft.setTextDatum(TL_DATUM);
+
+    // 2. Determine the cap based on the active radio mode
+    int top_count = 0;
+    if (currentRadioMode == RADIO_WIFI) top_count = sessionMacCount;
+    else if (currentRadioMode == RADIO_BLE) top_count = sessionBleCount;
+    else if (currentRadioMode == RADIO_AP) top_count = sessionApCount;
+    else if (currentRadioMode == RADIO_CHANNELS) top_count = sessionChannelCount;
+
+    // Constrain to the 3x2 grid limits
+    if (top_count > 6) top_count = 6;
+
+    for (int i = 0; i < top_count; i++) {
+        // 3. Grid Math (3 rows x 2 columns)
+        int col = i / 3;           // 0 for ranks 1-3 (Left), 1 for ranks 4-6 (Right)
+        int row = i % 3;           // 0, 1, or 2 (Top, Middle, Bottom)
+        
+        int x_pos = 5 + (col * 240);       
+        int y_pos = start_y + (row * 16);  
+
+        String displayName = "";
+
+        // ==========================================
+        // MODE ROUTER: Pure UI passthrough 
+        // ==========================================
+        if (currentRadioMode == RADIO_WIFI) {
+            displayName = String(sessionData[i].vendor);
+        } 
+        else if (currentRadioMode == RADIO_BLE) {
+            // Assuming upstream places the resolved name/vendor here
+            displayName = String((char*)sessionBleData[i].name); 
+        }
+        else if (currentRadioMode == RADIO_AP) {
+            displayName = String((char*)sessionApData[i].ssid);
+        }
+        else if (currentRadioMode == RADIO_CHANNELS) {
+            // Channels use state math, not vendors, so keep the calculation
+            float rho = 0.0;
+            if (sessionChannelData[i].ema_variance > 0.01) {
+                rho = sessionChannelData[i].ema_cov / sessionChannelData[i].ema_variance;
+            }
+            const char* stateStr = "STATIC";
+            if (sessionChannelData[i].packets < 5) stateStr = "CALC..";
+            else if (rho > 0.6) stateStr = "DRIFT";
+            else if (rho > 0.2) stateStr = "ACTIVE";
+
+            char chStr[24];
+            snprintf(chStr, sizeof(chStr), "CH:%02d [%s]", sessionChannelData[i].channel, stateStr);
+            displayName = String(chStr);
+        }
+
+        // Just in case a struct passed an empty string, fail gracefully
+        if (displayName.length() == 0) {
+            displayName = "Unknown";
+        } else if (displayName.length() > 20) {
+            displayName = displayName.substring(0, 18) + "..";
+        }
+
+        // Apply your predefined chestnut macro (with a black background to overwrite old text cleanly)
+        tft.setTextColor(COLOR_HOT_CHEST, TFT_BLACK);
+        
+        String label = String(i + 1) + "." + displayName;
+        tft.drawString(label, x_pos, y_pos);
+    }
+    // Draw a white separator line between the leaderboard and the waterfall
+    tft.drawLine(0, chart_start_y, 480, chart_start_y, COLOR_HOT_CHEST);
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(15, OUTPUT); digitalWrite(15, HIGH);
@@ -4601,6 +4767,10 @@ if (millis() - last_anim_tick > current_delay) {
         for(int i = 0; i < 8 && i < sortMacCount; i++) {
           resolveMacVendor(&sortData[i]);
         }
+        // 4. NEW: Resolve vendors for the Top 6 all-time session devices!
+        for(int i = 0; i < 6 && i < sessionMacCount; i++) {
+          resolveMacVendor(&sessionData[i]);
+        }
       }
       else if (currentRadioMode == RADIO_BLE) {
         // ==========================================
@@ -5088,104 +5258,24 @@ if (millis() - last_anim_tick > current_delay) {
 
       if (currentState == SCREEN_CHART) {
 
-      int displayCount = 0;
-      if (currentRadioMode == RADIO_WIFI) displayCount = sortMacCount;
-      else if (currentRadioMode == RADIO_BLE) displayCount = sortBleCount;
-      else if (currentRadioMode == RADIO_AP) displayCount = sortApCount;
-      else if (currentRadioMode == RADIO_CHANNELS) displayCount = sortChannelCount;
+      // ==========================================
+      // 1. DRAW THE TEMPORAL 8-DEVICE LEGEND (Top)
+      // ==========================================
+      drawTemporalLegend();
 
-      if (displayCount > 0 || ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) && sortOtherBytes > 0)) {
-
-        // 1. CALCULATE AND DRAW "OTHER" IN THE TOP MENU BANNER
-        int otherCount = 0;
-        if (displayCount > 8) {
-          otherCount = displayCount - 8;
-        }
-
-        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-        tft.setTextDatum(TL_DATUM); 
-        tft.setTextColor(colors[8]);
-        tft.fillRect(315, 4, 95, 15, TFT_BLACK);
-        char otherStr[16];
-        sprintf(otherStr, "OTHER:%d", otherCount);
-        tft.drawString(otherStr, 315, 4);
-
-        // 2. DRAW THE MAIN 8-DEVICE LEGEND
-        tft.fillRect(0, 18, 480, HEADER_HEIGHT - 18, TFT_BLACK);
-        tft.setFreeFont(&UbuntuMono_Regular11pt7b);
-
-        // Dynamically determine the ceiling for the loop based on the active mode
-        int renderCount = 0;
-        if (currentRadioMode == RADIO_WIFI) renderCount = sortMacCount;
-        else if (currentRadioMode == RADIO_BLE) renderCount = sortBleCount;
-        else if (currentRadioMode == RADIO_AP) renderCount = sortApCount;
-        else if (currentRadioMode == RADIO_CHANNELS) renderCount = sortChannelCount;
-
-        for(int i = 0; i < 8 && i < renderCount; i++) {
-          char short_text[20];
-
-          if (currentRadioMode == RADIO_WIFI) {
-            strncpy(short_text, sortData[i].vendor, 19);
-            short_text[19] = '\0';
-          } 
-          else if (currentRadioMode == RADIO_BLE) {
-            // BLE: Use the snapshot broadcast Name. If empty, fallback to MAC address.
-            if (strlen(sortBleData[i].name) > 0) {
-              strncpy(short_text, sortBleData[i].name, 19);
-              short_text[19] = '\0';
-            } else {
-              // Format the 6 raw bytes directly into the short_text buffer.
-              snprintf(short_text, sizeof(short_text), "%02X:%02X:%02X:%02X:%02X:%02X", 
-                       sortBleData[i].mac[0], sortBleData[i].mac[1], sortBleData[i].mac[2], 
-                       sortBleData[i].mac[3], sortBleData[i].mac[4], sortBleData[i].mac[5]);
-            }
-          } 
-          else if (currentRadioMode == RADIO_AP) {
-            // 1. Determine if this SSID has a clone in the dictionary
-            bool has_clone = false;
-            if (strcmp(sortApData[i].ssid, "<HIDDEN>") != 0 && strcmp(sortApData[i].ssid, "<UNKNOWN>") != 0) {
-              for (int j = 0; j < sortApCount; j++) {
-                if (i != j && strcmp(sortApData[i].ssid, sortApData[j].ssid) == 0) {
-                  has_clone = true;
-                  break;
-                }
-              }
-            }
-
-            // 2. Format the output based on clone status
-            if (strcmp(sortApData[i].ssid, "<HIDDEN>") == 0 || strcmp(sortApData[i].ssid, "<UNKNOWN>") == 0) {
-               snprintf(short_text, sizeof(short_text), "%s", sortApData[i].ssid);
-            } else if (has_clone) {
-               char temp_ssid[13];
-               strncpy(temp_ssid, sortApData[i].ssid, 12); 
-               temp_ssid[12] = '\0';
-               snprintf(short_text, sizeof(short_text), "%s~%02X%02X", 
-                        temp_ssid, sortApData[i].bssid[4], sortApData[i].bssid[5]);
-            } else {
-               // Unique network! Give it more characters since we don't need the bracket suffix
-               strncpy(short_text, sortApData[i].ssid, 19);
-               short_text[19] = '\0';
-            }
-          }
-          else if (currentRadioMode == RADIO_CHANNELS) {
-             // Simply print the channel number (e.g., "CH 06")
-             snprintf(short_text, sizeof(short_text), "CH %02d", sortChannelData[i].channel);
-          }
-
-
-          tft.setTextColor(colors[i]);
-          int x_pos = 5 + (i % 2) * 240; 
-          int y_pos = 22 + (i / 2) * 20;
-
-          tft.drawString(short_text, x_pos, y_pos);
-        }
-      }
+      // ==========================================
+      // 2. DRAW THE SESSION TOP 6 LEADERBOARD (Middle)
+      // ==========================================
+      drawPersistentTopN();
 
       // --- WATERFALL CHART PLOTTING MATH ---
-
+      // THE SHIFT: Push the top of the chart down by 50 pixels to make room for the Top-6 grid
+      //int chart_start_y = HEADER_HEIGHT + 50; -->moved to global variable
       // 1. Establish the Dual-Pane boundaries
-      int chart_area_height = CHART_BOTTOM - HEADER_HEIGHT;
-      int split_y = HEADER_HEIGHT + (chart_area_height * 3) / 4; // The 75% line
+      int chart_area_height = CHART_BOTTOM - chart_start_y;
+      int split_y = chart_start_y + (chart_area_height * 3) / 4; // The 75% line chart_start_y
+      //int chart_area_height = CHART_BOTTOM - HEADER_HEIGHT;
+      //int split_y = HEADER_HEIGHT + (chart_area_height * 3) / 4; // The 75% line
 
       // ==========================================
       // 2. The ECG Scan Window (Wipes 44 pixels ahead)
@@ -5194,20 +5284,22 @@ if (millis() - last_anim_tick > current_delay) {
       
       // Pure wipe logic: Clears the void. Borders are drawn at the end to survive rescales.
       if (current_x + ERASER_WIDTH <= 480) {
-          tft.fillRect(current_x, HEADER_HEIGHT + 1, ERASER_WIDTH, CHART_BOTTOM - HEADER_HEIGHT, TFT_BLACK);
+          tft.fillRect(current_x, chart_start_y + 1, ERASER_WIDTH, CHART_BOTTOM - chart_start_y, TFT_BLACK);
       } else {
           int w1 = 480 - current_x;
-          tft.fillRect(current_x, HEADER_HEIGHT + 1, w1, CHART_BOTTOM - HEADER_HEIGHT, TFT_BLACK);
-          tft.fillRect(0, HEADER_HEIGHT + 1, ERASER_WIDTH - w1, CHART_BOTTOM - HEADER_HEIGHT, TFT_BLACK);
+          tft.fillRect(current_x, chart_start_y + 1, w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+          tft.fillRect(0, chart_start_y + 1, ERASER_WIDTH - w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
       }
 
       // 3. Draw the X-Axis Time Ticks & Separator Line
       if (current_x % 60 == 0) {
-          tft.drawLine(current_x, split_y - 3, current_x, split_y + 3, TFT_WHITE);
-          tft.drawLine(current_x + 1, split_y - 3, current_x + 1, split_y + 3, TFT_WHITE);
+          // Draw the tall tick marks in chestnut
+          tft.drawLine(current_x, split_y - 3, current_x, split_y + 3, COLOR_HOT_CHEST);
+          tft.drawLine(current_x + 1, split_y - 3, current_x + 1, split_y + 3, COLOR_HOT_CHEST);
       } else {
-          tft.drawPixel(current_x, split_y, TFT_DARKGREY);
-          tft.drawPixel(current_x + 1, split_y, TFT_DARKGREY);
+          // Draw the solid separator line in chestnut when not on a tick mark
+          tft.drawPixel(current_x, split_y, COLOR_HOT_CHEST);
+          tft.drawPixel(current_x + 1, split_y, COLOR_HOT_CHEST);
       }
 
       int current_y = split_y - 1; // Top chart builds UP from the split line
@@ -5241,20 +5333,20 @@ if (millis() - last_anim_tick > current_delay) {
             if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
             else fraction = (double)current_device_bytes / (double)total_bytes;
 
-            int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
-            if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
+            int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+            if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
             tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
             current_y -= bar_height;
           }
 
-          if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
-            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-          } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortMacCount > 0) {
-            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortMacCount - 1]);
+          if (sortOtherBytes > 0 && current_y > chart_start_y) {
+            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+          } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortMacCount > 0) {
+            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortMacCount - 1]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortMacCount - 1]);
           }
         }
       }
@@ -5287,20 +5379,20 @@ if (millis() - last_anim_tick > current_delay) {
             if (useLogScale) fraction = log10((double)sortBleData[i].hits + 1.0) / log_total;
             else fraction = (double)sortBleData[i].hits / (double)total_hits;
             
-            int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
-            if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
+            int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+            if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
             tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
             tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
             current_y -= bar_height;
           }
           
-          if (other_hits > 0 && current_y > HEADER_HEIGHT) {
-            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-          } else if (other_hits == 0 && current_y > HEADER_HEIGHT && ble_count > 0) {
-            tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[ble_count - 1]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[ble_count - 1]);
+          if (other_hits > 0 && current_y > chart_start_y) {
+            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+          } else if (other_hits == 0 && current_y > chart_start_y && ble_count > 0) {
+            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[ble_count - 1]);
+            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[ble_count - 1]);
           }
         }
       }
@@ -5330,20 +5422,20 @@ if (millis() - last_anim_tick > current_delay) {
               if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
               else fraction = (double)current_device_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
-              if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
+              int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+              if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
               tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
               current_y -= bar_height;
             }
 
-            if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
-              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-            } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortApCount > 0) {
-              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortApCount - 1]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortApCount - 1]);
+            if (sortOtherBytes > 0 && current_y > chart_start_y) {
+              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+            } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortApCount > 0) {
+              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortApCount - 1]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortApCount - 1]);
             }
           }
       }
@@ -5373,20 +5465,20 @@ if (millis() - last_anim_tick > current_delay) {
               if (useLogScale) fraction = log10((double)current_c_bytes + 1.0) / log_total;
               else fraction = (double)current_c_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (split_y - HEADER_HEIGHT - 1));
-              if (bar_height > (split_y - HEADER_HEIGHT - 1)) bar_height = split_y - HEADER_HEIGHT - 1;
+              int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+              if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
               tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
               tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
               current_y -= bar_height;
             }
 
-            if (sortOtherBytes > 0 && current_y > HEADER_HEIGHT) {
-              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[8]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[8]);
-            } else if (sortOtherBytes == 0 && current_y > HEADER_HEIGHT && sortChannelCount > 0) {
-              tft.drawLine(current_x, current_y, current_x, HEADER_HEIGHT + 1, colors[sortChannelCount - 1]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, HEADER_HEIGHT + 1, colors[sortChannelCount - 1]);
+            if (sortOtherBytes > 0 && current_y > chart_start_y) {
+              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+            } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortChannelCount > 0) {
+              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortChannelCount - 1]);
+              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortChannelCount - 1]);
             }
           }
       }
@@ -5468,45 +5560,57 @@ if (millis() - last_anim_tick > current_delay) {
       if (did_rescale) {
           // A rescale triggered: Wipe and redraw the entire history array instantly
           tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
-          
+          // --- THE REPAIR: Draw the solid separator line across the whole screen ---
+          tft.drawLine(0, split_y, 480, split_y, COLOR_HOT_CHEST);
+
           for (int c = 0; c < 240; c++) {
               int px = c * 2;
 
               // --- THE REPAIR: Redraw the bottom half of the tick marks ---
               if (px % 60 == 0) {
-                  tft.drawLine(px, split_y + 1, px, split_y + 3, TFT_WHITE);
-                  tft.drawLine(px + 1, split_y + 1, px + 1, split_y + 3, TFT_WHITE);
+                  tft.drawLine(px, split_y + 1, px, split_y + 3, COLOR_HOT_CHEST);
+                  tft.drawLine(px + 1, split_y + 1, px + 1, split_y + 3, COLOR_HOT_CHEST);
               }
 
               if (traffic_history[c] > 0) {
                   int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
                   if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
                   
-                  tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, TFT_GREEN);
-                  tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, TFT_GREEN);
+                  tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+                  tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
               }
           }
-      } else if (current_total_metric > 0) {
-          // Normal plotting: Just draw the current bar
-          int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-          if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
-          
-          tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, TFT_GREEN);
-          tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, TFT_GREEN);
+      } else {
+          // Normal plotting: Sweeping cursor
+          if (current_total_metric > 0) {
+              // Just draw the current traffic bar
+              int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+              if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
+              
+              tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+              tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+          }
       }
 
       // ==========================================
       // FINAL OVERLAY: WINDOW BORDERS (Z-Order Top)
       // ==========================================
-      tft.drawFastVLine(current_x + 2, HEADER_HEIGHT + 1, CHART_BOTTOM - HEADER_HEIGHT, TFT_WHITE);
+      tft.drawFastVLine(current_x + 2, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
       
       if (current_x + ERASER_WIDTH <= 480) {
-          tft.drawFastVLine(current_x + ERASER_WIDTH - 1, HEADER_HEIGHT + 1, CHART_BOTTOM - HEADER_HEIGHT, TFT_WHITE);
+          tft.drawFastVLine(current_x + ERASER_WIDTH - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+          
+          // REPAIR: Draw the horizontal line straight through the playhead gap
+          tft.drawFastHLine(current_x, split_y, ERASER_WIDTH, COLOR_HOT_CHEST);
       } else {
           int w1 = 480 - current_x;
-          tft.drawFastVLine(ERASER_WIDTH - w1 - 1, HEADER_HEIGHT + 1, CHART_BOTTOM - HEADER_HEIGHT, TFT_WHITE);
+          tft.drawFastVLine(ERASER_WIDTH - w1 - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+          
+          // REPAIR: Handle screen wrap for the horizontal line
+          tft.drawFastHLine(current_x, split_y, w1, COLOR_HOT_CHEST);
+          tft.drawFastHLine(0, split_y, ERASER_WIDTH - w1, COLOR_HOT_CHEST);
       }
-      
+
       // ==========================================
       // PUNCH-OUT Y-AXIS OVERLAY LABELS
       // ==========================================
@@ -5517,12 +5621,12 @@ if (millis() - last_anim_tick > current_delay) {
           tft.setFreeFont(&UbuntuMono_Regular8pt7b);
           tft.setTextDatum(TL_DATUM);
 
-          tft.setTextColor(TFT_WHITE);
-          tft.drawString("100%", text_x, HEADER_HEIGHT + 4);
-          int mid_y = HEADER_HEIGHT + ((split_y - HEADER_HEIGHT) / 2);
+          tft.setTextColor(COLOR_HOT_CHEST);
+          tft.drawString("100%", text_x, chart_start_y + 4);
+          int mid_y = chart_start_y + ((split_y - chart_start_y) / 2);
           tft.drawString("50%", text_x, mid_y - 6);
 
-          tft.setTextColor(TFT_DARKGREY);
+          tft.setTextColor(COLOR_HOT_CHEST);
           if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
           else tft.drawString("|=2m", text_x, split_y - 15);
 
@@ -5536,9 +5640,10 @@ if (millis() - last_anim_tick > current_delay) {
               else snprintf(maxStr, sizeof(maxStr), "%.1fG", (float)absolute_max_traffic / 1073741824.0);
           }
           
-          tft.setTextColor(TFT_GREEN);
+          tft.setTextColor(COLOR_HOT_CHEST);
+          //tft.setTextColor(TFT_GREEN);
           tft.drawString(maxStr, text_x, split_y + 4);
-          tft.drawString("0", text_x, CHART_BOTTOM - 15);
+          tft.drawString("0", text_x, CHART_BOTTOM - 12);
       }
 
       // ==========================================
