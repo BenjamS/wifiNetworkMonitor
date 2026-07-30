@@ -201,12 +201,13 @@ struct ApRecord {
   uint8_t channel;
   uint8_t max_rate;
   int8_t rssi;
-  int8_t rssi_min;    // NEW: spatial floor for foxhunt adaptive threshold
-  int8_t rssi_max;    // NEW: spatial ceiling for foxhunt adaptive threshold
-  char ssid[26];      // Trimmed from 28 — UI truncates at 18 chars anyway
+  int8_t rssi_min;    
+  int8_t rssi_max;    
+  bool has_clone;     // NEW: O(1) lookup during UI rendering
+  char ssid[25];      // Trimmed from 26 to 25 to maintain exactly 80 bytes
   char country[3];
 };
-// Still exactly 80 bytes
+// Still exactly 80 bytes!
 
 #define MAX_CHANNEL_RECORDS 100
 
@@ -389,6 +390,8 @@ constexpr size_t SRAM_BUDGET = 327680;  // 320KB — conservative application bu
 static_assert(static_non_union <= SRAM_BUDGET,
     "FATAL: Static allocations exceed conservative SRAM budget. "
     "Reduce array sizes.");
+
+bool force_ui_refresh = false;
 
 // Color utility fn
 constexpr uint16_t hex24to565(uint32_t hex24) {
@@ -783,10 +786,37 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
             liveApData[ap_index].rssi_min = pkt->rx_ctrl.rssi;
             liveApData[ap_index].rssi_max = pkt->rx_ctrl.rssi;
             liveApData[ap_index].channel = true_channel; // <--- INJECT THE TRUE CHANNEL
+            
             // ssid is char ssid[26] — trimmed from 28 to accommodate rssi_min/rssi_max
             strncpy((char*)liveApData[ap_index].ssid, extracted_ssid, sizeof(liveApData[ap_index].ssid));
-          }
-        }
+            
+            // ADD THIS LINE: Force null termination to prevent runaway memory reads
+            liveApData[ap_index].ssid[sizeof(liveApData[ap_index].ssid) - 1] = '\0';
+
+            // ==========================================
+            // NEW: O(N) CLONE DETECTION ON DISCOVERY
+            // ==========================================
+            liveApData[ap_index].has_clone = false;
+
+            if (strlen((char*)liveApData[ap_index].ssid) > 0 && 
+                strcmp((char*)liveApData[ap_index].ssid, "<HIDDEN>") != 0 && 
+                strcmp((char*)liveApData[ap_index].ssid, "<UNKNOWN>") != 0) {
+                
+                for (int i = 0; i < liveApCount; i++) {
+                    // Skip self-comparison (crucial if ap_index claimed an evicted slot)
+                    if (i == ap_index) continue;
+
+                    if (strcmp((char*)liveApData[i].ssid, (char*)liveApData[ap_index].ssid) == 0) {
+                        liveApData[ap_index].has_clone = true;
+                        liveApData[i].has_clone = true;
+                        break; 
+                    }
+                }
+            }
+            // ==========================================
+
+          } // Closes `if (ap_index != -1)`
+        } // Closes `if (ap_index == -1)`
 
         // If the AP made it into the array, update metadata but IGNORE TRAFFIC MATH!
         if (ap_index != -1) {
@@ -1215,6 +1245,12 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     
     liveData[liveMacCount].vendorFound = false;
     
+    // --- ADD THESE 3 LINES ---
+    liveData[liveMacCount].needs_lookup = true; // Tell Core 1 to check the SD card
+    strncpy((char*)liveData[liveMacCount].vendor, "Resolving...", 27); 
+    liveData[liveMacCount].vendor[27] = '\0';
+    // -------------------------
+
     liveMacCount++; // Advance the tracker
   } else {
     // If the buffer is full, dump the size into the overflow bucket
@@ -1524,21 +1560,33 @@ void drawMenu() {
   tft.drawString("SNIFFED PROBES", 375, 160);
 
   // ==========================================
-  // 3. AP SCANNER BUTTON (Y: 190 - 230)
+  // 3. AP SCANNER / CH SELECT BUTTON (Y: 190 - 230)
   // ==========================================
-  if (currentRadioMode == RADIO_WIFI) {
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
     // Active State
     tft.fillRect(50, 190, 200, 40, TFT_BLACK);
     tft.drawRect(50, 190, 200, 40, TFT_WHITE);
     tft.setTextColor(TFT_WHITE);
-   } else {
+    
+    if (currentRadioMode == RADIO_WIFI) {
+        tft.drawString("SELECT AP", 150, 210);
+    } else if (currentRadioMode == RADIO_AP) {
+        if (target_locked) {
+            char chStr[16];
+            snprintf(chStr, sizeof(chStr), "LOCKED: CH %d", target_channel);
+            tft.drawString(chStr, 150, 210);
+        } else {
+            tft.drawString("SELECT CH", 150, 210);
+        }
+    }
+  } else {
     // "Cold" Abyss State
     uint16_t deadGrey = hex24to565(0x222222);      // Almost black
     tft.fillRect(50, 190, 200, 40, deadGrey);
     tft.drawRect(50, 190, 200, 40, TFT_DARKGREY);
     tft.setTextColor(TFT_DARKGREY);
+    tft.drawString("SELECT AP", 150, 210);
   }
-  tft.drawString("SELECT AP", 150, 210);
 
   // 4. SEEN DEVICES BUTTON
   tft.fillRect(50, 240, 200, 40, TFT_BLACK);
@@ -1622,8 +1670,11 @@ void drawChartHeader() {
     snprintf(bannerStr, sizeof(bannerStr), "SNIFFING BLE DEVICES");
   } 
   else if (currentRadioMode == RADIO_AP) {
-    // AP Mode also hops channels, so showing the active channel is highly useful!
-    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING NETWORKS", CHANNELS[current_ch_idx]);
+    if (!target_locked) {
+        snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING NETWORKS", CHANNELS[current_ch_idx]);
+    } else {
+        snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | TARGET LOCKED", target_channel);
+    }
   }
   else if (currentRadioMode == RADIO_CHANNELS) { 
     snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING SPECTRUM", CHANNELS[current_ch_idx]);
@@ -3728,17 +3779,20 @@ void drawPersistentTopN() {
 
     if (top_count > 10) top_count = 10;
 
-    // 1. Static state trackers for delta-drawing
-    static String lastLabels[10];
+    // 1. Static state trackers for delta-drawing (REMOVED HEAP-FRAG STRINGS)
+    static char lastLabels[10][32] = {0}; 
     static int lastTopCount = 0;
     static uint8_t lastRadioMode = 255; // 255 forces an initial redraw on boot
 
     // 2. Force a full block wipe ONLY when changing radio modes
-    bool forceRedraw = (currentRadioMode != lastRadioMode);
+    bool forceRedraw = (currentRadioMode != lastRadioMode) || force_ui_refresh;
     if (forceRedraw) {
         tft.fillRect(0, 18, 480, HEADER_HEIGHT - 27, TFT_BLACK);
-        for(int i = 0; i < 10; i++) lastLabels[i] = "";
+        for(int i = 0; i < 10; i++) {
+            lastLabels[i][0] = '\0'; // Clear the cache array
+        }
         lastRadioMode = currentRadioMode;
+        force_ui_refresh = false; // Consume the flag so it only runs once
     }
 
     for (int i = 0; i < top_count; i++) {
@@ -3749,16 +3803,36 @@ void drawPersistentTopN() {
         int x_pos = 5 + (col * 240);       
         int y_pos = 18 + (row * 16);  
 
-        String displayName = "";
+        char display_name[28] = "Unknown"; // Buffer for the raw text
 
         if (currentRadioMode == RADIO_WIFI) {
-            displayName = String(sessionData[i].vendor);
+            strncpy(display_name, sessionData[i].vendor, 26);
+            display_name[26] = '\0';
         } 
         else if (currentRadioMode == RADIO_BLE) {
-            displayName = String((char*)sessionBleData[i].name); 
+            if (strlen((char*)sessionBleData[i].name) > 0) {
+                strncpy(display_name, (char*)sessionBleData[i].name, 26);
+                display_name[26] = '\0';
+            } else {
+                snprintf(display_name, sizeof(display_name), "%02X:%02X:%02X:%02X:%02X:%02X", 
+                         sessionBleData[i].mac[0], sessionBleData[i].mac[1], sessionBleData[i].mac[2], 
+                         sessionBleData[i].mac[3], sessionBleData[i].mac[4], sessionBleData[i].mac[5]);
+            }
         }
         else if (currentRadioMode == RADIO_AP) {
-            displayName = String((char*)sessionApData[i].ssid);
+            // Uses sessionApData, display_name, and wider truncation bounds
+            if (strcmp(sessionApData[i].ssid, "<HIDDEN>") == 0 || strcmp(sessionApData[i].ssid, "<UNKNOWN>") == 0) {
+                snprintf(display_name, sizeof(display_name), "%s", sessionApData[i].ssid);
+            } else if (sessionApData[i].has_clone) {
+                char temp_ssid[22]; 
+                strncpy(temp_ssid, sessionApData[i].ssid, 21); // 21 chars max for list
+                temp_ssid[21] = '\0';
+                snprintf(display_name, sizeof(display_name), "%s~%02X%02X", 
+                         temp_ssid, sessionApData[i].bssid[4], sessionApData[i].bssid[5]);
+            } else {
+                strncpy(display_name, sessionApData[i].ssid, 26); // 26 chars max for list
+                display_name[26] = '\0';
+            }
         }
         else if (currentRadioMode == RADIO_CHANNELS) {
             float rho = 0.0;
@@ -3770,21 +3844,15 @@ void drawPersistentTopN() {
             else if (rho > 0.6) stateStr = "DRIFT";
             else if (rho > 0.2) stateStr = "ACTIVE";
 
-            char chStr[24];
-            snprintf(chStr, sizeof(chStr), "CH:%02d [%s]", sessionChannelData[i].channel, stateStr);
-            displayName = String(chStr);
+            snprintf(display_name, sizeof(display_name), "CH:%02d [%s]", sessionChannelData[i].channel, stateStr);
         }
 
-        if (displayName.length() == 0) {
-            displayName = "Unknown";
-        } else if (displayName.length() > 24) {
-            displayName = displayName.substring(0, 22) + "..";
-        }
-
-        String label = String(i + 1) + "." + displayName;
+        // Final assembly of index + display name
+        char label[32];
+        snprintf(label, sizeof(label), "%d.%s", i + 1, display_name);
 
         // 3. Delta Check: Only draw if the string changed or a mode swap forced it
-        if (forceRedraw || label != lastLabels[i]) {
+        if (forceRedraw || strcmp(label, lastLabels[i]) != 0) {
             if (!forceRedraw) {
                 // Wipe just this specific 235x16 cell to prevent trailing characters 
                 // from a previous, longer string ghosting on the screen.
@@ -3793,7 +3861,10 @@ void drawPersistentTopN() {
             
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
             tft.drawString(label, x_pos, y_pos);
-            lastLabels[i] = label;
+            
+            // Store the new label for future delta checks
+            strncpy(lastLabels[i], label, sizeof(lastLabels[i]) - 1);
+            lastLabels[i][sizeof(lastLabels[i]) - 1] = '\0';
         }
     }
 
@@ -3805,7 +3876,7 @@ void drawPersistentTopN() {
         int y_pos = 18 + (row * 16);
         
         tft.fillRect(x_pos, y_pos, 235, 16, TFT_BLACK);
-        lastLabels[i] = "";
+        lastLabels[i][0] = '\0'; // Clear the tracker
     }
 
     lastTopCount = top_count;
@@ -3860,7 +3931,7 @@ void drawTemporalLegend() {
 
     // REDUCED: Only loop up to 6 items max
     for(int i = 0; i < 6 && i < renderCount; i++) {
-        char short_text[25]; // Kept at 25 to safely hold "1. " + 19 chars + null terminator
+        char short_text[25]; // Safe size for 20-char strings + null terminator
 
         if (currentRadioMode == RADIO_WIFI) {
             strncpy(short_text, sortData[i].vendor, 19);
@@ -3877,27 +3948,18 @@ void drawTemporalLegend() {
             }
         } 
         else if (currentRadioMode == RADIO_AP) {
-            bool has_clone = false;
-            if (strcmp(sortApData[i].ssid, "<HIDDEN>") != 0 && strcmp(sortApData[i].ssid, "<UNKNOWN>") != 0) {
-                for (int j = 0; j < sortApCount; j++) {
-                    if (i != j && strcmp(sortApData[i].ssid, sortApData[j].ssid) == 0) {
-                        has_clone = true;
-                        break;
-                    }
-                }
-            }
-
+            // Uses sortApData, short_text, and tighter truncation bounds
             if (strcmp(sortApData[i].ssid, "<HIDDEN>") == 0 || strcmp(sortApData[i].ssid, "<UNKNOWN>") == 0) {
                 snprintf(short_text, sizeof(short_text), "%s", sortApData[i].ssid);
-            } else if (has_clone) {
-                char temp_ssid[13];
-                strncpy(temp_ssid, sortApData[i].ssid, 12); 
-                temp_ssid[12] = '\0';
+            } else if (sortApData[i].has_clone) {
+                char temp_ssid[16]; 
+                strncpy(temp_ssid, sortApData[i].ssid, 14); // 14 chars max for legend
+                temp_ssid[14] = '\0';
                 snprintf(short_text, sizeof(short_text), "%s~%02X%02X", 
                          temp_ssid, sortApData[i].bssid[4], sortApData[i].bssid[5]);
             } else {
-                strncpy(short_text, sortApData[i].ssid, 19);
-                short_text[19] = '\0';
+                strncpy(short_text, sortApData[i].ssid, 20); // 20 chars max for legend
+                short_text[20] = '\0';
             }
         }
         else if (currentRadioMode == RADIO_CHANNELS) {
@@ -3910,8 +3972,9 @@ void drawTemporalLegend() {
         int x_pos = 5 + (i % 2) * 240; 
         int y_pos = start_y + (i / 2) * 20; 
 
-        // Prepend the index (i + 1) to match the persistent list styling
-        String label = String(i + 1) + "." + String(short_text);
+        // UPDATED: Eliminated dynamic String object for pure char array
+        char label[32];
+        snprintf(label, sizeof(label), "%d.%s", i + 1, short_text);
         
         tft.drawString(label, x_pos, y_pos);
     }
@@ -3964,13 +4027,8 @@ void setup() {
 }
 
 
-void loop() {
-  processPendingVendors();
-  uint16_t t_x = 0, t_y = 0;
-  bool should_render = false;
-  bool pressed = tft.getTouch(&t_x, &t_y);
-
-  if (pressed) {
+bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
+  bool trigger_render = false; // 1. Create local tracking variable
 
     // ==========================================
     // 1. CHART SCREEN TOUCH LOGIC
@@ -4022,7 +4080,7 @@ void loop() {
           
           // 3. Redraw
           drawChartFooter();
-          should_render = true; // Trigger the engine to re-sort and redraw the bars
+          trigger_render = true; // Trigger the engine to re-sort and redraw the bars
           delay(200); 
         }
         
@@ -4073,7 +4131,7 @@ void loop() {
 
           // 1. THE GATE
           if (!foxhunt_available) {
-              return; // The button is cold. Ignore the touch entirely.
+              return false; // The button is cold. Ignore the touch entirely.
           }
           
           // 2. THE EXECUTION
@@ -4091,12 +4149,32 @@ void loop() {
         drawProbeTracker();
         delay(300); 
       }
-      // AP Scanner Button
+      // AP Scanner / CH Select Button
       else if (t_x > 50 && t_x < 250 && t_y > 190 && t_y < 230) {
         if (currentRadioMode == RADIO_WIFI) {
           currentState = SCREEN_AP_SCAN;
           drawApScanner();
           delay(300);
+        } else if (currentRadioMode == RADIO_AP) {
+          // Tap to cycle channels! 1-13, then back to unlocked (ALL)
+          if (!target_locked) {
+              target_locked = true;
+              target_channel = 1;
+          } else {
+              target_channel++;
+              if (target_channel > 13) {
+                  target_locked = false;
+                  target_channel = 0;
+              }
+          }
+          
+          // Wipe the slate clean so the chart only shows APs on the new channel
+          memset(traffic_history, 0, sizeof(traffic_history)); 
+          absolute_max_traffic = 10;
+          resetMonitorState(); 
+          
+          drawMenu(); // Redraw the button immediately to show the new channel number
+          delay(150); // Snappy debounce for fast tapping
         }
       }
       // Sniffed Devices Button
@@ -4197,15 +4275,21 @@ void loop() {
         drawChartHeader();
         drawChartFooter();
         
-        // THE FIX: Wake the Wi-Fi radio back up if we are in ANY Wi-Fi based mode!
-          if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
-              esp_wifi_set_promiscuous(true); 
-          }
+        // --- FLUSH THE DELTA-DRAW CACHE ---
+        force_ui_refresh = true; 
         
-        // Channel tuning for locked targets
-        if (currentRadioMode == RADIO_WIFI && target_locked) {
-          esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
+        // THE FIX: Wake the Wi-Fi radio back up if we are in ANY Wi-Fi based mode!
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
+            esp_wifi_set_promiscuous(true); 
         }
+        
+        // --- UPDATED: Allow AP mode to restore its target channel, and sync the hopper if unlocked ---
+        if ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) && target_locked) {
+          esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
+        } else if (currentRadioMode != RADIO_BLE) {
+          esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+        }
+        // -----------------------------------------------------------------------------
         
         current_x = 0;
         delay(300);
@@ -4375,6 +4459,12 @@ void loop() {
         is_selecting_target = false;
         foxhunt_bounds_seeded = false; // Clear stale bounds
         
+        // --- ADD THESE 3 LINES ---
+        target_locked = false; // Release the lock
+        current_ch_idx = 0;    // Reset the hopper index cleanly
+        esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+        // -------------------------
+
         currentState = SCREEN_MENU; // Route back to MENU
         drawMenu();
         delay(300);
@@ -4548,63 +4638,61 @@ void loop() {
       }
 
     }
-  } // <-- End of main if (pressed)
+    return trigger_render; // 3. Return the decision back to loop()
 
-  // ==========================================
-  // REAL-TIME FOXHUNT RADAR UPDATER
-  // ==========================================
-  if (currentState == SCREEN_FOXHUNT) {
-
-    // --- WAVE HOUND ANIMATION ENGINE ---
-static unsigned long last_anim_tick = 0;
-static int sequence_index = 0; // Tracks where we are in the script
-static unsigned long current_delay = 300; // Tracks how long the current frame should stay on screen
-
-// Define the custom animation script (0 = sniff, 1 = sniff/wag, 2 = look up)
-// This yields 8 standard loops, followed by 1 loop where the head raises
-const int ANIM_SEQUENCE[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 2};
-const int SEQUENCE_LENGTH = 20;
-
-// Animate using the dynamic delay interval
-if (millis() - last_anim_tick > current_delay) {
-    last_anim_tick = millis();
-    
-    int current_val = (int)smoothed_rssi;
-    uint16_t houndColor = TFT_WHITE;
-    int step_time = 300;
-
-    // Tactical Color Feedback & Speed based on signal strength (Hot/Cold logic)
-    if (current_val > -60) {
-        houndColor = COLOR_HOT_CHEST;  // Hot / Close
-        step_time = 100;               // Fast walk
-    } else if (current_val > -75) {
-        houndColor = COLOR_WARM;       // Warm / Medium
-        step_time = 300;               // Normal walk
-    } else {
-        houndColor = COLOR_COLD;       // Cold / Far
-        step_time = 600;               // Slow walk
-    }
-
-    int dog_x = HOUND_CENTER_X - (HOUND_WIDTH / 2); 
-    int dog_y = HOUND_BASELINE_Y - HOUND_HEIGHT; 
-
-    // Look up the actual frame (0, 1, or 2) from our sequence array
-    int current_frame = ANIM_SEQUENCE[sequence_index];
-
-    // Render the frame to the display
-    tft.drawBitmap(dog_x, dog_y, houndAnimation[current_frame], HOUND_WIDTH, HOUND_HEIGHT, houndColor, TFT_BLACK);
-    
-    // NOW determine how long THIS newly drawn frame should stay on screen
-    if (current_frame == 2) {
-        current_delay = 1000;      // Always lock to 1-second pause when looking up
-    } else {
-        current_delay = step_time; // Apply the dynamically calculated walking speed
-    }
-    
-    // Advance to the next step in the sequence, looping back to 0 at the end
-    sequence_index = (sequence_index + 1) % SEQUENCE_LENGTH; 
 }
-// -----------------------------------
+
+void updateFoxhuntRadar() {
+    // --- WAVE HOUND ANIMATION ENGINE ---
+    static unsigned long last_anim_tick = 0;
+    static int sequence_index = 0; // Tracks where we are in the script
+    static unsigned long current_delay = 300; // Tracks how long the current frame should stay on screen
+
+    // Define the custom animation script (0 = sniff, 1 = sniff/wag, 2 = look up)
+    // This yields 8 standard loops, followed by 1 loop where the head raises
+    const int ANIM_SEQUENCE[] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 2};
+    const int SEQUENCE_LENGTH = 20;
+
+    // Animate using the dynamic delay interval
+    if (millis() - last_anim_tick > current_delay) {
+        last_anim_tick = millis();
+        
+        int current_val = (int)smoothed_rssi;
+        uint16_t houndColor = TFT_WHITE;
+        int step_time = 300;
+
+        // Tactical Color Feedback & Speed based on signal strength (Hot/Cold logic)
+        if (current_val > -60) {
+            houndColor = COLOR_HOT_CHEST;  // Hot / Close
+            step_time = 100;               // Fast walk
+        } else if (current_val > -75) {
+            houndColor = COLOR_WARM;       // Warm / Medium
+            step_time = 300;               // Normal walk
+        } else {
+            houndColor = COLOR_COLD;       // Cold / Far
+            step_time = 600;               // Slow walk
+        }
+
+        int dog_x = HOUND_CENTER_X - (HOUND_WIDTH / 2); 
+        int dog_y = HOUND_BASELINE_Y - HOUND_HEIGHT; 
+
+        // Look up the actual frame (0, 1, or 2) from our sequence array
+        int current_frame = ANIM_SEQUENCE[sequence_index];
+
+        // Render the frame to the display
+        tft.drawBitmap(dog_x, dog_y, houndAnimation[current_frame], HOUND_WIDTH, HOUND_HEIGHT, houndColor, TFT_BLACK);
+        
+        // NOW determine how long THIS newly drawn frame should stay on screen
+        if (current_frame == 2) {
+            current_delay = 1000;      // Always lock to 1-second pause when looking up
+        } else {
+            current_delay = step_time; // Apply the dynamically calculated walking speed
+        }
+        
+        // Advance to the next step in the sequence, looping back to 0 at the end
+        sequence_index = (sequence_index + 1) % SEQUENCE_LENGTH; 
+    }
+    // -----------------------------------
 
     static unsigned long last_radar_update = 0;
 
@@ -4661,104 +4749,183 @@ if (millis() - last_anim_tick > current_delay) {
 
         last_radar_update = millis();
     }
-  }
-
-  if (currentState == SCREEN_CHART || currentState == SCREEN_FOXHUNT) {
-    static unsigned long lastTimer = 0;
-    //bool should_render = false; // Local render trigger MOVED TO TOP
-
-    tft.setTextWrap(false);
-
-    // ==========================================
-    // RADIO-AWARE TIMERS
-    // ==========================================
-    // Both Wi-Fi and AP modes need the Channel Hopper!
-    if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
-      if (!target_locked) {
-        if (millis() - lastTimer > HOP_INTERVAL) {
-          lastTimer = millis();
-          current_ch_idx++;
-
-          if (current_ch_idx >= NUM_CHANNELS) {
-            current_ch_idx = 0;
-            should_render = true;
-          }
-
-          esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
-
-          // THE FIX: Only draw the channel indicator if we are on the main chart!
-          if (currentState == SCREEN_CHART) {
-    // 1. Reduced width from 75 to 62 to prevent clipping the " | "
-    tft.fillRect(5, 0, 62, 20, TFT_BLACK);
-    
-    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-    tft.setTextDatum(TL_DATUM);
-    
-    tft.setTextColor(COLOR_HOT_CHEST);
-    // Match the colors we set in drawChartHeader!
-    //if (currentRadioMode == RADIO_AP) tft.setTextColor(TFT_GREEN);
-    //else if (currentRadioMode == RADIO_CHANNELS) tft.setTextColor(TFT_ORANGE);
-    //else tft.setTextColor(COLOR_HOT_CHEST); // Default to Wi-Fi mode color
-
-    char chStr[16];
-    sprintf(chStr, "CH: %02d", CHANNELS[current_ch_idx]);
-    
-    // 2. Changed y from 0 to 1 to match drawChartHeader() exactly
-    tft.drawString(chStr, 5, 1);
 }
-        }
-      }
-      else {
-        // High-speed drain for Foxhunting / Target Locking
-        if (millis() - lastTimer > LOCKED_UPDATE_INTERVAL) {
-          lastTimer = millis();
-          should_render = true;
-        }
-      }
-    } 
-    else if (currentRadioMode == RADIO_BLE) {
-      // BLE MODE WATERFALL
-      if (millis() - lastTimer > BLE_UPDATE_INTERVAL) { 
-        lastTimer = millis();
-        should_render = true; 
+
+void runProbeCorrelationEngine() {
+    static unsigned long last_correlation_run = 0;
+    
+    if (millis() - last_correlation_run > 5000) { 
+        last_correlation_run = millis();
         
-        // THE FIX: Only draw the BLE sniffing indicator if we are on the main chart!
-        if (currentState == SCREEN_CHART) {
-            tft.fillRect(5, 0, 200, 20, TFT_BLACK); 
-            tft.setFreeFont(&UbuntuMono_Regular9pt7b);
-            tft.setTextDatum(TL_DATUM);
-            tft.setTextColor(TFT_ORANGE);
-            tft.drawString("SNIFFING BLE DEVICES", 5, 4);
+        for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
+            if (probeList[i].generation == 0) continue; 
+            if ((probeList[i].mac[0] & 0x02) == 0) continue; // Only process randomized MACs
+
+            for (int j = i + 1; j < MAX_PROBE_SLOTS; j++) {
+                 if (probeList[j].generation == 0) continue;
+                 if ((probeList[j].mac[0] & 0x02) == 0) continue; 
+
+                 // --- THE MERGE TRIGGER ---
+                 if (isSameDevice(i, j)) {
+                     
+                     // 1. Update Rotations & Hits
+                     probeList[i].mac_rotations += probeList[j].mac_rotations;
+                     probeList[i].hits += probeList[j].hits;
+                     
+                     // 2. Adopt the most recent MAC address and timestamps
+                     if (probeList[j].last_seen > probeList[i].last_seen) {
+                         probeList[i].last_seen = probeList[j].last_seen;
+                         memcpy(probeList[i].mac, probeList[j].mac, 6); // Stay current with the target's rotation
+                     }
+                     
+                     // 3. Merge the Behavioral PNL Fingerprint
+                     probeList[i].pnl_hash |= probeList[j].pnl_hash;
+
+                     // ==========================================
+                     // 4. THE STACK-BUFFERED MERGE PROTOCOL
+                     // ==========================================
+                     // MAX_MERGE_SSIDS matches EMERGENCY_CUTOFF so no valid SSIDs
+                     // should be truncated. If j_ssid_count hits the cap, remaining
+                     // nodes are freed in 4b without migration — acceptable data loss
+                     // from a corrupted chain that exceeded the per-device limit.
+                     const int MAX_MERGE_SSIDS = EMERGENCY_CUTOFF;
+                     char j_ssids[MAX_MERGE_SSIDS][33];
+                     uint8_t j_ssid_count = 0;
+                     int node = probeList[j].first_ssid_idx;
+                     
+                     // 4a. Pre-collect J's SSIDs onto the stack
+                     while (node != -1 && j_ssid_count < MAX_MERGE_SSIDS) {
+                         if (strlen(ssidPool[node].text) > 0) {
+                             strncpy(j_ssids[j_ssid_count], ssidPool[node].text, 32);
+                             j_ssids[j_ssid_count][32] = '\0';
+                             j_ssid_count++;
+                         }
+                         node = ssidPool[node].next_node_idx;
+                     }
+
+                     // 4b. THE BURN PROTOCOL: Free J's pool nodes FIRST to reclaim SRAM
+                     int node_to_wipe = probeList[j].first_ssid_idx;
+                     int fail_safe = 0; 
+                     while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
+                         int next = ssidPool[node_to_wipe].next_node_idx;
+                         ssidPool[node_to_wipe].text[0] = '\0'; 
+                         ssidPool[node_to_wipe].next_node_idx = -1; 
+                         node_to_wipe = next;
+                         fail_safe++;
+                     }
+                     
+                     // 4c. Wipe J's array slot completely (The Sentinel Burn)
+                     memset(&probeList[j], 0, sizeof(ProbeRecordShared));
+                     
+                     // Restore the critical sentinels that cannot be 0
+                     probeList[j].first_ssid_idx = -1; 
+                     probeList[j].rssi = -100;         
+                     strncpy(probeList[j].vendor, "Unknown", 25);
+
+                     // 4d. Re-allocate unique SSIDs from the stack into I
+                     for (int s = 0; s < j_ssid_count; s++) {
+                         bool already_exists = false;
+                         bool added = false;
+                         probeList[i].first_ssid_idx = addSsidToPool(j_ssids[s], 
+                                                                     probeList[i].first_ssid_idx, 
+                                                                     already_exists, added, 
+                                                                     probeList[i].ssid_count);
+                         if (added) probeList[i].ssid_count++;
+                     }
+                 }
+            }
         }
-      }
     }
+}
 
-    if (should_render) {
-      pause_sniffing = true; 
-      
-     if (currentRadioMode == RADIO_WIFI) {
+bool updateRadioHopper() {
+    bool trigger_render = false; // Local render trigger
+
+    if (currentState == SCREEN_CHART || currentState == SCREEN_FOXHUNT) {
+        static unsigned long lastTimer = 0;
+
+        tft.setTextWrap(false);
+
         // ==========================================
-        // 1. WI-FI DATA PROCESSING PIPELINE
+        // RADIO-AWARE TIMERS
         // ==========================================
-        
-        // Snapshot the live buffer for the real-time UI/sorting
-        // (Using void* casts to safely bypass volatile memory warnings)
-        memcpy((void*)sortData, (void*)liveData, sizeof(liveData));
-        sortMacCount = liveMacCount;
-        sortOtherBytes = liveOtherBytes;
+        // Both Wi-Fi and AP modes need the Channel Hopper!
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
+            if (!target_locked) {
+                if (millis() - lastTimer > HOP_INTERVAL) {
+                    lastTimer = millis();
+                    current_ch_idx++;
 
-        // Drain the "Other Bytes" bucket into the historical session
-        sessionOtherBytes += liveOtherBytes;
-        
-        // Sync the Live Buffer into the Historical Session
-        for (int i = 0; i < liveMacCount; i++) {
-             
-          bool found = false;
+                    if (current_ch_idx >= NUM_CHANNELS) {
+                        current_ch_idx = 0;
+                        trigger_render = true; // Replaces should_render = true
+                    }
 
-          float rawDistance = calculateRfDistance(liveData[i].rssi, 0, RADIO_WIFI_24GHZ);
-          
-          // A. Inner j loop — session sync + bounds refresh
-          for (int j = 0; j < sessionMacCount; j++) {
+                    esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
+
+                    // THE FIX: Only draw the channel indicator if we are on the main chart!
+                    if (currentState == SCREEN_CHART) {
+                        // 1. Reduced width from 75 to 62 to prevent clipping the " | "
+                        tft.fillRect(5, 0, 62, 20, TFT_BLACK);
+                        
+                        tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+                        tft.setTextDatum(TL_DATUM);
+                        
+                        tft.setTextColor(COLOR_HOT_CHEST);
+
+                        char chStr[16];
+                        sprintf(chStr, "CH: %02d", CHANNELS[current_ch_idx]);
+                        
+                        // 2. Changed y from 0 to 1 to match drawChartHeader() exactly
+                        tft.drawString(chStr, 5, 1);
+                    }
+                }
+            }
+            else {
+                // High-speed drain for Foxhunting / Target Locking
+                if (millis() - lastTimer > LOCKED_UPDATE_INTERVAL) {
+                    lastTimer = millis();
+                    trigger_render = true; // Replaces should_render = true
+                }
+            }
+        } 
+        else if (currentRadioMode == RADIO_BLE) {
+            // BLE MODE WATERFALL
+            if (millis() - lastTimer > BLE_UPDATE_INTERVAL) { 
+                lastTimer = millis();
+                trigger_render = true; // Replaces should_render = true
+                
+                // THE FIX: Only draw the BLE sniffing indicator if we are on the main chart!
+                if (currentState == SCREEN_CHART) {
+                    tft.fillRect(5, 0, 200, 20, TFT_BLACK); 
+                    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+                    tft.setTextDatum(TL_DATUM);
+                    tft.setTextColor(COLOR_HOT_CHEST);
+                    tft.drawString("SNIFFING BLE DEVICES", 5, 4);
+                }
+            }
+        }
+    }
+    
+    return trigger_render;
+}
+
+void processWifiData() {
+    // Snapshot the live buffer for the real-time UI/sorting
+    memcpy((void*)sortData, (void*)liveData, sizeof(liveData));
+    sortMacCount = liveMacCount;
+    sortOtherBytes = liveOtherBytes;
+
+    // Drain the "Other Bytes" bucket into the historical session
+    sessionOtherBytes += liveOtherBytes;
+    
+    // Sync the Live Buffer into the Historical Session
+    for (int i = 0; i < liveMacCount; i++) {
+        bool found = false;
+        float rawDistance = calculateRfDistance(liveData[i].rssi, 0, RADIO_WIFI_24GHZ);
+        
+        // A. Inner j loop — session sync + bounds refresh
+        for (int j = 0; j < sessionMacCount; j++) {
             if (memcmp(sessionData[j].mac, (void*)liveData[i].mac, 6) == 0) {
                 sessionData[j].packets += liveData[i].packets;
                 sessionData[j].tx_bytes += liveData[i].tx_bytes;
@@ -4767,21 +4934,16 @@ if (millis() - last_anim_tick > current_delay) {
                 sessionData[j].sum_sq_bytes += liveData[i].sum_sq_bytes;
                 sessionData[j].rssi = liveData[i].rssi;
                 
-                if (liveData[i].rate > 0) {
-                    sessionData[j].rate = liveData[i].rate;
-                }
+                if (liveData[i].rate > 0) sessionData[j].rate = liveData[i].rate;
                 sessionData[j].last_seen = liveData[i].last_seen;
                 
-                // THE FIX: The Empty Window Gate
                 // Only stretch the session bounds if the liveData window actually
                 // captured a valid physical transmission (!= 0 and != -100).
-                // The `|| sessionData[j]... == 0` ensures it breaks out of the initial C++ ghost state.
                 if (liveData[i].rssi_min != 0) {
                     if (liveData[i].rssi_min < sessionData[j].rssi_min || sessionData[j].rssi_min == 0) {
                         sessionData[j].rssi_min = liveData[i].rssi_min;
                     }
                 }
-                
                 if (liveData[i].rssi_max != -100) {
                     if (liveData[i].rssi_max > sessionData[j].rssi_max || sessionData[j].rssi_max == 0) {
                         sessionData[j].rssi_max = liveData[i].rssi_max;
@@ -4789,1005 +4951,785 @@ if (millis() - last_anim_tick > current_delay) {
                 }
 
                 if (rawDistance > 0) {
-                    sessionData[j].smoothedDistance = 
-                        (0.2 * rawDistance) + (0.8 * sessionData[j].smoothedDistance);
+                    sessionData[j].smoothedDistance = (0.2 * rawDistance) + (0.8 * sessionData[j].smoothedDistance);
                 }
 
                 found = true;
                 break;
             }
-          }
+        }
 
-          // B. If it's a completely new MAC, claim a new slot OR Evict
-          if (!found) {
+        // B. If it's a completely new MAC, claim a new slot OR Evict
+        if (!found) {
             int targetIndex = 0;
 
             if (sessionMacCount < MAX_MACS) {
-              // 1. We have empty space, use it!
-              targetIndex = sessionMacCount;
-              sessionMacCount++;
+                targetIndex = sessionMacCount;
+                sessionMacCount++;
             } else {
-              // 2. Memory is full, execute LRU Eviction!
-              uint32_t oldestTime = 0xFFFFFFFF; 
-              for (int k = 0; k < MAX_MACS; k++) {
-                if (sessionData[k].last_seen < oldestTime) {
-                  oldestTime = sessionData[k].last_seen;
-                  targetIndex = k;
+                // Execute LRU Eviction!
+                uint32_t oldestTime = 0xFFFFFFFF; 
+                for (int k = 0; k < MAX_MACS; k++) {
+                    if (sessionData[k].last_seen < oldestTime) {
+                        oldestTime = sessionData[k].last_seen;
+                        targetIndex = k;
+                    }
                 }
-              }
-              
-              // 3. Overflow Bucket: Dump the evicted device's stats so global totals remain accurate!
-              sessionOtherBytes += (sessionData[targetIndex].tx_bytes + sessionData[targetIndex].rx_bytes);
+                // Dump the evicted device's stats so global totals remain accurate!
+                sessionOtherBytes += (sessionData[targetIndex].tx_bytes + sessionData[targetIndex].rx_bytes);
             }
 
-            // --- POPULATE THE TARGET SLOT ---
-            // 4. Bulk copy the entire raw packet struct into the target index
             memcpy((void*)&sessionData[targetIndex], (void*)&liveData[i], sizeof(MacRecord));
-            
-            // 5. Inject the math we calculated at the top of the pipeline
             sessionData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
-          }
-        } // <-- Ends the 'for (int i...)' loop safely!
+        }
+    } 
 
-        // Wipe the live buffer clean so the interrupt can refill it
-        memset((void*)liveData, 0, sizeof(liveData));
-        liveMacCount = 0;
-        liveOtherBytes = 0;
+    // Wipe the live buffer clean so the interrupt can refill it
+    memset((void*)liveData, 0, sizeof(liveData));
+    liveMacCount = 0;
+    liveOtherBytes = 0;
 
-        // ==========================================
-        // 2. SORTING & UI PREPARATION
-        // ==========================================
-        
-        // --- FAST INSERTION SORT: WI-FI SNAPSHOT ---
-        for (int i = 1; i < sortMacCount; i++) {
-          MacRecord key = sortData[i];
-          
-          // Dynamically grab the correct math based on the touch button!
-          double key_val = getSortMetric(key, currentSortMode); 
-          int j = i - 1;
+    // --- FAST INSERTION SORT: WI-FI SNAPSHOT ---
+    for (int i = 1; i < sortMacCount; i++) {
+        MacRecord key = sortData[i];
+        double key_val = getSortMetric(key, currentSortMode); 
+        int j = i - 1;
 
-          if (sort_descending) {
+        if (sort_descending) {
             while (j >= 0 && getSortMetric(sortData[j], currentSortMode) < key_val) {
-              sortData[j + 1] = sortData[j];
-              j = j - 1;
+                sortData[j + 1] = sortData[j];
+                j = j - 1;
             }
-          } else {
-            // Preserved safety catch: keeps 0-value items at the bottom!
+        } else {
             while (j >= 0 && getSortMetric(sortData[j], currentSortMode) > key_val && key_val > 0.0) {
-              sortData[j + 1] = sortData[j];
-              j = j - 1;
+                sortData[j + 1] = sortData[j];
+                j = j - 1;
             }
-          }
-          sortData[j + 1] = key;
         }
+        sortData[j + 1] = key;
+    }
 
-        // --- FAST INSERTION SORT: WI-FI SESSION ---
-        for (int i = 1; i < sessionMacCount; i++) {
-          MacRecord key = sessionData[i];
-          
-          // Dynamically grab the correct math based on the touch button!
-          double key_val = getSortMetric(key, currentSortMode); 
-          int j = i - 1;
+    // --- FAST INSERTION SORT: WI-FI SESSION ---
+    for (int i = 1; i < sessionMacCount; i++) {
+        MacRecord key = sessionData[i];
+        double key_val = getSortMetric(key, currentSortMode); 
+        int j = i - 1;
 
-          if (sort_descending) {
+        if (sort_descending) {
             while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) < key_val) {
-              sessionData[j + 1] = sessionData[j];
-              j = j - 1;
+                sessionData[j + 1] = sessionData[j];
+                j = j - 1;
             }
-          } else {
-            // Preserved safety catch: keeps 0-value items at the bottom!
+        } else {
             while (j >= 0 && getSortMetric(sessionData[j], currentSortMode) > key_val && key_val > 0.0) {
-              sessionData[j + 1] = sessionData[j];
-              j = j - 1;
+                sessionData[j + 1] = sessionData[j];
+                j = j - 1;
             }
-          }
-          sessionData[j + 1] = key;
         }
+        sessionData[j + 1] = key;
+    }
 
-        // ==========================================
-        // Calculate "Other" for the live waterfall chart
-        // ==========================================
-        // 1. Start with any packets that overflowed the buffer entirely
-        sortOtherBytes = liveOtherBytes; 
+    // Calculate "Other" for the live waterfall chart
+    sortOtherBytes = liveOtherBytes; 
+    for(int i = 6; i < sortMacCount; i++) {
+        sortOtherBytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
+    }
+
+    // Attempt Vendor Resolution
+    for(int i = 0; i < 10 && i < sortMacCount; i++) resolveMacVendor(&sortData[i]);
+    for(int i = 0; i < 10 && i < sessionMacCount; i++) resolveMacVendor(&sessionData[i]);
+}
+
+void processBleData() {
+    memcpy(sortBleData, (void*)liveBleData, sizeof(liveBleData));
+    sortBleCount = liveBleCount;
+
+    for (int i = 0; i < liveBleCount; i++) {
+        bool found = false;
+        float rawDistance = calculateRfDistance(liveBleData[i].rssi, liveBleData[i].txPower, RADIO_BLE_24GHZ);
         
-        // 2. Add the TOTAL BYTES of everything from index 6 onwards, 
-        //    regardless of what metric the array is currently sorted by!
-        for(int i = 6; i < sortMacCount; i++) {
-          sortOtherBytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
-        }
-
-        // 3. Attempt Vendor Resolution for ONLY the top 8 visible devices
-        for(int i = 0; i < 6 && i < sortMacCount; i++) {
-          resolveMacVendor(&sortData[i]);
-        }
-        // 4. NEW: Resolve vendors for the Top 6 all-time session devices!
-        for(int i = 0; i < 6 && i < sessionMacCount; i++) {
-          resolveMacVendor(&sessionData[i]);
-        }
-      }
-      else if (currentRadioMode == RADIO_BLE) {
-        // ==========================================
-        // 2. BLE DATA PROCESSING PIPELINE
-        // ==========================================
-        // Snapshot the live data for the waterfall
-        memcpy(sortBleData, (void*)liveBleData, sizeof(liveBleData));
-        sortBleCount = liveBleCount;
-
-        for (int i = 0; i < liveBleCount; i++) {
-          // --- INJECT FOXHUNT TRACKER ---
-          // Notice the explicit (void*) cast added to the MAC
-          bool found = false;
-          float rawDistance = calculateRfDistance(liveBleData[i].rssi, liveBleData[i].txPower, RADIO_BLE_24GHZ);
-          
-          for (int j = 0; j < sessionBleCount; j++) {
-            
-            // CRITICAL FIX 1: Use memcmp for raw byte arrays, NOT strcmp!
+        for (int j = 0; j < sessionBleCount; j++) {
             if (memcmp(sessionBleData[j].mac, (void*)(uint8_t*)liveBleData[i].mac, 6) == 0) {
-                
                 sessionBleData[j].hits += liveBleData[i].hits;
                 sessionBleData[j].rssi = liveBleData[i].rssi;
-                sessionBleData[j].txPower = liveBleData[i].txPower; // Keep the math engine fed with fresh data!
-
-                // CRITICAL FIX 2: Propagate the fresh timestamp from the live buffer!
+                sessionBleData[j].txPower = liveBleData[i].txPower; 
                 sessionBleData[j].lastSeen = liveBleData[i].lastSeen;
 
-                // EMA smooth the distance into the session record
                 if (rawDistance > 0) {
-                    sessionBleData[j].smoothedDistance =
-                        (0.2 * rawDistance) + (0.8 * sessionBleData[j].smoothedDistance);
+                    sessionBleData[j].smoothedDistance = (0.2 * rawDistance) + (0.8 * sessionBleData[j].smoothedDistance);
                 }
 
-                // --- NEW: HYBRID OSINT PROPAGATION ---
-                
-                // 1. Handle the dynamic Name string exactly as you did before
                 if (liveBleData[i].name[0] != '\0') {
                     strncpy((char*)sessionBleData[j].name, (char*)liveBleData[i].name, 24);
-                    sessionBleData[j].name[24] = '\0'; // Guarantee safe termination
+                    sessionBleData[j].name[24] = '\0'; 
                 }
                 
-                // 2. Replace the massive string copies with tiny ID assignments
-                if (liveBleData[i].trackerType != TRACKER_NONE) {
-                    sessionBleData[j].trackerType = liveBleData[i].trackerType;
-                }
-                if (liveBleData[i].appearanceId != 0) {
-                    sessionBleData[j].appearanceId = liveBleData[i].appearanceId;
-                }
-                if (liveBleData[i].serviceId != 0) {
-                    sessionBleData[j].serviceId = liveBleData[i].serviceId;
-                }
+                if (liveBleData[i].trackerType != TRACKER_NONE) sessionBleData[j].trackerType = liveBleData[i].trackerType;
+                if (liveBleData[i].appearanceId != 0) sessionBleData[j].appearanceId = liveBleData[i].appearanceId;
+                if (liveBleData[i].serviceId != 0) sessionBleData[j].serviceId = liveBleData[i].serviceId;
 
                 found = true;
                 break;
             }
-          }
+        }
 
-          // B. If it's a completely new device, claim a new slot OR Evict
-          if (!found) {
+        if (!found) {
             int targetIndex = 0;
 
             if (sessionBleCount < MAX_BLE_DEVICES) {
-              // 1. We have empty space, use it!
-              targetIndex = sessionBleCount;
-              sessionBleCount++;
+                targetIndex = sessionBleCount;
+                sessionBleCount++;
             } else {
-              // 2. Memory is full, execute LRU Eviction!
-              uint32_t oldestTime = 0xFFFFFFFF; 
-              for (int k = 0; k < MAX_BLE_DEVICES; k++) {
-                // Note: using camelCase lastSeen for BLE struct
-                if (sessionBleData[k].lastSeen < oldestTime) {
-                  oldestTime = sessionBleData[k].lastSeen;
-                  targetIndex = k;
+                uint32_t oldestTime = 0xFFFFFFFF; 
+                for (int k = 0; k < MAX_BLE_DEVICES; k++) {
+                    if (sessionBleData[k].lastSeen < oldestTime) {
+                        oldestTime = sessionBleData[k].lastSeen;
+                        targetIndex = k;
+                    }
                 }
-              }
-              // (No overflow bucket needed for BLE since we don't track packet byte sizes)
             }
 
-            // --- POPULATE THE TARGET SLOT ---
-            // 3. Bulk copy the entire raw packet struct into the target index
             memcpy((void*)&sessionBleData[targetIndex], (void*)&liveBleData[i], sizeof(BLERecord));
-            
-            // 4. Inject the math we calculated at the top of the pipeline
             sessionBleData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
-          }
         }
+    }
 
-        // Dump the bucket for the next scanning wave
-        memset((void*)liveBleData, 0, sizeof(liveBleData));
-        liveBleCount = 0;
+    memset((void*)liveBleData, 0, sizeof(liveBleData));
+    liveBleCount = 0;
 
-        // --- FAST INSERTION SORT: BLE SNAPSHOT (WATERFALL) ---
-        for (int i = 1; i < sortBleCount; i++) {
-          BLERecord key = sortBleData[i];
-          double key_val = getBleSortMetric(key, currentBleSortMode);
-          int j = i - 1;
+    // --- FAST INSERTION SORT: BLE SNAPSHOT ---
+    for (int i = 1; i < sortBleCount; i++) {
+        BLERecord key = sortBleData[i];
+        double key_val = getBleSortMetric(key, currentBleSortMode);
+        int j = i - 1;
 
-          if (sort_descending) {
+        if (sort_descending) {
             while (j >= 0 && getBleSortMetric(sortBleData[j], currentBleSortMode) < key_val) {
-              sortBleData[j + 1] = sortBleData[j];
-              j = j - 1;
+                sortBleData[j + 1] = sortBleData[j];
+                j = j - 1;
             }
-          } else {
-            // Safety catch: explicitly check 'hits' so empty memory slots stay at the bottom
+        } else {
             while (j >= 0 && getBleSortMetric(sortBleData[j], currentBleSortMode) > key_val && key.hits > 0) {
-              sortBleData[j + 1] = sortBleData[j];
-              j = j - 1;
+                sortBleData[j + 1] = sortBleData[j];
+                j = j - 1;
             }
-          }
-          sortBleData[j + 1] = key;
         }
+        sortBleData[j + 1] = key;
+    }
 
-        // --- FAST INSERTION SORT: BLE SESSION (SEEN DEVICES) ---
-        for (int i = 1; i < sessionBleCount; i++) {
-          BLERecord key = sessionBleData[i];
-          double key_val = getBleSortMetric(key, currentBleSortMode);
-          int j = i - 1;
+    // --- FAST INSERTION SORT: BLE SESSION ---
+    for (int i = 1; i < sessionBleCount; i++) {
+        BLERecord key = sessionBleData[i];
+        double key_val = getBleSortMetric(key, currentBleSortMode);
+        int j = i - 1;
 
-          if (sort_descending) {
+        if (sort_descending) {
             while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) < key_val) {
-              sessionBleData[j + 1] = sessionBleData[j];
-              j = j - 1;
+                sessionBleData[j + 1] = sessionBleData[j];
+                j = j - 1;
             }
-          } else {
+        } else {
             while (j >= 0 && getBleSortMetric(sessionBleData[j], currentBleSortMode) > key_val && key.hits > 0) {
-              sessionBleData[j + 1] = sessionBleData[j];
-              j = j - 1;
+                sessionBleData[j + 1] = sessionBleData[j];
+                j = j - 1;
             }
-          }
-          sessionBleData[j + 1] = key;
         }
-      }
-      else if (currentRadioMode == RADIO_AP) {
-        // ==========================================
-        // 3. AP NETWORK DATA PROCESSING PIPELINE
-        // ==========================================
-                
-        // 1. Snapshot the live data for the waterfall
-        memcpy((void*)sortApData, (void*)liveApData, sizeof(liveApData));
-        sortApCount = liveApCount;
-        
-        // 2. Sync to Historical Session
-        for (int i = 0; i < liveApCount; i++) {
-          bool found = false;
-          float rawDistance = calculateRfDistance(liveApData[i].rssi, 0, RADIO_WIFI_24GHZ);
+        sessionBleData[j + 1] = key;
+    }
+}
 
-          // A. Try to update an existing AP
-          for (int j = 0; j < sessionApCount; j++) {
+void processApData() {
+    //memcpy((void*)sortApData, (void*)liveApData, sizeof(liveApData));
+    //sortApCount = liveApCount;
+    sortApCount = 0;
+    for (int i = 0; i < liveApCount; i++) {
+        // Only push APs to the temporal legend/waterfall if they moved actual data in this cycle
+        if (liveApData[i].tx_bytes + liveApData[i].rx_bytes > 0) {
+            // Safely cast away volatile using memcpy for the single struct
+            memcpy((void*)&sortApData[sortApCount], (void*)&liveApData[i], sizeof(ApRecord));
+            sortApCount++;
+        }
+    }
+    
+    for (int i = 0; i < liveApCount; i++) {
+        bool found = false;
+        float rawDistance = calculateRfDistance(liveApData[i].rssi, 0, RADIO_WIFI_24GHZ);
+
+        for (int j = 0; j < sessionApCount; j++) {
             if (memcmp(sessionApData[j].bssid, (void*)liveApData[i].bssid, 6) == 0) {
-              
-              sessionApData[j].packets += liveApData[i].packets;
-              sessionApData[j].tx_bytes += liveApData[i].tx_bytes;
-              sessionApData[j].rx_bytes += liveApData[i].rx_bytes;
-              sessionApData[j].sum_bytes += liveApData[i].sum_bytes;
-              sessionApData[j].sum_sq_bytes += liveApData[i].sum_sq_bytes;
-              
-              sessionApData[j].last_seen = liveApData[i].last_seen;
-              sessionApData[j].rssi = liveApData[i].rssi;
-              if (liveApData[i].rssi_min < sessionApData[j].rssi_min || 
-                  sessionApData[j].rssi_min == 0) {
-                  sessionApData[j].rssi_min = liveApData[i].rssi_min;
-              }
-              if (liveApData[i].rssi_max > sessionApData[j].rssi_max || 
-                  sessionApData[j].rssi_max == 0) {
-                  sessionApData[j].rssi_max = liveApData[i].rssi_max;
-              }
-              sessionApData[j].channel = liveApData[i].channel;
-              if (sessionApData[j].country[0] == '\0' && liveApData[i].country[0] != '\0') {
-                  sessionApData[j].country[0] = liveApData[i].country[0];
-                  sessionApData[j].country[1] = liveApData[i].country[1];
-                  sessionApData[j].country[2] = '\0';
-              }
-              
-              // Only overwrite the historical rate if the new one is faster
-              if (liveApData[i].max_rate > sessionApData[j].max_rate) {
-                  sessionApData[j].max_rate = liveApData[i].max_rate;
-              }
-              
-              if (rawDistance > 0) {
-                  sessionApData[j].smoothedDistance = 
-                      (0.2 * rawDistance) + (0.8 * sessionApData[j].smoothedDistance);
-              }
-              
-              if (strcmp(sessionApData[j].ssid, "<UNKNOWN>") == 0 && strcmp((char*)liveApData[i].ssid, "<UNKNOWN>") != 0) {
-                strcpy((char*)sessionApData[j].ssid, (char*)liveApData[i].ssid);
-              }
-              
-              found = true; break;
+                sessionApData[j].packets += liveApData[i].packets;
+                sessionApData[j].tx_bytes += liveApData[i].tx_bytes;
+                sessionApData[j].rx_bytes += liveApData[i].rx_bytes;
+                sessionApData[j].sum_bytes += liveApData[i].sum_bytes;
+                sessionApData[j].sum_sq_bytes += liveApData[i].sum_sq_bytes;
+                
+                sessionApData[j].last_seen = liveApData[i].last_seen;
+                sessionApData[j].rssi = liveApData[i].rssi;
+                if (liveApData[i].rssi_min < sessionApData[j].rssi_min || sessionApData[j].rssi_min == 0) {
+                    sessionApData[j].rssi_min = liveApData[i].rssi_min;
+                }
+                if (liveApData[i].rssi_max > sessionApData[j].rssi_max || sessionApData[j].rssi_max == 0) {
+                    sessionApData[j].rssi_max = liveApData[i].rssi_max;
+                }
+                sessionApData[j].channel = liveApData[i].channel;
+                if (sessionApData[j].country[0] == '\0' && liveApData[i].country[0] != '\0') {
+                    sessionApData[j].country[0] = liveApData[i].country[0];
+                    sessionApData[j].country[1] = liveApData[i].country[1];
+                    sessionApData[j].country[2] = '\0';
+                }
+                
+                if (liveApData[i].max_rate > sessionApData[j].max_rate) {
+                    sessionApData[j].max_rate = liveApData[i].max_rate;
+                }
+                
+                if (rawDistance > 0) {
+                    sessionApData[j].smoothedDistance = (0.2 * rawDistance) + (0.8 * sessionApData[j].smoothedDistance);
+                }
+                
+                if (strcmp(sessionApData[j].ssid, "<UNKNOWN>") == 0 && strcmp((char*)liveApData[i].ssid, "<UNKNOWN>") != 0) {
+                    strlcpy((char*)sessionApData[j].ssid, (char*)liveApData[i].ssid, sizeof(sessionApData[j].ssid));
+                }
+                sessionApData[j].has_clone = liveApData[i].has_clone;
+                found = true; break;
             }
-          }
-          
-          // B. If it's a completely new AP, claim a new slot OR Evict
-          if (!found) {
+        }
+        
+        if (!found) {
             int targetIndex = -1;
 
             if (sessionApCount < MAX_AP_RECORDS) {
-              // Space available, claim the next slot
-              targetIndex = sessionApCount;
-              sessionApCount++;
+                targetIndex = sessionApCount;
+                sessionApCount++;
             } else {
-              // ==========================================
-              // THE STALE & WEAK HYBRID EVICTION (Sync)
-              // ==========================================
-              unsigned long now = millis();
-              int stalest_idx = 0;
-              int weakest_idx = 0;
-              unsigned long oldest_time = 0xFFFFFFFF;
-              int lowest_rssi = 127;
+                unsigned long now = millis();
+                int stalest_idx = 0;
+                int weakest_idx = 0;
+                unsigned long oldest_time = 0xFFFFFFFF;
+                int lowest_rssi = 127;
 
-              for (int k = 0; k < MAX_AP_RECORDS; k++) {
-                if (sessionApData[k].last_seen < oldest_time) {
-                  oldest_time = sessionApData[k].last_seen;
-                  stalest_idx = k;
+                for (int k = 0; k < MAX_AP_RECORDS; k++) {
+                    if (sessionApData[k].last_seen < oldest_time) {
+                        oldest_time = sessionApData[k].last_seen;
+                        stalest_idx = k;
+                    }
+                    if (sessionApData[k].rssi < lowest_rssi) {
+                        lowest_rssi = sessionApData[k].rssi;
+                        weakest_idx = k;
+                    }
                 }
-                if (sessionApData[k].rssi < lowest_rssi) {
-                  lowest_rssi = sessionApData[k].rssi;
-                  weakest_idx = k;
-                }
-              }
 
-              // 1. The Ghost Hunt
-              if ((now - oldest_time) > 60000) {
-                targetIndex = stalest_idx;
-              } 
-              // 2. The Weakest Link
-              else if (liveApData[i].rssi > lowest_rssi) {
-                targetIndex = weakest_idx;
-              }
+                if ((now - oldest_time) > 60000) targetIndex = stalest_idx;
+                else if (liveApData[i].rssi > lowest_rssi) targetIndex = weakest_idx;
             }
 
-            // If we claimed a slot, pull the data from the live buffer!
             if (targetIndex != -1) {
-               memcpy((void*)&sessionApData[targetIndex], (void*)&liveApData[i], sizeof(ApRecord));
-               sessionApData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
+                memcpy((void*)&sessionApData[targetIndex], (void*)&liveApData[i], sizeof(ApRecord));
+                sessionApData[targetIndex].smoothedDistance = (rawDistance > 0) ? rawDistance : 0.0;
             }
-          }
         }
-        
-        // 3. Clear the traffic counters, but PRESERVE THE DICTIONARY!
-        for (int i = 0; i < liveApCount; i++) {
-            liveApData[i].packets = 0;
-            liveApData[i].tx_bytes = 0;
-            liveApData[i].rx_bytes = 0;
-            liveApData[i].sum_bytes = 0;
-            liveApData[i].sum_sq_bytes = 0;
-            
-            // We intentionally do NOT reset max_rate, bssid, or ssid.
-            // We also intentionally do NOT reset liveApCount to 0!
-        }
-        
-        // 4. --- FAST INSERTION SORT: AP SNAPSHOT ---
-        for (int i = 1; i < sortApCount; i++) {
-          ApRecord key = sortApData[i];
-          double key_val = getSortMetric(key, currentSortMode);
-          int j = i - 1;
-          
-          if (sort_descending) {
-            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) < key_val) {
-              sortApData[j + 1] = sortApData[j];
-              j = j - 1;
-            }
-          } else {
-            // Safety catch: keeps 0-value items at the bottom
-            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) > key_val && key_val > 0.0) {
-              sortApData[j + 1] = sortApData[j];
-              j = j - 1;
-            }
-          }
-          sortApData[j + 1] = key;
-        }
-
-        // --- FAST INSERTION SORT: AP SESSION (SEEN DEVICES) ---
-        for (int i = 1; i < sessionApCount; i++) {
-          ApRecord key = sessionApData[i];
-          double key_val = getSortMetric(key, currentSortMode);
-          int j = i - 1;
-
-          if (sort_descending) {
-            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) < key_val) {
-              sessionApData[j + 1] = sessionApData[j];
-              j = j - 1;
-            }
-          } else {
-            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) > key_val && key_val > 0.0) {
-              sessionApData[j + 1] = sessionApData[j];
-              j = j - 1;
-            }
-          }
-          sessionApData[j + 1] = key;
-        }
-        
-        // 5. Calculate "Other" Bytes for the AP Waterfall
-        sortOtherBytes = 0; 
-        for(int i = 8; i < sortApCount; i++) {
-          sortOtherBytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
-        }
-      }
-      else if (currentRadioMode == RADIO_CHANNELS) {
-        // ==========================================
-        // 4. CHANNEL SPECTRUM PROCESSING PIPELINE
-        // ==========================================
-        // 1. Snapshot the live data for the waterfall
-        memcpy((void*)sortChannelData, (void*)liveChannelData, sizeof(liveChannelData));
-        sortChannelCount = liveChannelCount;
-        
-        // 2. Sync to Historical Session
-        for (int i = 0; i < liveChannelCount; i++) {
-          bool found = false;
-          for (int j = 0; j < sessionChannelCount; j++) {
-            if (sessionChannelData[j].channel == liveChannelData[i].channel) {
-              // 1. Accumulate Volume
-              sessionChannelData[j].packets += liveChannelData[i].packets;
-              sessionChannelData[j].tx_bytes += liveChannelData[i].tx_bytes;
-              sessionChannelData[j].rx_bytes += liveChannelData[i].rx_bytes;
-              sessionChannelData[j].sum_bytes += liveChannelData[i].sum_bytes;
-              sessionChannelData[j].sum_sq_bytes += liveChannelData[i].sum_sq_bytes;
-              sessionChannelData[j].last_seen = liveChannelData[i].last_seen;
-              
-              // 2. Overwrite EMA State (Sync the physics model)
-              sessionChannelData[j].avg_rssi = liveChannelData[i].avg_rssi;
-              sessionChannelData[j].ema_variance = liveChannelData[i].ema_variance;
-              sessionChannelData[j].prev_rssi = liveChannelData[i].prev_rssi;
-              sessionChannelData[j].ema_cov = liveChannelData[i].ema_cov;
-              
-              found = true; break;
-            }
-          }
-          
-          // (Keep the memcpy block exactly as it is below this, 
-          // because memcpy perfectly copies all the floats automatically for new channels!)
-          
-          if (!found && sessionChannelCount < MAX_CHANNEL_RECORDS) {
-             memcpy((void*)&sessionChannelData[sessionChannelCount], (void*)&liveChannelData[i], sizeof(ChannelRecord));
-             sessionChannelCount++;
-          }
-        }
-        
-        // 3. Clear traffic counters for the next hop
-        for (int i = 0; i < liveChannelCount; i++) {
-            liveChannelData[i].packets = 0;
-            liveChannelData[i].tx_bytes = 0;
-            liveChannelData[i].rx_bytes = 0;
-            liveChannelData[i].sum_bytes = 0;
-            liveChannelData[i].sum_sq_bytes = 0;
-        }
-        
-        // 4. --- DYNAMIC INSERTION SORT: CHANNEL SNAPSHOT ---
-        for (int i = 1; i < sortChannelCount; i++) {
-          ChannelRecord key = sortChannelData[i];
-          double key_val = getChannelMetric(key, currentSortMode);
-          int j = i - 1;
-          
-          if (sort_descending) {
-              while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) < key_val) {
-                sortChannelData[j + 1] = sortChannelData[j];
-                j = j - 1;
-              }
-          } else {
-              while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) > key_val && key_val != 0) {
-                sortChannelData[j + 1] = sortChannelData[j];
-                j = j - 1;
-              }
-          }
-          sortChannelData[j + 1] = key;
-        }
-
-        // --- DYNAMIC INSERTION SORT: CHANNEL SESSION (SEEN DEVICES) ---
-        for (int i = 1; i < sessionChannelCount; i++) {
-          ChannelRecord key = sessionChannelData[i];
-          double key_val = getChannelMetric(key, currentSortMode);
-          int j = i - 1;
-          
-          if (sort_descending) {
-              while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) < key_val) {
-                sessionChannelData[j + 1] = sessionChannelData[j];
-                j = j - 1;
-              }
-          } else {
-              while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) > key_val && key_val != 0) {
-                sessionChannelData[j + 1] = sessionChannelData[j];
-                j = j - 1;
-              }
-          }
-          sessionChannelData[j + 1] = key;
-        }
-                
-        // 5. Calculate "Other" Bytes for channels beyond the top 6
-        sortOtherBytes = 0; 
-        for(int i = 6; i < sortChannelCount; i++) {
-          sortOtherBytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
-        }
-      }
-
-      // ==========================================
-  // THE BACKGROUND CORRELATION & MERGE ENGINE
-  // ==========================================
-  static unsigned long last_correlation_run = 0;
-  
-  if (millis() - last_correlation_run > 5000) { 
-    last_correlation_run = millis();
-    
-    for (int i = 0; i < MAX_PROBE_SLOTS; i++) {
-      if (probeList[i].generation == 0) continue; 
-      if ((probeList[i].mac[0] & 0x02) == 0) continue; // Only process randomized MACs
-
-      for (int j = i + 1; j < MAX_PROBE_SLOTS; j++) {
-         if (probeList[j].generation == 0) continue;
-         if ((probeList[j].mac[0] & 0x02) == 0) continue; 
-
-         // --- THE MERGE TRIGGER ---
-         if (isSameDevice(i, j)) {
-             
-             // 1. Update Rotations & Hits
-             probeList[i].mac_rotations += probeList[j].mac_rotations;
-             probeList[i].hits += probeList[j].hits;
-             
-             // 2. Adopt the most recent MAC address and timestamps
-             if (probeList[j].last_seen > probeList[i].last_seen) {
-                 probeList[i].last_seen = probeList[j].last_seen;
-                 memcpy(probeList[i].mac, probeList[j].mac, 6); // Stay current with the target's rotation
-             }
-             
-             // 3. Merge the Behavioral PNL Fingerprint
-             probeList[i].pnl_hash |= probeList[j].pnl_hash;
-
-             // ==========================================
-             // 4. THE STACK-BUFFERED MERGE PROTOCOL
-             // ==========================================
-             // MAX_MERGE_SSIDS matches EMERGENCY_CUTOFF so no valid SSIDs
-             // should be truncated. If j_ssid_count hits the cap, remaining
-             // nodes are freed in 4b without migration — acceptable data loss
-             // from a corrupted chain that exceeded the per-device limit.
-             const int MAX_MERGE_SSIDS = EMERGENCY_CUTOFF;
-             char j_ssids[MAX_MERGE_SSIDS][33];
-             uint8_t j_ssid_count = 0;
-             int node = probeList[j].first_ssid_idx;
-             
-             // 4a. Pre-collect J's SSIDs onto the stack
-             while (node != -1 && j_ssid_count < MAX_MERGE_SSIDS) {
-                 if (strlen(ssidPool[node].text) > 0) {
-                     strncpy(j_ssids[j_ssid_count], ssidPool[node].text, 32);
-                     j_ssids[j_ssid_count][32] = '\0';
-                     j_ssid_count++;
-                 }
-                 node = ssidPool[node].next_node_idx;
-             }
-
-             // 4b. THE BURN PROTOCOL: Free J's pool nodes FIRST to reclaim SRAM
-             int node_to_wipe = probeList[j].first_ssid_idx;
-             int fail_safe = 0; 
-             while (node_to_wipe != -1 && fail_safe < TOTAL_SSID_POOL) {
-                 int next = ssidPool[node_to_wipe].next_node_idx;
-                 ssidPool[node_to_wipe].text[0] = '\0'; 
-                 ssidPool[node_to_wipe].next_node_idx = -1; 
-                 node_to_wipe = next;
-                 fail_safe++;
-             }
-             
-             // 4c. Wipe J's array slot completely (The Sentinel Burn)
-             memset(&probeList[j], 0, sizeof(ProbeRecordShared));
-             
-             // Restore the critical sentinels that cannot be 0
-             probeList[j].first_ssid_idx = -1; 
-             probeList[j].rssi = -100;         
-             strncpy(probeList[j].vendor, "Unknown", 25);
-
-             // 4d. Re-allocate unique SSIDs from the stack into I
-             for (int s = 0; s < j_ssid_count; s++) {
-                 bool already_exists = false;
-                 bool added = false;
-                 probeList[i].first_ssid_idx = addSsidToPool(j_ssids[s], 
-                                                             probeList[i].first_ssid_idx, 
-                                                             already_exists, added, 
-                                                             probeList[i].ssid_count);
-                 if (added) probeList[i].ssid_count++;
-             }
-             // (Old Step 5 was successfully deleted from here)
-         }
-      }
     }
-  }
-  // ==========================================
+    
+    // Clear the traffic counters, but PRESERVE THE DICTIONARY!
+    for (int i = 0; i < liveApCount; i++) {
+        liveApData[i].packets = 0;
+        liveApData[i].tx_bytes = 0;
+        liveApData[i].rx_bytes = 0;
+        liveApData[i].sum_bytes = 0;
+        liveApData[i].sum_sq_bytes = 0;
+    }
+    
+    // --- FAST INSERTION SORT: AP SNAPSHOT ---
+    for (int i = 1; i < sortApCount; i++) {
+        ApRecord key = sortApData[i];
+        double key_val = getSortMetric(key, currentSortMode);
+        int j = i - 1;
+        
+        if (sort_descending) {
+            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) < key_val) {
+                sortApData[j + 1] = sortApData[j];
+                j = j - 1;
+            }
+        } else {
+            while (j >= 0 && getSortMetric(sortApData[j], currentSortMode) > key_val && key_val > 0.0) {
+                sortApData[j + 1] = sortApData[j];
+                j = j - 1;
+            }
+        }
+        sortApData[j + 1] = key;
+    }
 
-      pause_sniffing = false;
+    // --- FAST INSERTION SORT: AP SESSION ---
+    for (int i = 1; i < sessionApCount; i++) {
+        ApRecord key = sessionApData[i];
+        double key_val = getSortMetric(key, currentSortMode);
+        int j = i - 1;
 
-      if (currentState == SCREEN_CHART) {
+        if (sort_descending) {
+            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) < key_val) {
+                sessionApData[j + 1] = sessionApData[j];
+                j = j - 1;
+            }
+        } else {
+            while (j >= 0 && getSortMetric(sessionApData[j], currentSortMode) > key_val && key_val > 0.0) {
+                sessionApData[j + 1] = sessionApData[j];
+                j = j - 1;
+            }
+        }
+        sessionApData[j + 1] = key;
+    }
+    
+    sortOtherBytes = 0; 
+    for(int i = 8; i < sortApCount; i++) {
+        sortOtherBytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
+    }
+}
 
-      // ==========================================
-      // 1. DRAW THE TEMPORAL DEVICE LEGEND (Middle)
-      // ==========================================
-      drawTemporalLegend();
-
-      // ==========================================
-      // 2. DRAW THE SESSION TOP LEADERBOARD (Top)
-      // ==========================================
-      drawPersistentTopN();
-
-      // --- WATERFALL CHART PLOTTING MATH ---
-      // THE SHIFT: Push the top of the chart down by 50 pixels to make room for the Top-6 grid
-      //int chart_start_y = HEADER_HEIGHT + 50; -->moved to global variable
-      // 1. Establish the Dual-Pane boundaries
-      int chart_area_height = CHART_BOTTOM - chart_start_y;
-      int split_y = chart_start_y + (chart_area_height * 3) / 4; // The 75% line chart_start_y
-      //int chart_area_height = CHART_BOTTOM - HEADER_HEIGHT;
-      //int split_y = HEADER_HEIGHT + (chart_area_height * 3) / 4; // The 75% line
-
-      // ==========================================
-      // 2. The ECG Scan Window (Wipes 44 pixels ahead)
-      // ==========================================
-      int ERASER_WIDTH = 44;
-      
-      // Pure wipe logic: Clears the void. Borders are drawn at the end to survive rescales.
-      if (current_x + ERASER_WIDTH <= 480) {
-          tft.fillRect(current_x, chart_start_y + 1, ERASER_WIDTH, CHART_BOTTOM - chart_start_y, TFT_BLACK);
-      } else {
-          int w1 = 480 - current_x;
-          tft.fillRect(current_x, chart_start_y + 1, w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
-          tft.fillRect(0, chart_start_y + 1, ERASER_WIDTH - w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
-      }
-
-      // 3. Draw the X-Axis Time Ticks & Separator Line
-      if (current_x % 60 == 0) {
-          // Draw the tall tick marks in chestnut
-          tft.drawLine(current_x, split_y - 3, current_x, split_y + 3, COLOR_HOT_CHEST);
-          tft.drawLine(current_x + 1, split_y - 3, current_x + 1, split_y + 3, COLOR_HOT_CHEST);
-      } else {
-          // Draw the solid separator line in chestnut when not on a tick mark
-          tft.drawPixel(current_x, split_y, COLOR_HOT_CHEST);
-          tft.drawPixel(current_x + 1, split_y, COLOR_HOT_CHEST);
-      }
-
-      int current_y = split_y - 1; // Top chart builds UP from the split line
-      uint32_t current_total_metric = 0; // Universal tracker for the bottom pane
-
-      if (currentRadioMode == RADIO_WIFI) {
-        // ==========================================
-        // WI-FI PLOTTING (Bytes & Log Scale)
-        // ==========================================
-        uint32_t total_bytes = sortOtherBytes;
-        for(int i = 0; i < 6 && i < sortMacCount; i++) {
-          total_bytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
+void processChannelData() {
+    memcpy((void*)sortChannelData, (void*)liveChannelData, sizeof(liveChannelData));
+    sortChannelCount = liveChannelCount;
+    
+    for (int i = 0; i < liveChannelCount; i++) {
+        bool found = false;
+        for (int j = 0; j < sessionChannelCount; j++) {
+            if (sessionChannelData[j].channel == liveChannelData[i].channel) {
+                sessionChannelData[j].packets += liveChannelData[i].packets;
+                sessionChannelData[j].tx_bytes += liveChannelData[i].tx_bytes;
+                sessionChannelData[j].rx_bytes += liveChannelData[i].rx_bytes;
+                sessionChannelData[j].sum_bytes += liveChannelData[i].sum_bytes;
+                sessionChannelData[j].sum_sq_bytes += liveChannelData[i].sum_sq_bytes;
+                sessionChannelData[j].last_seen = liveChannelData[i].last_seen;
+                
+                sessionChannelData[j].avg_rssi = liveChannelData[i].avg_rssi;
+                sessionChannelData[j].ema_variance = liveChannelData[i].ema_variance;
+                sessionChannelData[j].prev_rssi = liveChannelData[i].prev_rssi;
+                sessionChannelData[j].ema_cov = liveChannelData[i].ema_cov;
+                
+                found = true; break;
+            }
         }
         
+        if (!found && sessionChannelCount < MAX_CHANNEL_RECORDS) {
+            memcpy((void*)&sessionChannelData[sessionChannelCount], (void*)&liveChannelData[i], sizeof(ChannelRecord));
+            sessionChannelCount++;
+        }
+    }
+    
+    for (int i = 0; i < liveChannelCount; i++) {
+        liveChannelData[i].packets = 0;
+        liveChannelData[i].tx_bytes = 0;
+        liveChannelData[i].rx_bytes = 0;
+        liveChannelData[i].sum_bytes = 0;
+        liveChannelData[i].sum_sq_bytes = 0;
+    }
+    
+    // --- DYNAMIC INSERTION SORT: CHANNEL SNAPSHOT ---
+    for (int i = 1; i < sortChannelCount; i++) {
+        ChannelRecord key = sortChannelData[i];
+        double key_val = getChannelMetric(key, currentSortMode);
+        int j = i - 1;
+        
+        if (sort_descending) {
+            while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) < key_val) {
+                sortChannelData[j + 1] = sortChannelData[j];
+                j = j - 1;
+            }
+        } else {
+            while (j >= 0 && getChannelMetric(sortChannelData[j], currentSortMode) > key_val && key_val != 0) {
+                sortChannelData[j + 1] = sortChannelData[j];
+                j = j - 1;
+            }
+        }
+        sortChannelData[j + 1] = key;
+    }
+
+    // --- DYNAMIC INSERTION SORT: CHANNEL SESSION ---
+    for (int i = 1; i < sessionChannelCount; i++) {
+        ChannelRecord key = sessionChannelData[i];
+        double key_val = getChannelMetric(key, currentSortMode);
+        int j = i - 1;
+        
+        if (sort_descending) {
+            while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) < key_val) {
+                sessionChannelData[j + 1] = sessionChannelData[j];
+                j = j - 1;
+            }
+        } else {
+            while (j >= 0 && getChannelMetric(sessionChannelData[j], currentSortMode) > key_val && key_val != 0) {
+                sessionChannelData[j + 1] = sessionChannelData[j];
+                j = j - 1;
+            }
+        }
+        sessionChannelData[j + 1] = key;
+    }
+            
+    sortOtherBytes = 0; 
+    for(int i = 6; i < sortChannelCount; i++) {
+        sortOtherBytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+    }
+}
+
+void drawWaterfallChart() {
+    drawTemporalLegend();
+    drawPersistentTopN();
+
+    int chart_area_height = CHART_BOTTOM - chart_start_y;
+    int split_y = chart_start_y + (chart_area_height * 3) / 4; 
+    int ERASER_WIDTH = 44;
+    
+    // Pure wipe logic
+    if (current_x + ERASER_WIDTH <= 480) {
+        tft.fillRect(current_x, chart_start_y + 1, ERASER_WIDTH, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+    } else {
+        int w1 = 480 - current_x;
+        tft.fillRect(current_x, chart_start_y + 1, w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+        tft.fillRect(0, chart_start_y + 1, ERASER_WIDTH - w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+    }
+
+    // X-Axis Time Ticks
+    if (current_x % 60 == 0) {
+        tft.drawLine(current_x, split_y - 3, current_x, split_y + 3, COLOR_HOT_CHEST);
+        tft.drawLine(current_x + 1, split_y - 3, current_x + 1, split_y + 3, COLOR_HOT_CHEST);
+    } else {
+        tft.drawPixel(current_x, split_y, COLOR_HOT_CHEST);
+        tft.drawPixel(current_x + 1, split_y, COLOR_HOT_CHEST);
+    }
+
+    int current_y = split_y - 1; 
+    uint32_t current_total_metric = 0; 
+
+    // --- CHART PLOTTING ---
+    if (currentRadioMode == RADIO_WIFI) {
+        uint32_t total_bytes = sortOtherBytes;
+        for(int i = 0; i < 6 && i < sortMacCount; i++) total_bytes += (sortData[i].tx_bytes + sortData[i].rx_bytes);
         current_total_metric = total_bytes; 
 
         if (total_bytes > 0) {
-          double log_total = 0;
-          if (useLogScale) {
-            for(int j = 0; j < 6 && j < sortMacCount; j++) {
-              uint32_t device_total = sortData[j].tx_bytes + sortData[j].rx_bytes;
-              log_total += log10((double)device_total + 1.0);
+            double log_total = 0;
+            if (useLogScale) {
+                for(int j = 0; j < 6 && j < sortMacCount; j++) {
+                    uint32_t device_total = sortData[j].tx_bytes + sortData[j].rx_bytes;
+                    log_total += log10((double)device_total + 1.0);
+                }
+                log_total += log10((double)sortOtherBytes + 1.0);
             }
-            log_total += log10((double)sortOtherBytes + 1.0);
-          }
 
-          for(int i = 0; i < 6 && i < sortMacCount; i++) {
-            double fraction;
-            uint32_t current_device_bytes = sortData[i].tx_bytes + sortData[i].rx_bytes;
+            for(int i = 0; i < 6 && i < sortMacCount; i++) {
+                double fraction;
+                uint32_t current_device_bytes = sortData[i].tx_bytes + sortData[i].rx_bytes;
 
-            if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
-            else fraction = (double)current_device_bytes / (double)total_bytes;
+                if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
+                else fraction = (double)current_device_bytes / (double)total_bytes;
 
-            int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
-            if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
+                int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+                if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
-            tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-            current_y -= bar_height;
-          }
+                tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+                current_y -= bar_height;
+            }
 
-          if (sortOtherBytes > 0 && current_y > chart_start_y) {
-            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
-          } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortMacCount > 0) {
-            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortMacCount - 1]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortMacCount - 1]);
-          }
+            if (sortOtherBytes > 0 && current_y > chart_start_y) {
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+            } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortMacCount > 0) {
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortMacCount - 1]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortMacCount - 1]);
+            }
         }
-      }
-      else if (currentRadioMode == RADIO_BLE) {
-        // ==========================================
-        // BLE PLOTTING (Hits / Traffic volume)
-        // ==========================================
+    }
+    else if (currentRadioMode == RADIO_BLE) {
         uint32_t total_hits = 0;
         uint32_t other_hits = 0;
         int ble_count = (sortBleCount > 6) ? 6 : sortBleCount;
 
         for(int i = 0; i < ble_count; i++) total_hits += sortBleData[i].hits;
-
         if (sortBleCount > 6) {
-          for (int i = 6; i < sortBleCount; i++) other_hits += sortBleData[i].hits;
-          total_hits += other_hits; 
+            for (int i = 6; i < sortBleCount; i++) other_hits += sortBleData[i].hits;
+            total_hits += other_hits; 
         }
-
         current_total_metric = total_hits; 
 
         if (total_hits > 0) {
-          double log_total = 0;
-          if (useLogScale) {
-            for(int j = 0; j < ble_count; j++) log_total += log10((double)sortBleData[j].hits + 1.0);
-            if (other_hits > 0) log_total += log10((double)other_hits + 1.0);
-          }
-
-          for(int i = 0; i < ble_count; i++) {
-            double fraction;
-            if (useLogScale) fraction = log10((double)sortBleData[i].hits + 1.0) / log_total;
-            else fraction = (double)sortBleData[i].hits / (double)total_hits;
-            
-            int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
-            if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
-
-            tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-            current_y -= bar_height;
-          }
-          
-          if (other_hits > 0 && current_y > chart_start_y) {
-            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
-          } else if (other_hits == 0 && current_y > chart_start_y && ble_count > 0) {
-            tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[ble_count - 1]);
-            tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[ble_count - 1]);
-          }
-        }
-      }
-      else if (currentRadioMode == RADIO_AP) {
-          // ==========================================
-          // AP PLOTTING (Traffic Bytes)
-          // ==========================================
-          uint32_t total_bytes = sortOtherBytes;
-          for(int i = 0; i < 6 && i < sortApCount; i++) total_bytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
-
-          current_total_metric = total_bytes; 
-
-          if (total_bytes > 0) {
             double log_total = 0;
             if (useLogScale) {
-              for(int j = 0; j < 6 && j < sortApCount; j++) {
-                uint32_t device_total = sortApData[j].tx_bytes + sortApData[j].rx_bytes;
-                log_total += log10((double)device_total + 1.0);
-              }
-              log_total += log10((double)sortOtherBytes + 1.0);
+                for(int j = 0; j < ble_count; j++) log_total += log10((double)sortBleData[j].hits + 1.0);
+                if (other_hits > 0) log_total += log10((double)other_hits + 1.0);
+            }
+
+            for(int i = 0; i < ble_count; i++) {
+                double fraction;
+                if (useLogScale) fraction = log10((double)sortBleData[i].hits + 1.0) / log_total;
+                else fraction = (double)sortBleData[i].hits / (double)total_hits;
+                
+                int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+                if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
+
+                tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+                current_y -= bar_height;
+            }
+            
+            if (other_hits > 0 && current_y > chart_start_y) {
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+            } else if (other_hits == 0 && current_y > chart_start_y && ble_count > 0) {
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[ble_count - 1]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[ble_count - 1]);
+            }
+        }
+    }
+    else if (currentRadioMode == RADIO_AP) {
+        uint32_t total_bytes = sortOtherBytes;
+        for(int i = 0; i < 6 && i < sortApCount; i++) total_bytes += (sortApData[i].tx_bytes + sortApData[i].rx_bytes);
+        current_total_metric = total_bytes; 
+
+        if (total_bytes > 0) {
+            double log_total = 0;
+            if (useLogScale) {
+                for(int j = 0; j < 6 && j < sortApCount; j++) {
+                    uint32_t device_total = sortApData[j].tx_bytes + sortApData[j].rx_bytes;
+                    log_total += log10((double)device_total + 1.0);
+                }
+                log_total += log10((double)sortOtherBytes + 1.0);
             }
 
             for(int i = 0; i < 6 && i < sortApCount; i++) {
-              double fraction;
-              uint32_t current_device_bytes = sortApData[i].tx_bytes + sortApData[i].rx_bytes;
-              
-              if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
-              else fraction = (double)current_device_bytes / (double)total_bytes;
+                double fraction;
+                uint32_t current_device_bytes = sortApData[i].tx_bytes + sortApData[i].rx_bytes;
+                
+                if (useLogScale) fraction = log10((double)current_device_bytes + 1.0) / log_total;
+                else fraction = (double)current_device_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
-              if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
+                int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+                if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
-              tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-              current_y -= bar_height;
+                tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+                current_y -= bar_height;
             }
 
             if (sortOtherBytes > 0 && current_y > chart_start_y) {
-              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
             } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortApCount > 0) {
-              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortApCount - 1]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortApCount - 1]);
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortApCount - 1]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortApCount - 1]);
             }
-          }
-      }
-      else if (currentRadioMode == RADIO_CHANNELS) {
-          // ==========================================
-          // CHANNEL PLOTTING
-          // ==========================================
-          uint32_t total_bytes = sortOtherBytes;
-          for(int i = 0; i < 6 && i < sortChannelCount; i++) total_bytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+        }
+    }
+    else if (currentRadioMode == RADIO_CHANNELS) {
+        uint32_t total_bytes = sortOtherBytes;
+        for(int i = 0; i < 6 && i < sortChannelCount; i++) total_bytes += (sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes);
+        current_total_metric = total_bytes; 
 
-          current_total_metric = total_bytes; 
-
-          if (total_bytes > 0) {
+        if (total_bytes > 0) {
             double log_total = 0;
             if (useLogScale) {
-              for(int j = 0; j < 6 && j < sortChannelCount; j++) {
-                uint32_t c_total = sortChannelData[j].tx_bytes + sortChannelData[j].rx_bytes;
-                log_total += log10((double)c_total + 1.0);
-              }
-              log_total += log10((double)sortOtherBytes + 1.0);
+                for(int j = 0; j < 6 && j < sortChannelCount; j++) {
+                    uint32_t c_total = sortChannelData[j].tx_bytes + sortChannelData[j].rx_bytes;
+                    log_total += log10((double)c_total + 1.0);
+                }
+                log_total += log10((double)sortOtherBytes + 1.0);
             }
 
             for(int i = 0; i < 6 && i < sortChannelCount; i++) {
-              double fraction;
-              uint32_t current_c_bytes = sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes;
-              
-              if (useLogScale) fraction = log10((double)current_c_bytes + 1.0) / log_total;
-              else fraction = (double)current_c_bytes / (double)total_bytes;
+                double fraction;
+                uint32_t current_c_bytes = sortChannelData[i].tx_bytes + sortChannelData[i].rx_bytes;
+                
+                if (useLogScale) fraction = log10((double)current_c_bytes + 1.0) / log_total;
+                else fraction = (double)current_c_bytes / (double)total_bytes;
 
-              int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
-              if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
+                int bar_height = (int)(fraction * (split_y - chart_start_y - 1));
+                if (bar_height > (split_y - chart_start_y - 1)) bar_height = split_y - chart_start_y - 1;
 
-              tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
-              current_y -= bar_height;
+                tft.drawLine(current_x, current_y, current_x, current_y - bar_height, colors[i]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, current_y - bar_height, colors[i]);
+                current_y -= bar_height;
             }
 
             if (sortOtherBytes > 0 && current_y > chart_start_y) {
-              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[8]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[8]);
             } else if (sortOtherBytes == 0 && current_y > chart_start_y && sortChannelCount > 0) {
-              tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortChannelCount - 1]);
-              tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortChannelCount - 1]);
+                tft.drawLine(current_x, current_y, current_x, chart_start_y + 1, colors[sortChannelCount - 1]);
+                tft.drawLine(current_x + 1, current_y, current_x + 1, chart_start_y + 1, colors[sortChannelCount - 1]);
             }
-          }
-      }
-
-      // ==========================================
-      // BOTTOM PANE: ABSOLUTE VOLUME GRAPH & SCALING
-      // ==========================================
-      // Local statics to track context switches and sliding window
-      static RadioMode last_seen_mode = currentRadioMode;
-      static uint8_t last_seen_bssid[6] = {0}; 
-      
-      // Sliding window tracking
-      static uint32_t true_max = 10;
-      static uint16_t peak_h_index = 0;
-      
-      bool did_rescale = false; 
-
-      // Safety reset: Wipe the sliding window, scale, and history if context changed
-      if (currentRadioMode != last_seen_mode || memcmp(target_bssid, last_seen_bssid, 6) != 0) {
-          true_max = 10;
-          peak_h_index = 0;
-          absolute_max_traffic = 10; 
-          
-          last_seen_mode = currentRadioMode;
-          memcpy(last_seen_bssid, target_bssid, 6); 
-
-          memset(traffic_history, 0, sizeof(traffic_history));
-          did_rescale = true; 
-      }
-
-      int h_index = current_x / 2;
-      traffic_history[h_index] = current_total_metric; 
-
-      // ==========================================
-      // SLIDING WINDOW SCALING ENGINE
-      // ==========================================
-      if (current_total_metric > absolute_max_traffic) {
-          // 1. INSTANT UP-SCALE (Ceiling broken)
-          true_max = current_total_metric;
-          peak_h_index = h_index;
-          
-          absolute_max_traffic = current_total_metric + (current_total_metric / 5); 
-          did_rescale = true; 
-          
-      } else {
-          // Track if this is the highest value currently visible on screen
-          if (current_total_metric > true_max) {
-              true_max = current_total_metric;
-              peak_h_index = h_index;
-          }
-          
-          // 2. SLIDING DOWNSCALE (Old peak was overwritten)
-          // If the sweeping cursor just overwrote the old champion peak with a smaller value...
-          if (h_index == peak_h_index && current_total_metric < true_max) {
-              
-              // Rescan the entire visible array to find the NEW champion
-              true_max = 0;
-              for (int i = 0; i < 240; i++) {
-                  if (traffic_history[i] > true_max) {
-                      true_max = traffic_history[i];
-                      peak_h_index = i;
-                  }
-              }
-              
-              uint32_t next_scale = true_max + (true_max / 5);
-              if (next_scale < 10) next_scale = 10; // Floor safety
-              
-              // If the new highest peak is significantly smaller, drop the ceiling
-              if (next_scale < absolute_max_traffic) {
-                  absolute_max_traffic = next_scale;
-                  did_rescale = true; 
-              }
-          }
-      }
-
-      // ==========================================
-      // RENDERING (Consolidated for up & down scales)
-      // ==========================================
-      if (did_rescale) {
-          // A rescale triggered: Wipe and redraw the entire history array instantly
-          tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
-          // --- THE REPAIR: Draw the solid separator line across the whole screen ---
-          tft.drawLine(0, split_y, 480, split_y, COLOR_HOT_CHEST);
-
-          for (int c = 0; c < 240; c++) {
-              int px = c * 2;
-
-              // --- THE REPAIR: Redraw the bottom half of the tick marks ---
-              if (px % 60 == 0) {
-                  tft.drawLine(px, split_y + 1, px, split_y + 3, COLOR_HOT_CHEST);
-                  tft.drawLine(px + 1, split_y + 1, px + 1, split_y + 3, COLOR_HOT_CHEST);
-              }
-
-              if (traffic_history[c] > 0) {
-                  int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-                  if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
-                  
-                  tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, COLOR_HOT_CHEST);
-                  tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
-              }
-          }
-      } else {
-          // Normal plotting: Sweeping cursor
-          if (current_total_metric > 0) {
-              // Just draw the current traffic bar
-              int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
-              if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
-              
-              tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, COLOR_HOT_CHEST);
-              tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
-          }
-      }
-
-      // ==========================================
-      // FINAL OVERLAY: WINDOW BORDERS (Z-Order Top)
-      // ==========================================
-      tft.drawFastVLine(current_x + 2, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
-      
-      if (current_x + ERASER_WIDTH <= 480) {
-          tft.drawFastVLine(current_x + ERASER_WIDTH - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
-          
-          // REPAIR: Draw the horizontal line straight through the playhead gap
-          tft.drawFastHLine(current_x, split_y, ERASER_WIDTH, COLOR_HOT_CHEST);
-      } else {
-          int w1 = 480 - current_x;
-          tft.drawFastVLine(ERASER_WIDTH - w1 - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
-          
-          // REPAIR: Handle screen wrap for the horizontal line
-          tft.drawFastHLine(current_x, split_y, w1, COLOR_HOT_CHEST);
-          tft.drawFastHLine(0, split_y, ERASER_WIDTH - w1, COLOR_HOT_CHEST);
-      }
-
-      // ==========================================
-      // PUNCH-OUT Y-AXIS OVERLAY LABELS
-      // ==========================================
-      if (current_x <= 480 - ERASER_WIDTH || did_rescale) {
-          int text_x = current_x + 6; 
-          if (text_x > 480 - 40) text_x = 480 - 40; 
-
-          tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-          tft.setTextDatum(TL_DATUM);
-
-          tft.setTextColor(COLOR_HOT_CHEST);
-          tft.drawString("100%", text_x, chart_start_y + 4);
-          int mid_y = chart_start_y + ((split_y - chart_start_y) / 2);
-          tft.drawString("50%", text_x, mid_y - 6);
-
-          tft.setTextColor(COLOR_HOT_CHEST);
-          if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
-          else tft.drawString("|=2m", text_x, split_y - 15);
-
-          char maxStr[16];
-          if (currentRadioMode == RADIO_BLE) {
-              snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
-          } else {
-              if (absolute_max_traffic < 1024) snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
-              else if (absolute_max_traffic < 1048576) snprintf(maxStr, sizeof(maxStr), "%luK", absolute_max_traffic / 1024);
-              else if (absolute_max_traffic < 1073741824) snprintf(maxStr, sizeof(maxStr), "%luM", absolute_max_traffic / 1048576);
-              else snprintf(maxStr, sizeof(maxStr), "%.1fG", (float)absolute_max_traffic / 1073741824.0);
-          }
-          
-          tft.setTextColor(COLOR_HOT_CHEST);
-          //tft.setTextColor(TFT_GREEN);
-          tft.drawString(maxStr, text_x, split_y + 4);
-          tft.drawString("0", text_x, CHART_BOTTOM - 12);
-      }
-
-      // ==========================================
-      // END OF SWEEP
-      // ==========================================
-      current_x += 2;
-      if (current_x >= 480) {
-          current_x = 0;
-          // The old epoch down-scaling logic has been completely removed!
-      }
+        }
     }
-  }
+
+    // --- BOTTOM PANE: SCALING ENGINE ---
+    static RadioMode last_seen_mode = currentRadioMode;
+    static uint8_t last_seen_bssid[6] = {0}; 
+    
+    static uint32_t true_max = 10;
+    static uint16_t peak_h_index = 0;
+    
+    bool did_rescale = false; 
+
+    if (currentRadioMode != last_seen_mode || memcmp(target_bssid, last_seen_bssid, 6) != 0) {
+        true_max = 10;
+        peak_h_index = 0;
+        absolute_max_traffic = 10; 
+        
+        last_seen_mode = currentRadioMode;
+        memcpy(last_seen_bssid, target_bssid, 6); 
+
+        memset(traffic_history, 0, sizeof(traffic_history));
+        did_rescale = true; 
+    }
+
+    int h_index = current_x / 2;
+    traffic_history[h_index] = current_total_metric; 
+
+    if (current_total_metric > absolute_max_traffic) {
+        true_max = current_total_metric;
+        peak_h_index = h_index;
+        absolute_max_traffic = current_total_metric + (current_total_metric / 5); 
+        did_rescale = true; 
+    } else {
+        if (current_total_metric > true_max) {
+            true_max = current_total_metric;
+            peak_h_index = h_index;
+        }
+        
+        if (h_index == peak_h_index && current_total_metric < true_max) {
+            true_max = 0;
+            for (int i = 0; i < 240; i++) {
+                if (traffic_history[i] > true_max) {
+                    true_max = traffic_history[i];
+                    peak_h_index = i;
+                }
+            }
+            
+            uint32_t next_scale = true_max + (true_max / 5);
+            if (next_scale < 10) next_scale = 10; 
+            
+            if (next_scale < absolute_max_traffic) {
+                absolute_max_traffic = next_scale;
+                did_rescale = true; 
+            }
+        }
+    }
+
+    if (did_rescale) {
+        tft.fillRect(0, split_y + 1, 480, CHART_BOTTOM - split_y, TFT_BLACK);
+        tft.drawLine(0, split_y, 480, split_y, COLOR_HOT_CHEST);
+
+        for (int c = 0; c < 240; c++) {
+            int px = c * 2;
+            if (px % 60 == 0) {
+                tft.drawLine(px, split_y + 1, px, split_y + 3, COLOR_HOT_CHEST);
+                tft.drawLine(px + 1, split_y + 1, px + 1, split_y + 3, COLOR_HOT_CHEST);
+            }
+
+            if (traffic_history[c] > 0) {
+                int h = (int)(((double)traffic_history[c] / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+                if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
+                
+                tft.drawLine(px, CHART_BOTTOM, px, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+                tft.drawLine(px + 1, CHART_BOTTOM, px + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+            }
+        }
+    } else {
+        if (current_total_metric > 0) {
+            int h = (int)(((double)current_total_metric / (double)absolute_max_traffic) * (CHART_BOTTOM - split_y - 1));
+            if (h > CHART_BOTTOM - split_y - 4) h = CHART_BOTTOM - split_y - 4; 
+            
+            tft.drawLine(current_x, CHART_BOTTOM, current_x, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+            tft.drawLine(current_x + 1, CHART_BOTTOM, current_x + 1, CHART_BOTTOM - h, COLOR_HOT_CHEST);
+        }
+    }
+
+    // --- OVERLAYS ---
+    tft.drawFastVLine(current_x + 2, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+    
+    if (current_x + ERASER_WIDTH <= 480) {
+        tft.drawFastVLine(current_x + ERASER_WIDTH - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+        tft.drawFastHLine(current_x, split_y, ERASER_WIDTH, COLOR_HOT_CHEST);
+    } else {
+        int w1 = 480 - current_x;
+        tft.drawFastVLine(ERASER_WIDTH - w1 - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+        tft.drawFastHLine(current_x, split_y, w1, COLOR_HOT_CHEST);
+        tft.drawFastHLine(0, split_y, ERASER_WIDTH - w1, COLOR_HOT_CHEST);
+    }
+
+    if (current_x <= 480 - ERASER_WIDTH || did_rescale) {
+        int text_x = current_x + 6; 
+        if (text_x > 480 - 40) text_x = 480 - 40; 
+
+        tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+        tft.setTextDatum(TL_DATUM);
+
+        tft.setTextColor(COLOR_HOT_CHEST);
+        tft.drawString("100%", text_x, chart_start_y + 4);
+        int mid_y = chart_start_y + ((split_y - chart_start_y) / 2);
+        tft.drawString("50%", text_x, mid_y - 6);
+
+        if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
+        else tft.drawString("|=2m", text_x, split_y - 15);
+
+        char maxStr[16];
+        if (currentRadioMode == RADIO_BLE) {
+            snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
+        } else {
+            if (absolute_max_traffic < 1024) snprintf(maxStr, sizeof(maxStr), "%lu", absolute_max_traffic);
+            else if (absolute_max_traffic < 1048576) snprintf(maxStr, sizeof(maxStr), "%luK", absolute_max_traffic / 1024);
+            else if (absolute_max_traffic < 1073741824) snprintf(maxStr, sizeof(maxStr), "%luM", absolute_max_traffic / 1048576);
+            else snprintf(maxStr, sizeof(maxStr), "%.1fG", (float)absolute_max_traffic / 1073741824.0);
+        }
+        
+        tft.drawString(maxStr, text_x, split_y + 4);
+        tft.drawString("0", text_x, CHART_BOTTOM - 12);
+    }
+
+    current_x += 2;
+    if (current_x >= 480) current_x = 0;
 }
+
+void loop() {
+  processPendingVendors();
+  runProbeCorrelationEngine(); 
+  
+  uint16_t t_x = 0, t_y = 0;
+  bool should_render = false;
+
+  // 1. Check Touch inputs (State Controller)
+  if (tft.getTouch(&t_x, &t_y)) {
+      should_render = handleTouchInputs(t_x, t_y);
+  }
+    
+  // 2. Run the Channel Hopper
+  should_render |= updateRadioHopper();
+
+  // 3. CONTINUOUS DELTA-DRAW: Foxhunt Animation Engine
+  // (Must run every loop so the dog keeps walking even if signal is lost)
+  if (currentState == SCREEN_FOXHUNT) {
+      updateFoxhuntRadar();
+  }
+
+  // 4. EVENT-DRIVEN GATE: Heavy Math & Full UI Redraws
+  if (should_render) {
+    pause_sniffing = true; // Lock the radio buffers
+
+    // --- MATH ENGINES ---
+    if (currentRadioMode == RADIO_WIFI) processWifiData();
+    else if (currentRadioMode == RADIO_BLE) processBleData();
+    else if (currentRadioMode == RADIO_AP) processApData();
+    else if (currentRadioMode == RADIO_CHANNELS) processChannelData();
+
+    pause_sniffing = false; // Unlock immediately!
+
+    // --- FULL REDRAW GRAPHICS ENGINES ---
+    // Notice SCREEN_FOXHUNT is omitted here because it handles itself above!
+    if (currentState == SCREEN_CHART) {
+        drawWaterfallChart();
+    } else if (currentState == SCREEN_DEVICE_LIST) {
+        drawDeviceList();
+    } else if (currentState == SCREEN_AP_SCAN) {
+        drawApScanner();
+    } else if (currentState == SCREEN_PROBE_TRACKER) {
+        drawProbeTracker();
+    }
+    Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+  }
 }
