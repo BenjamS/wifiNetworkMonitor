@@ -796,51 +796,60 @@ void leakMonitorTask(void *pvParameters) {
 // ==========================================
 // CLEARTEXT EXTRACTOR 
 // ==========================================
-// ---------------------------------------------------------
-// CLEARTEXT EXTRACTOR (Aggregator)
-// Scans the entire payload, scraping all printable strings.
-// Replaces binary gaps and newlines with spaces.
-// ---------------------------------------------------------
-bool extractCleartext(const uint8_t* payload, uint16_t payload_len, char* output_buffer) {
+// Scans raw bytes for runs of printable ASCII, filtering out short noise
+// blips below min_run. This is the ONE generic "scrape for cleartext"
+// primitive — grammar-aware protocols (SSDP, mDNS, JSON) do NOT use this;
+// it's strictly the last-resort fallback for unknown/unstructured payloads.
+//
+// min_run:     minimum consecutive printable chars before a chunk is kept
+// flatten_ws:  if true, \n \r \t count as printable and render as a single
+//              space instead of breaking the run (matches old extractCleartext)
+// separator:   inserted between chunks on a gap (" | " for Step 13 style,
+//              " " for extractCleartext style)
+bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t max_len,
+                             uint8_t min_run = 4, bool flatten_ws = false,
+                             const char* separator = " | ") {
     uint16_t out_idx = 0;
-    uint16_t consecutive_printable = 0;
-    uint16_t max_consecutive = 0;
+    uint16_t consecutive = 0;
+    uint16_t printable_count = 0;
+    size_t sep_len = strlen(separator);
 
-    for (uint16_t i = 0; i < payload_len; i++) {
-        char c = (char)payload[i];
-        
-        // Check for printable ASCII or standard whitespace
-        if ((c >= 32 && c <= 126) || c == '\n' || c == '\t' || c == '\r') {
-            if (out_idx < (MAX_LEAK_STR_LEN - 1)) {
-                // Flatten newlines and tabs to spaces for clean TFT rendering
-                if (c == '\n' || c == '\r' || c == '\t') {
-                    c = ' ';
+    for (uint16_t i = 0; i < len && out_idx < (max_len - 4); i++) {
+        char c = (char)data[i];
+        bool is_ws = (c == '\n' || c == '\r' || c == '\t');
+        bool is_printable = (c >= 32 && c <= 126) || (flatten_ws && is_ws);
+
+        if (is_printable) {
+            consecutive++;
+            if (consecutive == min_run) {
+                for (uint8_t back = min_run; back >= 1 && out_idx < max_len - 1; back--) {
+                    char rc = (char)data[i - back + 1];
+                    if (flatten_ws && (rc == '\n' || rc == '\r' || rc == '\t')) rc = ' ';
+                    out[out_idx++] = rc;
                 }
-                output_buffer[out_idx++] = c;
-            }
-            
-            consecutive_printable++;
-            if (consecutive_printable > max_consecutive) {
-                max_consecutive = consecutive_printable;
+                printable_count += min_run;
+            } else if (consecutive > min_run && out_idx < max_len - 1) {
+                out[out_idx++] = (flatten_ws && is_ws) ? ' ' : c;
+                printable_count++;
             }
         } else {
-            // Binary byte hit. Reset the streak counter.
-            consecutive_printable = 0;
-            
-            // Insert a single space to cleanly separate different text chunks
-            if (out_idx > 0 && output_buffer[out_idx - 1] != ' ' && out_idx < (MAX_LEAK_STR_LEN - 1)) {
-                output_buffer[out_idx++] = ' ';
+            if (consecutive >= min_run && out_idx + sep_len < max_len - 1) {
+                memcpy(out + out_idx, separator, sep_len);
+                out_idx += sep_len;
             }
+            consecutive = 0;
         }
-        
-        // If we filled the buffer, stop scanning
-        if (out_idx >= (MAX_LEAK_STR_LEN - 1)) break;
     }
-    
-    output_buffer[out_idx] = '\0'; 
-    
-    // Return true only if we found at least one chunk of 10+ characters
-    return (max_consecutive >= 10);
+
+    out[out_idx] = '\0';
+    return printable_count > 10;
+}
+
+bool extractCleartext(const uint8_t* payload, uint16_t payload_len, char* output_buffer) {
+    // 4-char minimum run (filters noise blips), CR/LF/TAB flattened to spaces,
+    // single-space separator — preserves this function's original style.
+    return extract_printable_runs(payload, payload_len, output_buffer, MAX_LEAK_STR_LEN,
+                                   /*min_run=*/4, /*flatten_ws=*/true, /*separator=*/" ");
 }
 // ==========================================
 // PROTOCOL TRANSLATORS (NetBIOS, mDNS, Cast)
@@ -929,8 +938,9 @@ bool parse_netbios(const uint8_t* payload, uint16_t length, char* out_text, size
         uint8_t suffixByte = decodeNetbiosName(rawEncodedString, cleanName, sizeof(cleanName));
         const char* serviceType = getNetbiosSuffixStr(suffixByte);
 
-        // 3. Format it
-        snprintf(out_text, max_len, "NetBIOS: %s [%s]", cleanName, serviceType);
+        // 3. Format it (Updated to show both)
+        snprintf(out_text, max_len, "NBNS: [%s] -> %s [%s]", 
+                 rawEncodedString, cleanName, serviceType);
         return true; 
     }
     return false;
@@ -946,36 +956,59 @@ bool parse_nbds(const uint8_t* payload, uint16_t length, char* out_text, size_t 
     bool found_any = false;
 
     int cur_s = 0, cur_l = 0;
-    
-    // Loop one extra time with a virtual 0-byte to force the final string to process
+
     for (int i = 0; i <= length; i++) {
-        char c = (i < length) ? payload[i] : 0; 
-        
-        if (c >= 32 && c <= 126) { // Printable ASCII
+        char c = (i < length) ? payload[i] : 0;
+
+        if (c >= 32 && c <= 126) {
             if (cur_l == 0) cur_s = i;
             cur_l++;
         } else {
-            // Python equivalent of re.findall(rb"[ -~]{5,}")
-            if (cur_l >= 5) { 
-                char temp[64] = {0};
-                int copy_len = std::min(cur_l, 63);
-                memcpy(temp, &payload[cur_s], copy_len);
-                
-                // 1. Filter out boilerplate MAILSLOT / BROWSE headers
-                if (!strstr(temp, "MAILSLOT") && !strstr(temp, "BROWSE")) {
-                    
-                    // 2. Filter out raw A-P encoded blobs (length >= 16 of just A-P)
-                    bool is_ap_blob = (cur_l >= 16);
-                    for (int j = 0; j < copy_len && is_ap_blob; j++) {
-                        if (temp[j] < 'A' || temp[j] > 'P') is_ap_blob = false;
-                    }
-                    
-                    // 3. Deduplicate (ensure we haven't already added this exact name)
-                    if (!is_ap_blob && !strstr(out_text, temp)) {
-                        if (written < max_len) {
-                            // Append it to our growing string with a separator!
-                            written += snprintf(out_text + written, max_len - written, " [%s]", temp);
-                            found_any = true;
+            if (cur_l >= 5) {
+                // Trim a leading/trailing space — NBT name fields are prefixed with a
+                // 0x20 length byte, which is itself printable and merges into the same
+                // run as the encoded name that follows it.
+                int seg_s = cur_s;
+                int seg_l = cur_l;
+                while (seg_l > 0 && payload[seg_s] == ' ') { seg_s++; seg_l--; }
+                while (seg_l > 0 && payload[seg_s + seg_l - 1] == ' ') { seg_l--; }
+
+                if (seg_l >= 5) {
+                    char temp[64] = {0};
+                    int copy_len = std::min(seg_l, 63);
+                    memcpy(temp, &payload[seg_s], copy_len);
+
+                    if (!strstr(temp, "MAILSLOT") && !strstr(temp, "BROWSE")) {
+                        // A real NetBIOS-encoded name is always exactly 32 A-P chars
+                        // (16 bytes x 2 nibbles). Requiring the exact length (not just
+                        // >=16) avoids misidentifying partial/truncated runs as names.
+                        bool is_ap_blob = (seg_l == 32);
+                        for (int j = 0; j < copy_len && is_ap_blob; j++) {
+                            if (temp[j] < 'A' || temp[j] > 'P') is_ap_blob = false;
+                        }
+
+                        if (is_ap_blob) {
+                            // Decode it instead of dropping it — this is the actual
+                            // "translation" step that was missing.
+                            char decoded[17] = {0};
+                            uint8_t suffix = decodeNetbiosName(temp, decoded, sizeof(decoded));
+                            
+                            // ==========================================
+                            // NEW "DOUBLE-KEY" PRINTING LOGIC GOES HERE
+                            // ==========================================
+                            if (decoded[0] != '\0' && !strstr(out_text, decoded) && written < (int)max_len) {
+                                written += snprintf(out_text + written, max_len - written,
+                                                     " [%s] -> %s [%s]", 
+                                                     temp, decoded, getNetbiosSuffixStr(suffix));
+                                found_any = true;
+                            }
+                            // ==========================================
+                            
+                        } else if (!strstr(out_text, temp)) {
+                            if (written < (int)max_len) {
+                                written += snprintf(out_text + written, max_len - written, " [%s]", temp);
+                                found_any = true;
+                            }
                         }
                     }
                 }
@@ -1420,6 +1453,64 @@ int decode_dns_name(const uint8_t* payload, uint16_t length, int offset, char* o
     return jumped ? original_offset : offset;
 }
 
+static inline uint16_t read_u16(const uint8_t* p, uint16_t len, int offset) {
+    if (offset < 0 || offset + 1 >= len) return 0;
+    return (p[offset] << 8) | p[offset + 1];
+}
+
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, char* out_text, size_t max_len) {
+    if (length < 12) return false;
+
+    uint16_t qdcount = (payload[4] << 8) | payload[5];
+    uint16_t ancount = (payload[6] << 8) | payload[7];
+    if (qdcount == 0 && ancount == 0) return false;
+
+    const char* proto = (dst_port == 5353) ? "mDNS" : "DNS";
+    int written = snprintf(out_text, max_len, "%s %uQ,%uA:", proto, qdcount, ancount);
+    int cursor = 12;
+
+    // --- Questions ---
+    for (uint16_t q = 0; q < qdcount && cursor < length && written < (int)max_len - 1; q++) {
+        char qname[96] = {0};
+        int next = decode_dns_name(payload, length, cursor, qname, sizeof(qname));
+        if (next <= cursor) break;           // malformed name, bail safely
+        cursor = next;
+
+        uint16_t qtype = read_u16(payload, length, cursor);
+        cursor += 4;                          // QTYPE + QCLASS
+
+        int n = snprintf(out_text + written, max_len - written, " Q:%s(%u)", qname, qtype);
+        written = std::min((int)max_len - 1, written + n);
+    }
+
+    // --- Answers ---
+    for (uint16_t a = 0; a < ancount && cursor < length && written < (int)max_len - 1; a++) {
+        char aname[96] = {0};
+        int next = decode_dns_name(payload, length, cursor, aname, sizeof(aname));
+        if (next <= cursor) break;
+        cursor = next;
+
+        uint16_t atype  = read_u16(payload, length, cursor);
+        uint16_t rdlen  = read_u16(payload, length, cursor + 8);
+        int rdata_off   = cursor + 10;         // past TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+
+        if (atype == 12 && rdata_off < length) {  // PTR
+            char target[96] = {0};
+            decode_dns_name(payload, length, rdata_off, target, sizeof(target));
+            int n = snprintf(out_text + written, max_len - written, " A:%s->%s", aname, target);
+            written = std::min((int)max_len - 1, written + n);
+        } else {
+            int n = snprintf(out_text + written, max_len - written, " A:%s(t%u)", aname, atype);
+            written = std::min((int)max_len - 1, written + n);
+        }
+
+        cursor = rdata_off + rdlen;   // always skip the full RDATA, decoded or not
+    }
+
+    return true;
+}
+
+/*
 // ---------------------------------------------------------
 // DNS & mDNS PARSER (Ports 53, 5353)
 // Extracts requested domains, local hostnames, and TXT specs
@@ -1483,6 +1574,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
 
     return false;
 }
+*/
 
 // ---------------------------------------------------------
 // SSDP VERBOSE PARSER (Port 1900)
@@ -1756,77 +1848,199 @@ bool parse_snmp(const uint8_t* payload, uint16_t length, char* out_text, size_t 
 // GENERIC JSON CATCH-ALL
 // Tries to extract useful data from unknown proprietary JSON UDP protocols
 // ---------------------------------------------------------
+// Finds "outer_key": { ... }, then searches for inner_key strictly inside that
+// object's span (via brace matching), mirroring Python's data['body']['deviceInfo']['model'].
+bool extract_nested_json_val(const char* json, uint16_t json_len,
+                              const char* outer_key, const char* inner_key,
+                              char* out, size_t out_max) {
+    char pattern[32];
+    int plen = snprintf(pattern, sizeof(pattern), "\"%s\"", outer_key);
+
+    const char* search_end = json + json_len - plen;
+    const char* key_pos = nullptr;
+    for (const char* c = json; c <= search_end; c++) {
+        if (memcmp(c, pattern, plen) == 0) { key_pos = c; break; }
+    }
+    if (!key_pos) return false;
+
+    // Find the '{' that opens this key's object value
+    const char* json_end = json + json_len;
+    const char* obj_start = key_pos + plen;
+    while (obj_start < json_end && *obj_start != '{') obj_start++;
+    if (obj_start >= json_end) return false;
+
+    // Match the closing brace for THIS object only
+    int depth = 1;
+    const char* obj_end = obj_start + 1;
+    while (obj_end < json_end && depth > 0) {
+        if (*obj_end == '{') depth++;
+        else if (*obj_end == '}') depth--;
+        obj_end++;
+    }
+    if (depth != 0) return false; // truncated mid-object — don't guess
+
+    return extract_json_val(obj_start, (uint16_t)(obj_end - obj_start), inner_key, out, out_max);
+}
+
+// Approximates what json.loads() gives you for free: rejects binary garbage that
+// happens to contain '{'/'}' bytes, while still tolerating a missing final '}'
+// from mid-capture truncation (unlike json.loads, which would just discard that too).
+bool looks_like_json(const char* s, uint16_t len) {
+    int depth = 0;
+    bool in_string = false;
+    for (uint16_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (in_string) {
+            if (c == '\\') { i++; continue; }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '{') { depth++; continue; }
+        if (c == '}') { depth--; if (depth < 0) return false; continue; }
+        if (!(isspace((unsigned char)c) || strchr(":,[]-+.eEtrufalsn0123456789", c))) {
+            return false; // a byte json.loads() would choke on
+        }
+    }
+    return true; // depth may be >0 here — that's fine, that's the truncation case
+}
+
 bool parse_generic_json(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     const char* p = (const char*)payload;
     const char* end = p + length;
-    
-    // 1. Find the first '{' and last '}'
     const char* json_start = nullptr;
     const char* json_end = nullptr;
-    
+
     for (int i = 0; i < length; i++) {
         if (!json_start && p[i] == '{') json_start = &p[i];
         if (p[i] == '}') json_end = &p[i];
     }
-    
+    if (json_start && !json_end) json_end = end - 1;
     if (!json_start || !json_end || json_end <= json_start) return false;
-    
-    // Narrow our scope to just the JSON portion
+    // Reject binary garbage that merely happens to contain '{'/'}' bytes
+
     uint16_t json_len = (json_end - json_start) + 1;
+    if (!looks_like_json(json_start, json_len)) return false;
     
     char model[64] = {0};
     char ip[32] = {0};
     char name[64] = {0};
-    
-    // 2. Surgically extract our target keys (ignores nesting!)
-    bool has_model = extract_json_val(json_start, json_len, "model", model, sizeof(model));
-    bool has_ip = extract_json_val(json_start, json_len, "ip", ip, sizeof(ip));
-    bool has_name = extract_json_val(json_start, json_len, "name", name, sizeof(name));
-    
-    int written = 0;
-    
-    // 3. Build the summary if we found any common keys
-    if (has_model || has_ip || has_name) {
-        written = snprintf(out_text, max_len, "JSON:");
-        if (has_model) written += snprintf(out_text + written, max_len - written, " model=%s", model);
-        if (has_ip) written += snprintf(out_text + written, max_len - written, " ip=%s", ip);
-        if (has_name) written += snprintf(out_text + written, max_len - written, " name=%s", name);
-        return true;
-    }
-    
-    // 4. Fallback: If no common keys, grab the first 3 key names we see
-    written = snprintf(out_text, max_len, "JSON Keys: ");
-    int keys_found = 0;
-    const char* curr = json_start;
-    
-    while (curr < json_end && keys_found < 3 && written < max_len - 5) {
-        // Look for "
-        const char* q_start = (const char*)memchr(curr, '"', json_end - curr);
-        if (!q_start) break;
-        
-        const char* q_end = (const char*)memchr(q_start + 1, '"', json_end - (q_start + 1));
-        if (!q_end) break;
-        
-        // Check if a colon follows shortly after the closing quote
-        const char* colon_check = q_end + 1;
-        while (colon_check < json_end && (*colon_check == ' ' || *colon_check == '\t')) colon_check++;
-        
-        if (colon_check < json_end && *colon_check == ':') {
-            // It's a key! Let's print it.
-            int key_len = std::min((int)(q_end - (q_start + 1)), 16); // limit key length for screen
-            written += snprintf(out_text + written, max_len - written, "%s%.*s", 
-                                (keys_found > 0) ? ", " : "", 
-                                key_len, q_start + 1);
-            keys_found++;
-        }
-        curr = colon_check + 1;
-    }
-    
-    if (keys_found > 0) return true;
-    
-    return false;
-}
 
+    bool has_model = extract_json_val(json_start, json_len, "model", model, sizeof(model));
+    if (!has_model) has_model = extract_nested_json_val(json_start, json_len, "deviceInfo", "model", model, sizeof(model));
+
+    bool has_ip = extract_json_val(json_start, json_len, "ip", ip, sizeof(ip));
+    if (!has_ip) has_ip = extract_nested_json_val(json_start, json_len, "deviceInfo", "ip", ip, sizeof(ip));
+
+    bool has_name = extract_json_val(json_start, json_len, "name", name, sizeof(name));
+    // (no Omada-style nested fallback for "name" in the Python reference, so left as-is)
+
+    // Single header write — everything below appends onto this, nothing resets it again.
+    int written = snprintf(out_text, max_len, "JSON:");
+    written = std::min((int)max_len - 1, written);
+    bool found_something = false;
+
+    // --- Step 3: known high-value keys (no early return anymore) ---
+    if (has_model) {
+        written += snprintf(out_text + written, max_len - written, " mod=%s", model);
+        written = std::min((int)max_len - 1, written);
+        found_something = true;
+    }
+    if (has_ip) {
+        written += snprintf(out_text + written, max_len - written, " ip=%s", ip);
+        written = std::min((int)max_len - 1, written);
+        found_something = true;
+    }
+    if (has_name) {
+        written += snprintf(out_text + written, max_len - written, " name=%s", name);
+        written = std::min((int)max_len - 1, written);
+        found_something = true;
+    }
+
+    // --- Step 4: fall through unconditionally to grab other root-level keys ---
+    int keys_found = 0;
+    int brace_depth = 0;
+    bool any_root_key_written = false;
+    const char* curr = json_start;
+
+    while (curr <= json_end && keys_found < 8 && written < (int)max_len - 1) {
+        if (*curr == '{') {
+            brace_depth++;
+        } else if (*curr == '}') {
+            brace_depth--;
+        } else if (*curr == '"' && brace_depth == 1) {
+            const char* q_start = curr;
+            const char* q_end = nullptr;
+            for (const char* c = q_start + 1; c <= json_end; c++) {
+                if (*c == '"' && *(c - 1) != '\\') { q_end = c; break; }
+            }
+            if (q_end) {
+                const char* colon_check = q_end + 1;
+                while (colon_check <= json_end && (*colon_check == ' ' || *colon_check == '\t')) colon_check++;
+                if (colon_check <= json_end && *colon_check == ':') {
+    int key_len = std::min((int)(q_end - (q_start + 1)), 12);
+
+    // Find where the value starts (skip colon + whitespace)
+    const char* val_start = colon_check + 1;
+    while (val_start <= json_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
+
+    char value_buf[24] = {0};
+    bool has_scalar_value = false;
+
+    if (val_start <= json_end) {
+        if (*val_start == '"') {
+            // String value — find closing quote, respecting escaped quotes
+            const char* v_end = nullptr;
+            for (const char* c = val_start + 1; c <= json_end; c++) {
+                if (*c == '"' && *(c - 1) != '\\') { v_end = c; break; }
+            }
+            if (v_end) {
+                int vlen = std::min((int)(v_end - (val_start + 1)), (int)sizeof(value_buf) - 1);
+                memcpy(value_buf, val_start + 1, vlen);
+                value_buf[vlen] = '\0';
+                has_scalar_value = true;
+            }
+        } else if (*val_start != '{' && *val_start != '[') {
+            // Number / bool / null — scan until a JSON delimiter
+            const char* v_end = val_start;
+            while (v_end <= json_end && *v_end != ',' && *v_end != '}' &&
+                   *v_end != ']' && *v_end != ' ' && *v_end != '\t' && *v_end != '\n') {
+                v_end++;
+            }
+            int vlen = std::min((int)(v_end - val_start), (int)sizeof(value_buf) - 1);
+            memcpy(value_buf, val_start, vlen);
+            value_buf[vlen] = '\0';
+            has_scalar_value = true;
+        }
+        // If it's '{' or '[', leave has_scalar_value false — nested object/array.
+        // We don't try to render it inline; the outer loop's existing brace_depth
+        // tracking already walks through it character-by-character on its own,
+        // exactly as it does today for the "data" key's nested object.
+    }
+
+    const char* sep = any_root_key_written ? "," : (found_something ? " keys:" : " ");
+    int n;
+    if (has_scalar_value) {
+        n = snprintf(out_text + written, max_len - written, "%s%.*s=%s",
+                     sep, key_len, q_start + 1, value_buf);
+    } else {
+        n = snprintf(out_text + written, max_len - written, "%s%.*s",
+                     sep, key_len, q_start + 1);
+    }
+    written = std::min((int)max_len - 1, written + n);
+    any_root_key_written = true;
+    keys_found++;
+
+}
+curr = q_end;   // always skip past this quoted string — key or value, doesn't matter
+
+            }
+        }
+        curr++;
+    }
+
+    return found_something || keys_found > 0;
+}
 // ---------------------------------------------------------
 // ARP PARSER (Extracts IP to MAC mappings)
 // ---------------------------------------------------------
@@ -2527,7 +2741,8 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                 custom_extracted = parse_arp(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
             }
             // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
-            if (captured_dst_port == 67 || captured_dst_port == 68) {
+            // FIXED: Changed to 'else if' to maintain the conditional chain
+            else if (captured_dst_port == 67 || captured_dst_port == 68) {
                 custom_extracted = parse_dhcp_v4(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
             }            
             // --- 2. DHCPv6 Extraction (Ports 546, 547) ---
@@ -2579,31 +2794,36 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                 snprintf(temp_text, MAX_LEAK_STR_LEN, "NAT-PMP: Apple Port Mapping");
                 custom_extracted = true;
             }
-            // --- 10. TCP Cleartext and Connection Flags ---
-            else if (captured_protocol == 6) {
-                // 1. Try to scrape text from the payload
-                if (body_len > 0 && extractCleartext(frame_body, body_len, temp_text)) {
+            // --- 10. Payload-Based Catch-Alls (Evaluates both TCP and UDP) ---
+            else if (body_len > 0) {
+                // Try JSON first (most structured)
+                if (parse_generic_json(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN)) {
                     custom_extracted = true;
-                } 
-                // 2. If no text, check if it's a new connection (SYN)
-                else if (tcp_flags & 0x02) { 
+                }
+                // Fallback to generic text scraping
+                else if (extractCleartext(frame_body, body_len, temp_text)) {
+                    custom_extracted = true;
+                }
+                // If binary (non-text), optionally log TCP or UDP metrics
+                else if (captured_protocol == 6) {
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP Data: %d->%d (%d bytes)", captured_src_port, captured_dst_port, body_len);
+                    custom_extracted = true;
+                }
+                else if (captured_protocol == 17) {
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "UDP Data: %d->%d (%d bytes)", captured_src_port, captured_dst_port, body_len);
+                    custom_extracted = true;
+                }
+            }
+            // --- 11. TCP Connection Flags (Empty Payloads) ---
+            else if (captured_protocol == 6) {
+                if (tcp_flags & 0x02) { 
                     snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP SYN (Port %d)", captured_dst_port); 
                     custom_extracted = true; 
                 } 
-                // 3. Or a connection reset (RST)
                 else if (tcp_flags & 0x04) { 
                     snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", captured_dst_port); 
                     custom_extracted = true; 
                 } 
-                // 4. (Optional) Log binary data packets
-                else if (body_len > 0) {
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP Data: %d->%d (%d bytes)", captured_src_port, captured_dst_port, body_len);
-                    custom_extracted = true;
-                }
-            }
-            // --- 11. Catch-All Generic JSON Parser ---
-            else {
-                custom_extracted = parse_generic_json(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
             }
 
             // --- 12. ICMPv6 Neighbor Discovery ---
@@ -2627,44 +2847,9 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
             // --- 13. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
             // If absolutely nothing else caught it, scan the raw bytes for text
             if (!custom_extracted && body_len > 0) {
-                uint16_t printable_count = 0;
-                uint16_t consecutive = 0;
-                uint16_t text_idx = 0;
-                
-                for (uint16_t i = 0; i < body_len && text_idx < (MAX_LEAK_STR_LEN - 4); i++) {
-                    char c = frame_body[i];
-                    
-                    if (c >= 32 && c <= 126) { // Printable ASCII range
-                        consecutive++;
-                        if (consecutive == 4) {
-                            // Hit threshold! Retroactively copy the 3 previous chars
-                            temp_text[text_idx++] = frame_body[i-3];
-                            temp_text[text_idx++] = frame_body[i-2];
-                            temp_text[text_idx++] = frame_body[i-1];
-                            temp_text[text_idx++] = c;
-                            printable_count += 4;
-                        } else if (consecutive > 4) {
-                            // Already past threshold, just keep adding
-                            temp_text[text_idx++] = c;
-                            printable_count++;
-                        }
-                    } else {
-                        // Not a printable character
-                        if (consecutive >= 4) {
-                            // Add a visual separator (equivalent to Python's " | ".join())
-                            temp_text[text_idx++] = ' ';
-                            temp_text[text_idx++] = '|';
-                            temp_text[text_idx++] = ' ';
-                        }
-                        consecutive = 0; // Reset streak
-                    }
-                }
-                
-                // If we found enough text, null terminate and trigger the queue push
-                if (printable_count > 10) {
-                    temp_text[text_idx] = '\0';
-                    custom_extracted = true;
-                }
+                custom_extracted = extract_printable_runs(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN,
+                                               /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/" | ");
+
             }
             
             // =========================================================
