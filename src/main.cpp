@@ -63,60 +63,117 @@ int target_rssi = 0;
 SdFs sd;
 
 // ==========================================
-// LEAKY LAYER 2 GLOBALS
+// WAVE HOUND LAYER 2 & LIVE DUMP GLOBALS
 // ==========================================
 #define MAX_LEAK_STR_LEN 256
-
-struct CleartextLeak {
-    uint32_t timestamp;           // 4 bytes 
-    uint16_t src_port;            // 2 bytes
-    uint16_t dst_port;            // 2 bytes
-    uint8_t ip_version;   // 0 = none, 4 = IPv4, 6 = IPv6
-    uint8_t src_ip[16];   // Holds 4 bytes for IPv4, or 16 bytes for IPv6
-    uint8_t dst_ip[16];
-    uint8_t src_mac[6];           // 6 bytes
-    uint8_t dst_mac[6];           // 6 bytes
-    uint8_t frame_subtype;        // 1 byte  (e.g., 0x08 for QoS Data)
-    uint8_t direction;            // 1 byte  (0=AdHoc, 1=STA->AP, 2=AP->STA, 3=WDS)
-    uint8_t channel;              // 1 byte
-    uint8_t protocol;             // 1 byte  (e.g., 17 for UDP, 6 for TCP)
-    bool is_high_value;           // 1 byte
-    char text[MAX_LEAK_STR_LEN];  // N bytes 
-}; // (Total adds up perfectly with 1 byte of tail padding depending on string length)
-
-struct LeakHistoryEntry {
-    CleartextLeak leak;   // 4-byte aligned
-    uint32_t first_seen;  // 4 bytes 
-    uint16_t hitCount;    // 2 bytes
-    char src_vendor[9];   // 9 bytes (8 chars + null)
-    char dst_vendor[9];   // 9 bytes (8 chars + null)
-};
-
-#define MAX_LEAK_SLOTS 10
-LeakHistoryEntry leakHistory[MAX_LEAK_SLOTS];
-
-// The FreeRTOS Queue to pass data from Core 0 (Sniffer) to Core 1 (Display)
-QueueHandle_t leakQueue = NULL;
-
-// De-duplication Hash Ring (Uses exactly 129 bytes of RAM)
-uint32_t leak_hash_history[32] = {0};
-uint8_t leak_hash_idx = 0;
-
-// Pagination for the Cleartext Leaks UI
-uint8_t leak_current_page = 0;
-
-#define SEC_COOLDOWN_MS 5000 // 5 seconds (adjust to your preference)
+#define MAX_RAW_PAYLOAD 512 
+#define MAX_ACTIVE_FLOWS 64
+#define MAX_LEAK_SLOTS 25
+#define LIVE_DUMP_COOLDOWN_MS 30000 
+#define SEC_COOLDOWN_MS 5000 
 #define ALERT_CACHE_SIZE 8
 
-struct CryptoAlertCache {
-    uint8_t mac_src[6];
-    uint8_t mac_dst[6];
-    uint32_t last_alert_ms;
+// ------------------------------------------
+// CORE 0 CACHES
+// ------------------------------------------
+struct FlowRecord {
+    uint32_t flow_hash;       
+    uint32_t first_seen_ms;   
+    uint32_t last_seen_ms;
+    uint32_t last_printed_ms;
+    uint16_t count;
 };
+static FlowRecord flow_cache[MAX_ACTIVE_FLOWS];
 
+struct CryptoAlertCache {
+    uint32_t last_alert_ms;
+    uint8_t  mac_src[6];
+    uint8_t  mac_dst[6];
+};
 static CryptoAlertCache crypto_cache[ALERT_CACHE_SIZE];
 static uint8_t crypto_cache_idx = 0;
 
+uint32_t leak_hash_history[32] = {0};
+uint8_t  leak_hash_idx = 0;
+
+// ------------------------------------------
+// DUAL-CORE MESSAGE QUEUES & UNIFIED STRUCT
+// ------------------------------------------
+struct Layer2Capture {
+    // --- 4-Byte Types ---
+    uint32_t timestamp;
+    uint32_t flow_hash;
+    
+    // --- 2-Byte Types ---
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t frame_length; // True physical RF size
+    uint16_t payload_len;  // Length of raw_payload copied
+    uint16_t ether_type;
+    
+    // --- 1-Byte Types & Arrays ---
+    uint8_t  src_ip[16];
+    uint8_t  dst_ip[16];
+    uint8_t  src_mac[6];
+    uint8_t  dst_mac[6];
+    uint8_t  ip_version;
+    uint8_t  protocol;
+    uint8_t  channel;
+    uint8_t  direction;
+    uint8_t  frame_subtype;
+    uint8_t  tcp_flags;
+    bool     is_high_value;
+    
+    // --- UNION 1: BSSID to SSID ---
+    // ISR writes 6 bytes. Core 1 resolves it and safely overwrites with an 18-byte string.
+    union {
+        uint8_t bssid[6];          
+        char    network_ssid[18];  
+    };
+
+    // --- UNION 2: Raw Binary to ASCII ---
+    // ISR writes up to 512 bytes of binary. Core 1 parses it and overwrites with the ASCII translation.
+    union {
+        uint8_t raw_payload[MAX_RAW_PAYLOAD]; 
+        char    text[MAX_LEAK_STR_LEN];       
+    };
+};
+
+// ------------------------------------------
+// UI MEMORY (SNIFF LIST)
+// ------------------------------------------
+struct LeakHistoryEntry {
+    Layer2Capture leak;           // Uses the unified struct
+    uint32_t first_seen;          // 4 bytes 
+    uint32_t flow_hash;           // 4 bytes (Added for tracking Core 1 hits)
+    char     src_vendor[16];      // 16 bytes
+    char     dst_vendor[16];      // 16 bytes
+    uint16_t hitCount;            // 2 bytes
+};
+
+QueueHandle_t liveDumpQueue = NULL;
+QueueHandle_t leakQueue = NULL;
+uint8_t leak_current_page = 0;
+
+enum LeakSortMode {
+    SORT_LEAK_AGE,
+    SORT_LEAK_LENGTH,
+    SORT_LEAK_HITS
+};
+LeakSortMode currentLeakSort = SORT_LEAK_AGE; // Default
+
+// ==========================================
+// LAYER 2 WATERFALL GLOBALS
+// ==========================================
+volatile uint32_t l2_bytes_tick = 0;
+uint32_t l2_bytes_render = 0;
+#define MAX_TERMINAL_LINES 5
+Layer2Capture terminal_history[MAX_TERMINAL_LINES];
+uint16_t terminal_hits[MAX_TERMINAL_LINES] = {0};
+uint32_t terminal_first_seen[MAX_TERMINAL_LINES] = {0};
+// ------------------------------------------
+// FORMATTING HELPERS
+// ------------------------------------------
 const char* getSubtypeStr(uint8_t subtype) {
     switch (subtype) {
         case 0:  return "Data";
@@ -128,18 +185,16 @@ const char* getSubtypeStr(uint8_t subtype) {
         case 12: return "QoS Null";
         case 14: return "QoS CF-Poll";
         case 15: return "QoS Ack+Poll";
-        default: return "Reserved";
+        default: return "Mgmt/Ctrl";
     }
 }
 
 const char* getDirectionStr(uint8_t dir) {
-    // dir is derived from (payload[1] & 0x03)
-    // Bit 0 = To DS (Upload), Bit 1 = From DS (Download)
     switch(dir) {
-        case 0: return "STA<->STA"; // To_DS = 0, From_DS = 0
-        case 1: return "STA->AP";   // To_DS = 1, From_DS = 0
-        case 2: return "AP->STA";   // To_DS = 0, From_DS = 1
-        case 3: return "WDS";       // To_DS = 1, From_DS = 1
+        case 0: return "STA>STA"; 
+        case 1: return "STA>AP";   
+        case 2: return "AP>STA";   
+        case 3: return "WDS";       
         default: return "???";
     }
 }
@@ -147,6 +202,8 @@ const char* getDirectionStr(uint8_t dir) {
 const char* getProtocolStr(uint8_t proto) {
     if (proto == 17) return "UDP";
     if (proto == 6) return "TCP";
+    if (proto == 1) return "ICMP";
+    if (proto == 58) return "ICMPv6";
     return "RAW";
 }
 
@@ -155,12 +212,12 @@ void getIpString(uint8_t version, const uint8_t* ip_bytes, char* out_str, size_t
         snprintf(out_str, max_len, "%d.%d.%d.%d", 
                  ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
     } else if (version == 6) {
-        // Simplified IPv6 formatting (avoids complex zero-compression logic for speed)
+        // Now extracting the full 16-byte (128-bit) IPv6 address
         snprintf(out_str, max_len, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
                  ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
                  ip_bytes[4], ip_bytes[5], ip_bytes[6], ip_bytes[7],
                  ip_bytes[8], ip_bytes[9], ip_bytes[10], ip_bytes[11],
-                 ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]);
+                 ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]); 
     } else {
         snprintf(out_str, max_len, "None");
     }
@@ -171,7 +228,6 @@ void getIpString(uint8_t version, const uint8_t* ip_bytes, char* out_str, size_t
 // ==========================================
 uint32_t traffic_history[240] = {0}; // 480 width / 2px increments = 240 columns
 uint32_t absolute_max_traffic = 10;  // Seeded to prevent divide-by-zero
-
 // ==========================================
 // FOXHUNT STATE GLOBALS
 // ==========================================
@@ -248,7 +304,7 @@ const int PROBES_PER_PAGE = 5;
 // ==========================================
 // RADIO MODE STATE
 // ==========================================
-enum RadioMode { RADIO_WIFI, RADIO_BLE, RADIO_AP, RADIO_CHANNELS };
+enum RadioMode { RADIO_WIFI, RADIO_BLE, RADIO_AP, RADIO_CHANNELS, RADIO_LAYER2 };
 RadioMode currentRadioMode = RADIO_WIFI;
 
 // ==========================================
@@ -396,7 +452,6 @@ struct MacRecord {
 //Should be 80 bytes
 
 void resolveMacVendor(MacRecord* record);
-void drawLeakAlertToTFT(uint8_t* mac, const char* vendor, const char* payload, bool is_high_value); // Good practice to add this one too!
 
 struct OUICache {
   uint8_t oui[3];
@@ -461,6 +516,7 @@ static union {
   BLERecord sessionBleData[MAX_BLE_DEVICES];
   ApRecord sessionApData[MAX_AP_RECORDS]; 
   ChannelRecord sessionChannelData[MAX_CHANNEL_RECORDS];
+  LeakHistoryEntry leakHistory[MAX_LEAK_SLOTS];
 };
 uint16_t sessionMacCount = 0;
 uint32_t sessionOtherBytes = 0;
@@ -473,11 +529,13 @@ constexpr size_t wifi_size = sizeof(MacRecord) * MAX_MACS;
 constexpr size_t ble_size = sizeof(BLERecord) * MAX_BLE_DEVICES;     
 constexpr size_t ap_size = sizeof(ApRecord) * MAX_AP_RECORDS;        
 constexpr size_t channel_size = sizeof(ChannelRecord) * MAX_CHANNEL_RECORDS; 
+constexpr size_t leak_size = sizeof(LeakHistoryEntry) * MAX_LEAK_SLOTS;
 
 // Dynamically determine the true union boundary
 constexpr size_t max_size_1 = (ble_size > wifi_size) ? ble_size : wifi_size;
 constexpr size_t max_size_2 = (ap_size > channel_size) ? ap_size : channel_size;
-constexpr size_t union_size = (max_size_1 > max_size_2) ? max_size_1 : max_size_2;
+constexpr size_t max_size_3 = (leak_size > max_size_1) ? leak_size : max_size_1; 
+constexpr size_t union_size = (max_size_3 > max_size_2) ? max_size_3 : max_size_2;
 
 constexpr size_t static_non_union =
     (union_size * 3) +                                        // live + sort + session
@@ -531,6 +589,24 @@ uint16_t colors[9] = {
   TFT_DARKGREY          // [8] "Other" category (unchanged)
   //hex24to565(0xE07EB6), // [6] Pink
 };
+
+// FNV-1a 32-bit Hash
+uint32_t hash_flow(const uint8_t* data, size_t len, uint16_t sport, uint16_t dport) {
+    uint32_t hash = 2166136261u;
+    
+    // Hash the ports first
+    hash ^= (sport & 0xFF); hash *= 16777619;
+    hash ^= (sport >> 8);   hash *= 16777619;
+    hash ^= (dport & 0xFF); hash *= 16777619;
+    hash ^= (dport >> 8);   hash *= 16777619;
+
+    // Hash the payload
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619;
+    }
+    return hash;
+}
 
 // ==========================================
 // PHY RATE TO MBPS TRANSLATOR
@@ -713,84 +789,6 @@ void updateFoxhuntSignal(int packet_rssi) {
       foxhunt_rssi_max = packet_rssi;
       foxhunt_bounds_seeded = true;
   }
-}
-
-// ==========================================
-// TFT LEAK ALERT RENDERER
-// ==========================================
-void drawLeakAlertToTFT(uint8_t* mac, const char* vendor, const char* payload, bool is_high_value) {
-    // Save the current text settings if needed
-    
-    // Draw a prominent alert box
-    int box_y = 60; // Adjust based on your chart location
-    int box_h = 120;
-    
-    // Use a red border for high-value targets (HTTP/mDNS), yellow for general leaks
-    uint16_t borderColor = is_high_value ? TFT_RED : TFT_YELLOW;
-    
-    tft.fillRoundRect(10, box_y, 460, box_h, 8, TFT_DARKGREY);
-    tft.drawRoundRect(10, box_y, 460, box_h, 8, borderColor);
-    
-    // Title
-    tft.setTextColor(borderColor, TFT_DARKGREY);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString("CLEARTEXT LEAK DETECTED", 240, box_y + 10, 2);
-    
-    // MAC & Vendor
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    tft.setTextDatum(TL_DATUM);
-    char macStr[64];
-    sprintf(macStr, "SRC: %02X:%02X:%02X:%02X:%02X:%02X (%s)", 
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], vendor);
-    tft.drawString(macStr, 20, box_y + 35, 2);
-    
-    // Payload snippet (truncate if too long for screen)
-    tft.setTextColor(TFT_GREEN, TFT_DARKGREY);
-    char short_payload[60];
-    strncpy(short_payload, payload, 59);
-    short_payload[59] = '\0'; // Ensure null termination
-    tft.drawString(short_payload, 20, box_y + 60, 2);
-}
-
-// ==========================================
-// CORE 1: LEAK MONITOR TASK
-// ==========================================
-void leakMonitorTask(void *pvParameters) {
-    CleartextLeak leak;
-    MacRecord tempRec; // Temporary record for the SD card lookup
-
-    while (true) {
-        // Wait indefinitely for a leak to arrive in the queue
-        if (xQueueReceive(leakQueue, &leak, portMAX_DELAY)) {
-            
-            // 1. Prepare the MacRecord and resolve the vendor
-            memset(&tempRec, 0, sizeof(MacRecord)); // Clear out old data
-            
-            // Copy the MAC from the leak into your MacRecord struct
-            // CHANGE '.mac' IF YOUR STRUCT USES A DIFFERENT NAME
-            memcpy(tempRec.mac, leak.src_mac, 6); 
-            
-            // Pass the pointer to your resolver
-            resolveMacVendor(&tempRec); 
-            
-            // 2. Dump full details to Serial for debugging
-            Serial.println("\n====================================");
-            Serial.printf("🚨 CLEARTEXT LEAK 🚨 [%s]\n", leak.is_high_value ? "HIGH VALUE" : "STANDARD");
-            
-            // CHANGE '.vendor' IF YOUR STRUCT USES A DIFFERENT NAME
-            Serial.printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X | Vendor: %s\n",
-                          leak.src_mac[0], leak.src_mac[1], leak.src_mac[2],
-                          leak.src_mac[3], leak.src_mac[4], leak.src_mac[5], 
-                          tempRec.vendor);
-                          
-            Serial.println("Payload:");
-            Serial.println(leak.text);
-            Serial.println("====================================\n");
-
-            // 3. Render to the TFT Display
-            drawLeakAlertToTFT(leak.src_mac, tempRec.vendor, leak.text, leak.is_high_value);
-        }
-    }
 }
 
 // ==========================================
@@ -1453,6 +1451,70 @@ int decode_dns_name(const uint8_t* payload, uint16_t length, int offset, char* o
     return jumped ? original_offset : offset;
 }
 
+void format_reverse_lookups(char* text, size_t max_len) {
+    char temp_buffer[max_len];
+
+    // ----------------------------------------------------
+    // 1. IPv4 Reverse Lookup (.in-addr.arpa)
+    // ----------------------------------------------------
+    char* in_addr = strstr(text, "in-addr");
+    if (in_addr != NULL) {
+        int o1, o2, o3, o4;
+        char* ptr = text;
+        
+        while (ptr < in_addr) {
+            // Updated to look for standard dot notation instead of spaces
+            if (sscanf(ptr, "%d.%d.%d.%d.in-addr", &o4, &o3, &o2, &o1) == 4) {
+                // Reconstruct the original prefix (e.g., "mDNS 0Q,1A: ")
+                int prefix_len = ptr - text;
+                snprintf(temp_buffer, max_len, "%.*sReverse Query: %d.%d.%d.%d", 
+                         prefix_len, text, o1, o2, o3, o4);
+                strncpy(text, temp_buffer, max_len);
+                return;
+            }
+            ptr++;
+        }
+    }
+
+    // ----------------------------------------------------
+    // 2. IPv6 Reverse Lookup (.ip6.arpa)
+    // ----------------------------------------------------
+    char* ip6 = strstr(text, "ip6");
+    if (ip6 != NULL) {
+        char nibbles[32];
+        int n_idx = 0;
+        char* ptr = ip6 - 1;
+        
+        // Walk backwards to collect exactly 32 hex nibbles
+        while (ptr >= text && n_idx < 32) {
+            char c = *ptr;
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+                nibbles[n_idx++] = c; 
+            }
+            ptr--;
+        }
+        
+        if (n_idx == 32) {
+            char ipv6_str[40];
+            int out_idx = 0;
+            
+            // Reconstruct the IPv6 address with colons
+            for (int i = 0; i < 32; i++) {
+                ipv6_str[out_idx++] = nibbles[i];
+                if (i % 4 == 3 && i != 31) {
+                    ipv6_str[out_idx++] = ':';
+                }
+            }
+            ipv6_str[out_idx] = '\0';
+            
+            int prefix_len = (ptr + 1) - text;
+            snprintf(temp_buffer, max_len, "%.*s%s", prefix_len, text, ipv6_str);
+            strncpy(text, temp_buffer, max_len);
+            return;
+        }
+    }
+}
+
 static inline uint16_t read_u16(const uint8_t* p, uint16_t len, int offset) {
     if (offset < 0 || offset + 1 >= len) return 0;
     return (p[offset] << 8) | p[offset + 1];
@@ -1507,6 +1569,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
         cursor = rdata_off + rdlen;   // always skip the full RDATA, decoded or not
     }
 
+    format_reverse_lookups(out_text, max_len);
     return true;
 }
 
@@ -1650,7 +1713,7 @@ bool parse_ssdp(const uint8_t* payload, uint16_t length, char* out_text, size_t 
     else if (strncmp(target_val, "urn:schemas-upnp-org:service:", 29) == 0) clean_target += 29;
 
     // 4. Assemble the multiline string exactly as requested
-    int written = snprintf(out_text, max_len, "%s", first_line);
+    int written = snprintf(out_text, max_len, "SSDP %s", first_line);
     if (host[0]) written += snprintf(out_text + written, max_len - written, " | HOST=%s", host);
     if (clean_target[0]) written += snprintf(out_text + written, max_len - written, " | %s=%s", target_key, clean_target);
     
@@ -1688,10 +1751,10 @@ bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t
         if (qname[0] != '\0') {
             const char* type_str = is_response ? "Reply" : "Query";
             snprintf(out_text, max_len, "LLMNR [%s] Tgt: %s", type_str, qname);
+                format_reverse_lookups(out_text, max_len);
             return true;
         }
     }
-    
     return false;
 }
 
@@ -2620,9 +2683,10 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // ==========================================
   // LEAKY LAYER 2 CLEARTEXT EXTRACTOR
   // ==========================================
-  if (currentRadioMode == RADIO_WIFI) {
+  if (currentRadioMode == RADIO_LAYER2) { // <-- THE CRITICAL GATE
+      // 1. TALLY ABSOLUTE RF VOLUME (Before the gate!)
+      l2_bytes_tick += pkt->rx_ctrl.sig_len;
       
-      // TRICK 1: The Protected Bit Filter
       bool is_protected = (payload[1] & 0x40) != 0;
       
       if (!is_protected) {
@@ -2655,6 +2719,16 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   ether_type = (frame_body[6] << 8) | frame_body[7]; // <--- GRAB ETHERTYPE HERE  
                   frame_body += 8;
                   body_len -= 8;
+
+                  // --- NEW: 802.1Q VLAN TAG STRIPPING ---
+                  // If EtherType is 0x8100, the packet has a 4-byte VLAN tag injected before the IP header.
+                  if (ether_type == 0x8100 && body_len > 4) {
+                      // The real EtherType is located right after the 2-byte TCI (Tag Control Information)
+                      ether_type = (frame_body[2] << 8) | frame_body[3];
+                      frame_body += 4; // Step over the VLAN tag
+                      body_len -= 4;
+                  }
+                  // --------------------------------------
               }
 
               // 2. Check for IPv4 (First nibble is 4)
@@ -2693,6 +2767,23 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                           body_len = 0; // Prevent underflow if no payload
                       }
                   }
+                  // --- NEW: ICMPv4 (1) and Unknown Protocol Catch-All ---
+                  else if (frame_body[9] == 1 && body_len > (ip_header_len + 8)) {
+                      captured_protocol = 1; // ICMPv4
+                      
+                      // Strip IP header and 8-byte ICMP header to reach pure payload
+                      frame_body += (ip_header_len + 8);
+                      body_len -= (ip_header_len + 8);
+                  } else {
+                      // Unknown protocol (e.g. IGMP, GRE). 
+                      // Strip the IP header so payload catch-alls don't print garbage!
+                      if (body_len > ip_header_len) {
+                          frame_body += ip_header_len;
+                          body_len -= ip_header_len;
+                      } else {
+                          body_len = 0;
+                      }
+                  }
               }
               // 2.5 Check for IPv6 (First nibble is 6)
               else if (body_len > 40 && (frame_body[0] & 0xF0) == 0x60) {
@@ -2726,190 +2817,118 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                           frame_body += (ip_header_len + tcp_header_len);
                           body_len -= (ip_header_len + tcp_header_len);
                       }
+                  } else if (next_header == 58 && body_len > (ip_header_len + 8)) {
+                      // --- NEW: ICMPv6 (58) ---
+                      captured_protocol = 58; // ICMPv6
+                      frame_body += (ip_header_len + 8);
+                      body_len -= (ip_header_len + 8);
                   } else {
                       // Unknown protocol or contains extension headers. Just strip the fixed IP header.
-                      frame_body += ip_header_len;
-                      body_len -= ip_header_len;
+                      if (body_len > ip_header_len) {
+                          frame_body += ip_header_len;
+                          body_len -= ip_header_len;
+                      } else {
+                          body_len = 0;
+                      }
                   }
               }
 
-              char temp_text[MAX_LEAK_STR_LEN] = {0};
-              bool custom_extracted = false;
+              // =========================================================
+              // 3. THE HIGH-SPEED ISR FUNNEL (LRU Cache & Deduplication)
+              // =========================================================
+              
+              // 1. Generate the fast integer hash of the flow
+              uint32_t current_hash = hash_flow(frame_body, body_len, captured_src_port, captured_dst_port);
+              
+              uint32_t now_ms = millis();
+              bool should_process = false;
+              int cache_idx = -1;
+              int oldest_idx = 0;
+              uint32_t oldest_time = 0xFFFFFFFF;
 
-            // --- 0. ARP (EtherType 0x0806) ---
-            if (ether_type == 0x0806) {
-                custom_extracted = parse_arp(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
-            // FIXED: Changed to 'else if' to maintain the conditional chain
-            else if (captured_dst_port == 67 || captured_dst_port == 68) {
-                custom_extracted = parse_dhcp_v4(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }            
-            // --- 2. DHCPv6 Extraction (Ports 546, 547) ---
-            else if (captured_dst_port == 546 || captured_dst_port == 547) {
-                custom_extracted = parse_dhcp_v6(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 3. NetBIOS Name Service (Port 137) ---
-            else if (captured_dst_port == 137 || captured_src_port == 137) {
-                custom_extracted = parse_netbios(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 3.5 NetBIOS Datagram / Browser (Port 138) ---
-            else if (captured_dst_port == 138 || captured_src_port == 138) {
-                custom_extracted = parse_nbds(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 4. DNS and mDNS (Ports 53, 5353) ---
-            else if (captured_dst_port == 53 || captured_dst_port == 5353) {
-                custom_extracted = parse_dns_mdns(frame_body, body_len, captured_dst_port, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 5. SSDP / UPnP (Port 1900) ---
-            else if (captured_dst_port == 1900) {
-                custom_extracted = parse_ssdp(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 6. LLMNR (Port 5355) ---
-            else if (captured_dst_port == 5355) {
-                custom_extracted = parse_llmnr(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 7. Dropbox LAN Sync (Port 17500) ---
-            else if (captured_dst_port == 17500 || captured_src_port == 17500) {
-                custom_extracted = parse_dropbox(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 8. SNMP (Ports 161, 162) ---
-            else if (captured_dst_port == 161 || captured_dst_port == 162) {
-                custom_extracted = parse_snmp(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-            // --- 9. Static Port Fingerprints (No payload parsing required) ---
-            else if (captured_dst_port == 3478 || captured_src_port == 3478) {
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: WebRTC/VoIP NAT Traversal");
-                custom_extracted = true;
-            }
-            else if (captured_dst_port == 3544 || captured_src_port == 3544) {
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "Teredo: Windows IPv6 Tunnel");
-                custom_extracted = true;
-            }
-            else if (captured_dst_port == 5350 || captured_src_port == 5350) {
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "PCP: Port Control Protocol");
-                custom_extracted = true;
-            }
-            else if (captured_dst_port == 5351 || captured_src_port == 5351) {
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "NAT-PMP: Apple Port Mapping");
-                custom_extracted = true;
-            }
-            // --- 10. Payload-Based Catch-Alls (Evaluates both TCP and UDP) ---
-            else if (body_len > 0) {
-                // Try JSON first (most structured)
-                if (parse_generic_json(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN)) {
-                    custom_extracted = true;
-                }
-                // Fallback to generic text scraping
-                else if (extractCleartext(frame_body, body_len, temp_text)) {
-                    custom_extracted = true;
-                }
-                // If binary (non-text), optionally log TCP or UDP metrics
-                else if (captured_protocol == 6) {
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP Data: %d->%d (%d bytes)", captured_src_port, captured_dst_port, body_len);
-                    custom_extracted = true;
-                }
-                else if (captured_protocol == 17) {
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "UDP Data: %d->%d (%d bytes)", captured_src_port, captured_dst_port, body_len);
-                    custom_extracted = true;
-                }
-            }
-            // --- 11. TCP Connection Flags (Empty Payloads) ---
-            else if (captured_protocol == 6) {
-                if (tcp_flags & 0x02) { 
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP SYN (Port %d)", captured_dst_port); 
-                    custom_extracted = true; 
-                } 
-                else if (tcp_flags & 0x04) { 
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", captured_dst_port); 
-                    custom_extracted = true; 
-                } 
-            }
+              // 2. Scan the LRU Cache
+              for (int i = 0; i < MAX_ACTIVE_FLOWS; i++) {
+                  // Found an existing flow
+                  if (flow_cache[i].flow_hash == current_hash) {
+                      cache_idx = i;
+                      break;
+                  }
+                  // Keep track of the stalest record in case we need to evict
+                  if (flow_cache[i].last_seen_ms < oldest_time) {
+                      oldest_time = flow_cache[i].last_seen_ms;
+                      oldest_idx = i;
+                  }
+              }
 
-            // --- 12. ICMPv6 Neighbor Discovery ---
-            // If JSON didn't catch it, check if it's ICMPv6
-            if (!custom_extracted && captured_ip_version == 6 && captured_protocol == 58) {
-                // Ensure we have enough of the body to read the ICMPv6 Target IP (starts at byte 8)
-                if (body_len >= 24) { 
-                    uint8_t icmp_type = frame_body[0];
-                    if (icmp_type == 135) { // 135 = Neighbor Solicitation
-                        // Filter out Router Noise (Assuming 2 is AP->STA in your direction mapping)
-                        if (captured_direction != 2) { 
-                            strncpy(temp_text, "ICMPV6_NS", MAX_LEAK_STR_LEN);
-                            // Overwrite captured_dst_ip with the Target IP being queried
-                            memcpy(captured_dst_ip, &frame_body[8], 16);
-                            custom_extracted = true;
-                        }
-                    }
-                }
-            }
+              if (cache_idx != -1) {
+                  // Existing Flow: Update stats and check the 30-second cooldown
+                  flow_cache[cache_idx].count++;
+                  flow_cache[cache_idx].last_seen_ms = now_ms;
+                  
+                  if (now_ms - flow_cache[cache_idx].last_printed_ms > LIVE_DUMP_COOLDOWN_MS) {
+                      should_process = true;
+                      flow_cache[cache_idx].last_printed_ms = now_ms;
+                  }
+              } else {
+                  // New Flow: Evict the oldest record and claim the slot
+                  cache_idx = oldest_idx;
+                  flow_cache[cache_idx].flow_hash = current_hash;
+                  flow_cache[cache_idx].first_seen_ms = now_ms;
+                  flow_cache[cache_idx].last_seen_ms = now_ms;
+                  flow_cache[cache_idx].last_printed_ms = now_ms;
+                  flow_cache[cache_idx].count = 1;
+                  should_process = true;
+              }
 
-            // --- 13. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
-            // If absolutely nothing else caught it, scan the raw bytes for text
-            if (!custom_extracted && body_len > 0) {
-                custom_extracted = extract_printable_runs(frame_body, body_len, temp_text, MAX_LEAK_STR_LEN,
-                                               /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/" | ");
+              // =========================================================
+              // 4. SHIP RAW BYTES TO CORE 1 
+              // =========================================================
+              if (should_process) {
+                  
+                  // Enforce memory safety boundary
+                  uint16_t copy_len = body_len;
+                  if (copy_len > MAX_RAW_PAYLOAD) {
+                      copy_len = MAX_RAW_PAYLOAD;
+                  }
 
-            }
-            
-            // =========================================================
-            // PUSH CLEARTEXT TO QUEUE (WITH DEDUPLICATION)
-            // =========================================================
-            if (custom_extracted) {
-                
-                // 1. ISR-Safe Flow Key De-Duplication (The Hash Ring)
-                uint32_t text_hash = 5381;
-                for (int c = 0; temp_text[c] != '\0'; c++) {
-                    text_hash = ((text_hash << 5) + text_hash) + temp_text[c];
-                }
-                
-                bool is_duplicate = false;
-                for (int h = 0; h < 32; h++) {
-                    if (leak_hash_history[h] == text_hash) {
-                        is_duplicate = true;
-                        break;
-                    }
-                }
-                
-                if (!is_duplicate) {
-                    // Save hash to ring buffer
-                    leak_hash_history[leak_hash_idx] = text_hash;
-                    leak_hash_idx = (leak_hash_idx + 1) % 32;
-                    
-                    CleartextLeak leak;
-                    memset(&leak, 0, sizeof(CleartextLeak));
-                    
-                    // 2. High-Value Triage (Optional: highlights on screen)
-                    if (strstr(temp_text, "M-SEARCH") || strstr(temp_text, "HTTP/1.") || 
-                        strstr(temp_text, "spotify") || strstr(temp_text, "cast")) {
-                        leak.is_high_value = true;
-                    }
-
-                    // 3. Populate Payload and MACs
-                    strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
-                    memcpy(leak.src_mac, payload + 10, 6);
-                    memcpy(leak.dst_mac, payload + 4, 6);
-                    
-                    // 4. Populate Extracted Metadata
-                    leak.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    leak.src_port = captured_src_port;
-                    leak.dst_port = captured_dst_port;
-                    leak.ip_version = captured_ip_version;
-                    memcpy(leak.src_ip, captured_src_ip, 16);
-                    memcpy(leak.dst_ip, captured_dst_ip, 16);
-                    leak.frame_subtype = captured_subtype;
-                    leak.direction = captured_direction;
-                    leak.channel = captured_channel;
-                    leak.protocol = captured_protocol;
-                    
-                    // 5. Fire off to the Main Task
-                    if (leakQueue != NULL) {
-                        xQueueSendFromISR(leakQueue, &leak, NULL);
-                    }
-                }
-            }
+                  Layer2Capture l2_cap;
+                  memset(&l2_cap, 0, sizeof(Layer2Capture)); 
+                  
+                  l2_cap.timestamp = now_ms;
+                  l2_cap.frame_length = pkt->rx_ctrl.sig_len;
+                  l2_cap.flow_hash = current_hash;
+                  l2_cap.src_port = captured_src_port;
+                  l2_cap.dst_port = captured_dst_port;
+                  l2_cap.payload_len = copy_len;
+                  l2_cap.ip_version = captured_ip_version;
+                  l2_cap.protocol = captured_protocol;
+                  l2_cap.ether_type = ether_type;
+                  l2_cap.tcp_flags = tcp_flags;
+                  l2_cap.channel = captured_channel;
+                  l2_cap.direction = captured_direction;
+                  l2_cap.frame_subtype = captured_subtype;
+                  
+                  // Populating Unions Phase 1 (Binary Data)
+                  memcpy(l2_cap.bssid, mac3, 6);
+                  if (copy_len > 0) memcpy(l2_cap.raw_payload, frame_body, copy_len);
+                  
+                  memcpy(l2_cap.src_ip, captured_src_ip, 16);
+                  memcpy(l2_cap.dst_ip, captured_dst_ip, 16);
+                  memcpy(l2_cap.src_mac, payload + 10, 6);
+                  memcpy(l2_cap.dst_mac, payload + 4, 6);
+                  
+                  // ROUTE 1: Feed the UI Engine
+                  if (leakQueue != NULL) {
+                      xQueueSendFromISR(leakQueue, &l2_cap, NULL);
+                  }
+                  
+                  // ROUTE 2: Feed the Background Logger (if still active)
+                  if (liveDumpQueue != NULL) {
+                      xQueueSendFromISR(liveDumpQueue, &l2_cap, NULL);
+                  }
+              }
           }
-        } else {
+      } else {
           // ==========================================
           // INSECURE ENCRYPTION DETECTION (TKIP/WEP)
           // ==========================================
@@ -2949,34 +2968,34 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               if (triggered) {
                   uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
                   
-                  // Grab MAC addresses directly from the frame (Dst is offset 4, Src is offset 10)
                   if (should_alert_crypto(payload + 10, payload + 4, now_ms)) {
                       
-                      CleartextLeak leak;
-                      memset(&leak, 0, sizeof(CleartextLeak));
+                      Layer2Capture leak;
+                      memset(&leak, 0, sizeof(Layer2Capture));
                       
                       // Using the correct struct member names
-                      strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
-                      memcpy(leak.src_mac, payload + 10, 6);
-                      memcpy(leak.dst_mac, payload + 4, 6);
-                      
-                      // Fill in the Layer 2 metadata we know for encrypted frames
                       leak.timestamp = now_ms;
+                      leak.frame_length = pkt->rx_ctrl.sig_len;
+                      // Generate a quick hash from a few bytes of the Dst and Src MACs
+                      // so processLeakQueue() can separate different routers!
+                      leak.flow_hash = (payload[9] << 24) | (payload[8] << 16) | (payload[15] << 8) | payload[14];
                       leak.frame_subtype = (payload[0] & 0xF0) >> 4;
                       leak.direction = payload[1] & 0x03;
                       leak.channel = pkt->rx_ctrl.channel;
                       
-                      // IP/Ports remain 0 since this frame is encrypted
+                      memcpy(leak.src_mac, payload + 10, 6);
+                      memcpy(leak.dst_mac, payload + 4, 6);
+                      memcpy(leak.bssid, mac3, 6);
+
+                      // Write directly to the UI Union
+                      strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
                       
-                      if (leakQueue != NULL) {
-                          xQueueSendFromISR(leakQueue, &leak, NULL);
-                      }
+                      if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
                   }
               }
-          }
-      }
-    }
-
+          } 
+      } 
+  }
   // ==========================================
 
   // 2. The Target AP Lock Gate
@@ -3117,6 +3136,153 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     // If the buffer is full, dump the size into the overflow bucket
     liveOtherBytes += len; 
   }
+}
+
+void processLiveDumpQueue() {
+    if (liveDumpQueue == NULL) return;
+
+    Layer2Capture l2_cap; // <--- Using the unified struct
+    // Process up to 5 packets per loop to prevent starvation of the UI
+    int packets_processed = 0; 
+    
+    while (xQueueReceive(liveDumpQueue, &l2_cap, 0) == pdTRUE && packets_processed < 5) {
+        packets_processed++;
+
+        char temp_text[MAX_LEAK_STR_LEN] = {0};
+        bool custom_extracted = false;
+
+        // --- 0. ARP (EtherType 0x0806) ---
+        if (l2_cap.ether_type == 0x0806) {
+            custom_extracted = parse_arp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 0.5 EAPOL (WPA/WPA2/WPA3 Handshake) ---
+        else if (l2_cap.ether_type == 0x888E) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL WPA Authentication Handshake");
+            custom_extracted = true;
+            l2_cap.is_high_value = true; // Tag it as high value to ensure it survives triage!
+        }
+        // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
+        else if (l2_cap.dst_port == 67 || l2_cap.dst_port == 68) {
+            custom_extracted = parse_dhcp_v4(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }            
+        // --- 2. DHCPv6 Extraction (Ports 546, 547) ---
+        else if (l2_cap.dst_port == 546 || l2_cap.dst_port == 547) {
+            custom_extracted = parse_dhcp_v6(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 3. NetBIOS Name Service (Port 137) ---
+        else if (l2_cap.dst_port == 137 || l2_cap.src_port == 137) {
+            custom_extracted = parse_netbios(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 3.5 NetBIOS Datagram / Browser (Port 138) ---
+        else if (l2_cap.dst_port == 138 || l2_cap.src_port == 138) {
+            custom_extracted = parse_nbds(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 4. DNS and mDNS (Ports 53, 5353) ---
+        else if (l2_cap.dst_port == 53 || l2_cap.dst_port == 5353) {
+            custom_extracted = parse_dns_mdns(l2_cap.raw_payload, l2_cap.payload_len, l2_cap.dst_port, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 5. SSDP / UPnP (Port 1900) ---
+        else if (l2_cap.dst_port == 1900) {
+            custom_extracted = parse_ssdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 6. LLMNR (Port 5355) ---
+        else if (l2_cap.dst_port == 5355) {
+            custom_extracted = parse_llmnr(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 7. Dropbox LAN Sync (Port 17500) ---
+        else if (l2_cap.dst_port == 17500 || l2_cap.src_port == 17500) {
+            custom_extracted = parse_dropbox(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 8. SNMP (Ports 161, 162) ---
+        else if (l2_cap.dst_port == 161 || l2_cap.dst_port == 162) {
+            custom_extracted = parse_snmp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 9. Static Port Fingerprints (No payload parsing required) ---
+        else if (l2_cap.dst_port == 3478 || l2_cap.src_port == 3478) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: WebRTC/VoIP NAT Traversal");
+            custom_extracted = true;
+        }
+        else if (l2_cap.dst_port == 3544 || l2_cap.src_port == 3544) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "Teredo: Windows IPv6 Tunnel");
+            custom_extracted = true;
+        }
+        else if (l2_cap.dst_port == 5350 || l2_cap.src_port == 5350) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "PCP: Port Control Protocol");
+            custom_extracted = true;
+        }
+        else if (l2_cap.dst_port == 5351 || l2_cap.src_port == 5351) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "NAT-PMP: Apple Port Mapping");
+            custom_extracted = true;
+        }
+        else if (l2_cap.dst_port == 1883 || l2_cap.src_port == 1883) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "MQTT (IoT Telemetry/PubSub)");
+            custom_extracted = true;
+            l2_cap.is_high_value = true; // Tagged as high value for triaging
+        }
+        else if (l2_cap.dst_port == 5683 || l2_cap.src_port == 5683) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "CoAP (IoT Constrained App Protocol)");
+            custom_extracted = true;
+            l2_cap.is_high_value = true;
+        }
+        // --- 10. Payload-Based Catch-Alls ---
+        else if (l2_cap.payload_len > 0) {
+            if (parse_generic_json(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN)) {
+                custom_extracted = true;
+            }
+            else if (extractCleartext(l2_cap.raw_payload, l2_cap.payload_len, temp_text)) {
+                custom_extracted = true;
+            }
+        }
+        // --- 11. TCP Connection Flags ---
+        else if (l2_cap.protocol == 6) {
+            if (l2_cap.tcp_flags & 0x02) { 
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP SYN (Port %d)", l2_cap.dst_port); 
+                custom_extracted = true; 
+            } 
+            else if (l2_cap.tcp_flags & 0x04) { 
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", l2_cap.dst_port); 
+                custom_extracted = true; 
+            } 
+        }
+        // --- 11.5 ICMP (Ping / Control) ---
+        else if (l2_cap.protocol == 1) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv4 Message (Ping/Control)");
+            custom_extracted = true;
+        }
+        else if (l2_cap.protocol == 58) {
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv6 Message (Ping/Control)");
+            custom_extracted = true;
+        }
+
+        // --- 12. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
+        if (!custom_extracted && l2_cap.payload_len > 0) {
+            custom_extracted = extract_printable_runs(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN,
+                                           /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/" | ");
+        }
+
+        if (custom_extracted) {
+            // High-Value Triage
+            l2_cap.is_high_value = false;
+            if (strstr(temp_text, "M-SEARCH") || strstr(temp_text, "HTTP/1.") || 
+                strstr(temp_text, "spotify") || strstr(temp_text, "cast")) {
+                l2_cap.is_high_value = true;
+            }
+
+            // ==========================================
+            // IN-PLACE UNION OVERWRITE & UI ROUTING
+            // ==========================================
+            // Safely overwrite the raw payload with the parsed cleartext.
+            // DO NOT write to network_ssid here to preserve the BSSID for live lookups!
+            
+            strncpy(l2_cap.text, temp_text, MAX_LEAK_STR_LEN - 1);
+            l2_cap.text[MAX_LEAK_STR_LEN - 1] = '\0';
+
+            // 3. Push the finalized struct directly to the UI list
+            if (leakQueue != NULL) {
+                xQueueSend(leakQueue, &l2_cap, 0); 
+            }
+        }
+    }
 }
 
 void resetMonitorState() {
@@ -3442,15 +3608,6 @@ void drawMenu() {
   }
   
   // ==========================================
-  // CLEAR TEXT LEAKS BUTTON (Right Column, Top)
-  // ==========================================
-  // Placed directly above SNIFFED PROBES
-  tft.fillRect(300, 90, 150, 40, TFT_DARKCYAN); 
-  tft.drawRect(300, 90, 150, 40, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE);
-  tft.drawString("SNIFFED LEAKS", 375, 110);
-
-  // ==========================================
   // PROBE REQUEST BUTTON (Right Column)
   // ==========================================
   uint16_t purpleColor = hex24to565(0x4A148C);
@@ -3512,6 +3669,9 @@ void drawMenu() {
   else if (currentRadioMode == RADIO_CHANNELS) {
     tft.fillRect(300, 190, 150, 40, TFT_ORANGE); 
   }
+  else if (currentRadioMode == RADIO_LAYER2) {
+    tft.fillRect(300, 190, 150, 40, TFT_MAROON); 
+  }
 
   // 2. Draw the universal white border
   tft.drawRect(300, 190, 150, 40, TFT_WHITE);
@@ -3529,6 +3689,9 @@ void drawMenu() {
   else if (currentRadioMode == RADIO_CHANNELS) {
     tft.drawString("MODE: CHANNELS", 375, 210);
   }
+  else if (currentRadioMode == RADIO_LAYER2) {
+    tft.drawString("MODE: LAYER 2", 375, 210);
+  }
 
   // 5. EXIT BUTTON
   tft.fillRect(300, 240, 150, 40, TFT_RED);
@@ -3541,19 +3704,18 @@ void drawMenu() {
 }
 
 void drawChartHeader() {
-  tft.drawLine(0, HEADER_HEIGHT - 8, 480, HEADER_HEIGHT - 8, COLOR_HOT_CHEST);
+  // 1. Gate the horizontal separator line so it doesn't cut through the L2 terminal
+  if (currentRadioMode != RADIO_LAYER2) {
+    tft.drawLine(0, HEADER_HEIGHT - 8, 480, HEADER_HEIGHT - 8, COLOR_HOT_CHEST);
+  }
 
   // MENU BUTTON
-  // 1. Draw the Button Outline
   tft.drawRoundRect(420, 1, 55, 16, 2, TFT_WHITE);
-  // 2. Set the Font State
   tft.setTextColor(TFT_WHITE);
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);  
-  // 3. Center the Text Automatically
-  tft.setTextDatum(MC_DATUM);     // Set datum to Middle-Center
+  tft.setTextDatum(MC_DATUM);     
   tft.drawString("MENU", 447, 7); 
-  // 4. Reset state for the rest of your UI
-  tft.setTextDatum(TL_DATUM);     // Put datum back to Top-Left
+  tft.setTextDatum(TL_DATUM);     
 
   // BANNER
   tft.setTextWrap(false); 
@@ -3563,9 +3725,9 @@ void drawChartHeader() {
   char bannerStr[64];
 
   // ==========================================
-  // THE 3-STATE HEADER LOGIC
+  // THE 4-STATE HEADER LOGIC
   // ==========================================
-  tft.setTextColor(COLOR_HOT_CHEST); // Default color for the header
+  tft.setTextColor(COLOR_HOT_CHEST); 
   if (currentRadioMode == RADIO_BLE) {
     snprintf(bannerStr, sizeof(bannerStr), "SNIFFING BLE DEVICES");
   } 
@@ -3579,6 +3741,9 @@ void drawChartHeader() {
   else if (currentRadioMode == RADIO_CHANNELS) { 
     snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING SPECTRUM", CHANNELS[current_ch_idx]);
   }
+  else if (currentRadioMode == RADIO_LAYER2) { 
+    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | LAYER 2 CAPTURE", CHANNELS[current_ch_idx]);
+  }
   else if (currentRadioMode == RADIO_WIFI) {    
     if (!target_locked) {
       snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | FREE AIRSPACE", CHANNELS[current_ch_idx]);
@@ -3589,8 +3754,6 @@ void drawChartHeader() {
       snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | %s (%ddBm)", target_channel, safe_ssid, target_rssi);
     }
   }
-
-  // Draw the final formulated string
   tft.drawString(bannerStr, 5, 1);
 }
 
@@ -3730,90 +3893,91 @@ void sortProbeList() {
 }
 
 void drawChartFooter() {
-  // 1. Draw the top bounding line (separating it from the waterfall)
-  //tft.drawLine(0, 295, 480, 295, TFT_WHITE);
-
-  // 2. Clear the footer area to prevent text from overlapping when updated
   tft.fillRect(0, 296, 480, 24, TFT_BLACK);
 
-  // 3. Set up the typography
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
   tft.setTextColor(TFT_WHITE);
   tft.setTextDatum(MC_DATUM); 
 
-  // ==========================================
-  // ZONE 1: SORT METRIC (Center X = 72)
-  // ==========================================
-  // Draw the button outline
-  tft.drawRoundRect(2, 302, 141, 17, 3, TFT_WHITE); 
+  if (currentRadioMode != RADIO_LAYER2) {
+      // ==========================================
+      // ZONE 1: SORT METRIC (Center X = 72)
+      // ==========================================
+      tft.drawRoundRect(2, 302, 141, 17, 3, TFT_WHITE); 
 
-  char metricStr[32] = "SORT: ERR"; // Failsafe fallback
-  
-  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
-    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: TX"); tft.setTextColor(TFT_CYAN); }
-    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: RX"); tft.setTextColor(TFT_MAGENTA); }
-    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
-    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
-    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
-    else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
-  } 
-  else if (currentRadioMode == RADIO_CHANNELS) {
-    // --- NEW SPECTRUM STRINGS ---
-    if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
-    else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: DN"); tft.setTextColor(TFT_CYAN); }
-    else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: UP"); tft.setTextColor(TFT_MAGENTA); }
-    else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
-    else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
-    else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: PWR"); tft.setTextColor(TFT_GREEN); }
-    else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
-  }
-  else if (currentRadioMode == RADIO_BLE) {
-    if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT: HITS"); tft.setTextColor(TFT_WHITE); }
-    else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
-    else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
-  }
-  
-  // Draw the text with the newly assigned color
-  tft.drawString(metricStr, 72, 308);
-  
-  // Reset the color back to WHITE so it doesn't bleed into Zone 2 or 3
-  tft.setTextColor(TFT_WHITE);
-  // ==========================================
-  // ZONE 2: SORT DIRECTION (Center X = 217)
-  // ==========================================
-  // Draw the button outline (X: 147, Y: 298, W: 141, H: 19, Radius: 3)
-  tft.drawRoundRect(147, 302, 141, 17, 3, TFT_WHITE); 
+      char metricStr[32] = "SORT: ERR"; 
+      
+      if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+        if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
+        else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: TX"); tft.setTextColor(TFT_CYAN); }
+        else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: RX"); tft.setTextColor(TFT_MAGENTA); }
+        else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
+        else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
+        else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
+        else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
+      } 
+      else if (currentRadioMode == RADIO_CHANNELS) {
+        if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT: TOTAL"); tft.setTextColor(TFT_WHITE); }
+        else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT: DN"); tft.setTextColor(TFT_CYAN); }
+        else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT: UP"); tft.setTextColor(TFT_MAGENTA); }
+        else if (currentSortMode == SORT_AVG) { strcpy(metricStr, "SORT: AVG"); tft.setTextColor(TFT_YELLOW); }
+        else if (currentSortMode == SORT_CV) { strcpy(metricStr, "SORT: CV%"); tft.setTextColor(TFT_ORANGE); }
+        else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT: PWR"); tft.setTextColor(TFT_GREEN); }
+        else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
+      }
+      else if (currentRadioMode == RADIO_BLE) {
+        if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT: HITS"); tft.setTextColor(TFT_WHITE); }
+        else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT: DIST"); tft.setTextColor(TFT_GREEN); }
+        else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT: AGE"); tft.setTextColor(TFT_BLUE); }
+      }
+      
+      tft.drawString(metricStr, 72, 308);
+      tft.setTextColor(TFT_WHITE);
+      
+      // ==========================================
+      // ZONE 2: SORT DIRECTION (Center X = 217)
+      // ==========================================
+      tft.drawRoundRect(147, 302, 141, 17, 3, TFT_WHITE); 
 
-  if (sort_descending) {
-    tft.drawString("ORDER: DESC", 217, 309);
+      if (sort_descending) {
+        tft.drawString("ORDER: DESC", 217, 309);
+      } else {
+        tft.setTextColor(TFT_GREEN); 
+        tft.drawString("ORDER: ASC", 217, 309);
+        tft.setTextColor(TFT_WHITE); 
+      }
+
+      // ==========================================
+      // ZONE 3: SCALE MODE (Center X = 362)
+      // ==========================================
+      tft.drawRoundRect(292, 302, 141, 17, 3, TFT_WHITE); 
+
+      if (useLogScale) {
+        tft.setTextColor(TFT_YELLOW); 
+        tft.drawString("SCALE: LOG", 362, 309);
+      } else {
+        tft.drawString("SCALE: LIN", 362, 309);
+      }
   } else {
-    tft.setTextColor(TFT_GREEN); 
-    tft.drawString("ORDER: ASC", 217, 309);
-    tft.setTextColor(TFT_WHITE); 
-  }
-
-  // ==========================================
-  // ZONE 3: SCALE MODE (Center X = 362)
-  // ==========================================
-  // Draw the button outline (X: 292, Y: 298, W: 141, H: 19, Radius: 3)
-  tft.drawRoundRect(292, 302, 141, 17, 3, TFT_WHITE); 
-
-  if (useLogScale) {
-    tft.setTextColor(TFT_YELLOW); 
-    tft.drawString("SCALE: LOG", 362, 309);
-  } else {
-    tft.drawString("SCALE: LIN", 362, 309);
+      // Layer 2 gets a clean, unified label instead of useless sort buttons
+      tft.setTextColor(TFT_DARKGREY);
+      // Draw the static time scale on the far left
+      tft.setTextDatum(TL_DATUM);
+      tft.drawString("|=2m", 10, 301); 
+      
+      // Draw the main status label perfectly centered
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("PROMISCUOUS CAPTURE MODE", 240, 309); // 240 is true center of 480px screen
+      tft.setTextColor(TFT_WHITE);
   }
     
   // ==========================================
   // ZONE 4: BATTERY PLACEHOLDER
   // ==========================================
-  tft.drawRect(445, 304, 22, 12, TFT_WHITE); // Battery Outline
-  tft.fillRect(467, 307, 3, 6, TFT_WHITE);   // Positive Terminal Nub
-  tft.fillRect(447, 306, 18, 8, TFT_GREEN);  // Fake "Full Charge" Indicator
+  tft.drawRect(445, 304, 22, 12, TFT_WHITE); 
+  tft.fillRect(467, 307, 3, 6, TFT_WHITE);   
+  tft.fillRect(447, 306, 18, 8, TFT_GREEN);  
   
-  // 4. Reset datum so the rest of your UI doesn't draw off-center
   tft.setTextDatum(TL_DATUM); 
   tft.setTextColor(TFT_WHITE);
 }
@@ -4131,13 +4295,18 @@ void drawDeviceList() {
   // ==========================================
   // DYNAMIC PAGINATION MATH
   // ==========================================
-  int items_per_page = 7; 
+  int items_per_page = (currentRadioMode == RADIO_LAYER2) ? 3 : 7; 
   int total_devices = 0;
   
   if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
   else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
   else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
   else if (currentRadioMode == RADIO_CHANNELS) total_devices = sessionChannelCount;
+  else if (currentRadioMode == RADIO_LAYER2) {
+      for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+          if (leakHistory[i].leak.timestamp > 0) total_devices++;
+      }
+  }
 
   // ==========================================
   // DRAW TOP BANNER (WITH FOXHUNT OVERRIDE)
@@ -4166,6 +4335,9 @@ void drawDeviceList() {
     } else if (currentRadioMode == RADIO_CHANNELS) {
         headerColor = TFT_ORANGE;
         modeStr = "CHANNELS";
+    } else if (currentRadioMode == RADIO_LAYER2) {
+        headerColor = TFT_MAROON;
+        modeStr = "LAYER 2 LEAKS";
     }
     
     tft.fillRect(0, 0, 480, 24, headerColor);
@@ -4182,7 +4354,6 @@ void drawDeviceList() {
   uint16_t metricColor = TFT_RED;
   
   if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-    // 1. STANDARD WI-FI / AP METRICS
     if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT:TOTAL"); metricColor = TFT_WHITE; }
     else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT:TX"); metricColor = TFT_CYAN; }
     else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT:RX"); metricColor = TFT_MAGENTA; }
@@ -4192,7 +4363,6 @@ void drawDeviceList() {
     else if (currentSortMode == SORT_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
   } 
   else if (currentRadioMode == RADIO_CHANNELS) {
-    // 2. CUSTOM SPECTRUM METRICS
     if (currentSortMode == SORT_TOTAL) { strcpy(metricStr, "SORT:TOTAL"); metricColor = TFT_WHITE; }
     else if (currentSortMode == SORT_TX) { strcpy(metricStr, "SORT:DN"); metricColor = TFT_CYAN; }
     else if (currentSortMode == SORT_RX) { strcpy(metricStr, "SORT:UP"); metricColor = TFT_MAGENTA; }
@@ -4201,10 +4371,14 @@ void drawDeviceList() {
     else if (currentSortMode == SORT_DIST) { strcpy(metricStr, "SORT:PWR"); metricColor = TFT_GREEN; }
   } 
   else if (currentRadioMode == RADIO_BLE) {
-    // 3. BLE METRICS
     if (currentBleSortMode == SORT_BLE_HITS) { strcpy(metricStr, "SORT:HITS"); metricColor = TFT_WHITE; }
     else if (currentBleSortMode == SORT_BLE_DIST) { strcpy(metricStr, "SORT:DIST"); metricColor = TFT_GREEN; }
     else if (currentBleSortMode == SORT_BLE_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
+  }
+  else if (currentRadioMode == RADIO_LAYER2) {
+    if (currentLeakSort == SORT_LEAK_AGE) { strcpy(metricStr, "SORT:AGE"); metricColor = TFT_BLUE; }
+    else if (currentLeakSort == SORT_LEAK_LENGTH) { strcpy(metricStr, "SORT:SIZE"); metricColor = TFT_CYAN; }
+    else if (currentLeakSort == SORT_LEAK_HITS) { strcpy(metricStr, "SORT:HITS"); metricColor = TFT_WHITE; }
   }
 
   // Draw Metric Button Outline and Text
@@ -4243,44 +4417,47 @@ void drawDeviceList() {
     // ==========================================
     // DRAW THE UNIFIED DUAL COLUMN HEADERS
     // ==========================================
-    tft.setTextColor(TFT_GREEN);
-    if (currentRadioMode == RADIO_WIFI) {
-      tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString("     VENDOR                 MAC            RSSI TOTAL", 5, 26); 
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      // --- UPDATED WIFI HEADER WITH Per(s) ---
-      tft.drawString("Per(s) FIRST | LAST DIST Mbps  AVG    CV%    TX | RX", 5, 41);
-    } 
-    else if (currentRadioMode == RADIO_AP) {
-      tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString("     SSID                 BSSID         CC RSSI TOTAL", 5, 26);       
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%    TX | RX", 5, 41);
+    // Hide headers for Layer 2 to make room for the 5-line display
+    if (currentRadioMode != RADIO_LAYER2) {
+        tft.setTextColor(TFT_GREEN);
+        if (currentRadioMode == RADIO_WIFI) {
+          tft.setFreeFont(&UbuntuMono_B9pt7b);
+          tft.drawString("     VENDOR                 MAC            RSSI TOTAL", 5, 26); 
+          tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+          tft.drawString("Per(s) FIRST | LAST DIST Mbps  AVG    CV%    TX | RX", 5, 41);
+        } 
+        else if (currentRadioMode == RADIO_AP) {
+          tft.setFreeFont(&UbuntuMono_B9pt7b);
+          tft.drawString("     SSID                 BSSID         CC RSSI TOTAL", 5, 26);       
+          tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+          tft.drawString("    FIRST | LAST  DIST CH RATE  AVG  CV%    TX | RX", 5, 41);
+        }
+        else if (currentRadioMode == RADIO_CHANNELS) {
+          tft.setFreeFont(&UbuntuMono_B9pt7b);
+          tft.drawString("     CHANNEL           PWR(AVG dBm|STD)         TOTAL", 5, 26);       
+          tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+          tft.drawString("    FIRST | LAST         STATE   AVG  CV%    DN | UP", 5, 41);
+        }
+        else {
+          tft.setFreeFont(&UbuntuMono_B9pt7b);
+          tft.drawString("    NAME                FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
+          tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
+          tft.drawString("MAC ADDRESS        VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
+        }
+        tft.setTextColor(TFT_WHITE); 
+        tft.drawLine(0, 57, 480, 57, TFT_WHITE); 
     }
-    else if (currentRadioMode == RADIO_CHANNELS) {
-      tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString("     CHANNEL           PWR(AVG dBm|STD)         TOTAL", 5, 26);       
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      tft.drawString("    FIRST | LAST         STATE   AVG  CV%    DN | UP", 5, 41);
-    }
-    else {
-      tft.setFreeFont(&UbuntuMono_B9pt7b);
-      tft.drawString("    NAME                FIRST|LAST    RSSI  DIST  HITS", 5, 26);       
-      tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-      tft.drawString("MAC ADDRESS        VENDOR/DIAGNOSTIC PAYLOAD", 5, 41);
-    }
-    tft.setTextColor(TFT_WHITE); 
-
-    // --- HEADER SEPARATOR LINE ---
-    tft.drawLine(0, 57, 480, 57, TFT_WHITE); 
 
     // ==========================================
     // DRAW THE DATA ROWS
     // ==========================================
     int row = 0;
+    int y_spacing = (currentRadioMode == RADIO_LAYER2) ? 80 : 33;
+    int base_y = (currentRadioMode == RADIO_LAYER2) ? 32 : 62;
+
     for (int i = start_idx; i < end_idx; i++) {
       
-      int y = 62 + (row * 33); 
+      int y = base_y + (row * y_spacing); 
       
       if (currentRadioMode == RADIO_WIFI) {
         // ==========================================
@@ -4295,7 +4472,6 @@ void drawDeviceList() {
                  sessionData[i].mac[3], sessionData[i].mac[4], sessionData[i].mac[5]);
 
         char safeVendor[20]; 
-        // The background queue already resolved this string, just format it for the column width
         snprintf(safeVendor, sizeof(safeVendor), "%-18.18s", sessionData[i].vendor);
 
         double mean = 0.0; double cv_percent = 0.0;
@@ -4325,19 +4501,16 @@ void drawDeviceList() {
         char avgStr[6];
         formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
 
-        // --- NEW: CALCULATE PERIODICITY (Keep-Alive Interval) ---
         int keep_alive_s = 0;
         if (sessionData[i].packets > 1) {
             unsigned long duration_ms = sessionData[i].last_seen - sessionData[i].first_seen;
             keep_alive_s = (duration_ms / sessionData[i].packets) / 1000;
-            if (keep_alive_s > 99) keep_alive_s = 99; // Cap at 99 to protect double-digit UI bounds
+            if (keep_alive_s > 99) keep_alive_s = 99; 
         }
-        // --------------------------------------------------------
 
         snprintf(line1, sizeof(line1), "%3d. %-18.18s %17s %4d %-5.5s", 
                  (i + 1), safeVendor, macStr, sessionData[i].rssi, totStr);
 
-        // --- UPDATED WIFI LINE 2 WITH %02d REPLACING INDENT ---
         snprintf(line2, sizeof(line2), "  %02d  %13s %4.0fm %3d  %-5.5s %4.0f%%   %9s", 
                  keep_alive_s, ageCombo, sessionData[i].smoothedDistance, sessionData[i].rate, 
                  avgStr, cv_percent, trafficCombo);
@@ -4375,11 +4548,10 @@ void drawDeviceList() {
             default: trackerStr = ""; break;
         }
 
-        // --- ZERO-ALLOCATION STRING BUILDER ---
         const char* appStr = resolveBleAppearance(sessionBleData[i].appearanceId);
         const char* srvStr = resolveBleServiceUuid(sessionBleData[i].serviceId);
         
-        char tagStr[64] = {0}; // Stack buffer initialized to empty string
+        char tagStr[64] = {0}; 
         
         if (strlen(trackerStr) > 0 && sessionBleData[i].namePriority != 1) {
             strlcpy(tagStr, trackerStr, sizeof(tagStr));
@@ -4395,7 +4567,6 @@ void drawDeviceList() {
             strlcat(tagStr, srvStr, sizeof(tagStr));
         }
 
-        // Fallback if tagStr is still empty
         if (tagStr[0] == '\0') {
             if (sessionBleData[i].payload[0] != '\0') {
                 if (sessionBleData[i].trackerType == TRACKER_APPLE_IBEACON) {
@@ -4408,7 +4579,6 @@ void drawDeviceList() {
             }
         }
         
-        // IMPORTANT: Ensure your cleanOsintString function signature expects a char* now, not a std::string!
         cleanOsintString(tagStr); 
 
         char macStr[18];
@@ -4421,7 +4591,6 @@ void drawDeviceList() {
                  sessionBleData[i].smoothedDistance, sessionBleData[i].hits);
 
         char line2[90];
-        // Dropped the .c_str() since tagStr is now a native char array
         snprintf(line2, sizeof(line2), "%17s  %-33.33s", macStr, tagStr);
 
         tft.setFreeFont(&UbuntuMono_B9pt7b);
@@ -4518,7 +4687,6 @@ void drawDeviceList() {
         char line1[90];
         char line2[90];
 
-        // 1. GLOBAL VOLUME STATISTICS (Bytes)
         double mean = 0.0;
         double cv_percent = 0.0;
         if (sessionChannelData[i].packets > 0) {
@@ -4530,11 +4698,9 @@ void drawDeviceList() {
             if (mean > 0) cv_percent = (std_dev / mean) * 100.0;
         }
 
-        // 2. EMA TIME-SERIES STATISTICS (RSSI & RF Physics)
         float avg_rssi = sessionChannelData[i].avg_rssi;
         double std_dev_rssi = sqrt(sessionChannelData[i].ema_variance);
         
-        // Calculate Autocorrelation (rho)
         float rho = 0.0;
         if (sessionChannelData[i].ema_variance > 0.01) { 
             rho = sessionChannelData[i].ema_cov / sessionChannelData[i].ema_variance;
@@ -4546,7 +4712,6 @@ void drawDeviceList() {
         else if (rho > 0.2) strcpy(stateStr, "ACTIVE");  
         else strcpy(stateStr, "STATIC");                 
 
-        // 3. STRING FORMATTING
         char avgStr[6];
         formatShortUnit((uint32_t)mean, avgStr, sizeof(avgStr));
 
@@ -4580,6 +4745,125 @@ void drawDeviceList() {
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.drawString(line2, 5, y + 15);
         tft.setTextColor(TFT_WHITE); 
+      }
+      else if (currentRadioMode == RADIO_LAYER2) {
+        // ==========================================
+        // LAYER 2 MODE - COMPACT 5-LINE RENDERING
+        // ==========================================
+        char line1[90], line2[90], line3[90];
+
+        // 1. Age Combo
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[18]; // Bumped to 18 to be safe
+        getAgeString(leakHistory[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
+        getAgeString(leakHistory[i].leak.timestamp, lastSeenStr, sizeof(lastSeenStr));
+        snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
+
+        // 2. Live SSID Lookup (Using persistent cache to bypass the union)
+        char safeSsid[13] = "Unknown";
+        for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
+            if (bssidCache[ap].last_seen == 0) continue; // Skip empty slots
+            
+            if (memcmp(leakHistory[i].leak.bssid, bssidCache[ap].bssid, 6) == 0) {
+                strncpy(safeSsid, bssidCache[ap].ssid, 12);
+                safeSsid[12] = '\0';
+                break;
+            }
+        }
+        
+        // 3. Format Vendor Strings & Strip Trailing Spaces to save width
+        char srcVend[9], dstVend[9];
+        strncpy(srcVend, leakHistory[i].src_vendor, 8); srcVend[8] = '\0';
+        strncpy(dstVend, leakHistory[i].dst_vendor, 8); dstVend[8] = '\0';
+        if(strlen(srcVend) == 0) strcpy(srcVend, "Unknown");
+        if(strlen(dstVend) == 0) strcpy(dstVend, "Unknown");
+        for (int v = 7; v >= 0; v--) { if (srcVend[v] == ' ') srcVend[v] = '\0'; else break; }
+        for (int v = 7; v >= 0; v--) { if (dstVend[v] == ' ') dstVend[v] = '\0'; else break; }
+
+        // --- INLINE FORMATTERS ---
+        // 1. Compact Length (Max 4 chars)
+        char lenStr[8];
+        uint16_t fLen = leakHistory[i].leak.frame_length;
+        if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
+        else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
+
+        // 2. Safe IPv6 Buffers (40 bytes to prevent overflow)
+        char srcIpStr[40] = {0}, dstIpStr[40] = {0}; 
+        getIpString(leakHistory[i].leak.ip_version, leakHistory[i].leak.src_ip, srcIpStr, sizeof(srcIpStr));
+        getIpString(leakHistory[i].leak.ip_version, leakHistory[i].leak.dst_ip, dstIpStr, sizeof(dstIpStr));
+        
+        // 3. IPv6 Shortener (Compresses consecutive and single zero-blocks)
+        char* p;
+        while ((p = strstr(srcIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
+        while ((p = strstr(dstIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
+        while ((p = strstr(srcIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+        while ((p = strstr(dstIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+
+        // --- ROW 1: [xHit] MAC(Vend)>MAC(Vend)|Len|C ---
+        snprintf(line1, sizeof(line1), "[x%d]%02X%02X%02X%02X%02X%02X(%s)>%02X%02X%02X%02X%02X%02X(%s)|%s|C%d", 
+                 leakHistory[i].hitCount,
+                 leakHistory[i].leak.src_mac[0], leakHistory[i].leak.src_mac[1], leakHistory[i].leak.src_mac[2],
+                 leakHistory[i].leak.src_mac[3], leakHistory[i].leak.src_mac[4], leakHistory[i].leak.src_mac[5],
+                 srcVend,
+                 leakHistory[i].leak.dst_mac[0], leakHistory[i].leak.dst_mac[1], leakHistory[i].leak.dst_mac[2],
+                 leakHistory[i].leak.dst_mac[3], leakHistory[i].leak.dst_mac[4], leakHistory[i].leak.dst_mac[5],
+                 dstVend, lenStr, leakHistory[i].leak.channel);
+
+        // --- ROW 2: BSSID(SSID)|DIR|SUBTYPE|PROTO|PORTS ---
+        char portStr[24] = "";
+        if (leakHistory[i].leak.protocol == 6 || leakHistory[i].leak.protocol == 17) {
+            snprintf(portStr, sizeof(portStr), "|%d>%d", leakHistory[i].leak.src_port, leakHistory[i].leak.dst_port);
+        }
+        snprintf(line2, sizeof(line2), "%02X%02X%02X%02X%02X%02X(%s)|%s|%s|%s%s", 
+                 leakHistory[i].leak.bssid[0], leakHistory[i].leak.bssid[1], leakHistory[i].leak.bssid[2],
+                 leakHistory[i].leak.bssid[3], leakHistory[i].leak.bssid[4], leakHistory[i].leak.bssid[5],
+                 safeSsid,
+                 getDirectionStr(leakHistory[i].leak.direction), 
+                 getSubtypeStr(leakHistory[i].leak.frame_subtype),
+                 getProtocolStr(leakHistory[i].leak.protocol), portStr);
+
+        // --- ROW 3: IP>IP|first/last ---
+        snprintf(line3, sizeof(line3), "%s>%s|%s",
+                 srcIpStr, dstIpStr, ageCombo);
+
+        // --- ROW 4 & 5: Sanitize & Split Payload ---
+        char safePayload[130] = {0};
+        strncpy(safePayload, leakHistory[i].leak.text, 128);
+        for (int pt = 0; pt < strlen(safePayload); pt++) {
+            if (safePayload[pt] < 32 || safePayload[pt] > 126) safePayload[pt] = '.';
+        }
+        
+        // Strict boundary wrap to prevent screen edge clipping (58 chars max per line)
+        int maxChars = 58;
+        char pLine1[65] = {0};
+        char pLine2[65] = {0};
+        strncpy(pLine1, safePayload, maxChars);
+        if (strlen(safePayload) > maxChars) strncpy(pLine2, safePayload + maxChars, maxChars);
+
+        // ==========================================
+        // TEXT RENDERING
+        // ==========================================
+        tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+        
+        // Draw Line 1
+        tft.setTextColor(TFT_CYAN);
+        tft.drawString(line1, 5, y);
+        
+        // Draw Line 2
+        tft.setTextColor(TFT_YELLOW);
+        tft.drawString(line2, 5, y + 14);
+        
+        // Draw Line 3
+        tft.setTextColor(TFT_ORANGE);
+        tft.drawString(line3, 5, y + 28);
+        
+        // Draw Payload Lines
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString(pLine1, 5, y + 42);
+        if (strlen(pLine2) > 0) {
+            tft.drawString(pLine2, 5, y + 56);
+        }
+        
+        tft.setTextColor(TFT_WHITE);
       }
       row++;
     }
@@ -5800,26 +6084,14 @@ void drawLeakList() {
   tft.setFreeFont(&UbuntuMono_B9pt7b);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE);
-  uint16_t leakHeaderColor = TFT_DARKCYAN; 
-  tft.fillRect(0, 0, 480, 24, leakHeaderColor);
+  tft.fillRect(0, 0, 480, 24, TFT_DARKCYAN);
   
   char headerStr[64];
   snprintf(headerStr, sizeof(headerStr), "SNIFFED LEAKS (%d)", active_leaks);
   tft.drawString(headerStr, 0, 5); 
 
   // ==========================================
-  // 2. MULTI-LINE COLUMN HEADERS
-  // ==========================================
-  tft.setTextColor(TFT_CYAN);
-  tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-  tft.drawString("SRC VENDOR:MAC:PORT  ->  DST VENDOR:MAC:PORT     HITS", 0, 25); 
-  
-  tft.setFreeFont(&UbuntuMono_Regular8pt7b); 
-  tft.drawString("Cleartext payload", 0, 38); 
-  tft.drawLine(0, 53, 480, 53, TFT_WHITE); 
-
-  // ==========================================
-  // 3. DATA ROWS (5-Line Data Injection)
+  // 2. DATA ROWS (3 Rows fit perfectly)
   // ==========================================
   int LEAKS_PER_PAGE = 3; 
   int start_idx = leak_current_page * LEAKS_PER_PAGE;
@@ -5829,96 +6101,71 @@ void drawLeakList() {
   for (int i = start_idx; i < end_idx && i < MAX_LEAK_SLOTS; i++) {
     if (leakHistory[i].hitCount == 0) continue;
 
-    // Row height increased to 74px (5 lines total)
-    int y = 60 + (row * 74); 
-    auto& lk = leakHistory[i].leak; // shorthand
+    int y = 30 + (row * 80); 
+    auto& lk = leakHistory[i].leak; 
 
     // ---------------------------------------------------
-    // METADATA LINE 1: MACs, Vendors, Channel, Hits, Time
+    // METADATA LINE 1: MACs & Vendors
     // ---------------------------------------------------
     tft.setFreeFont(&UbuntuMono_Regular8pt7b); 
     tft.setTextColor(TFT_GREEN);  
 
-    char meta1[80];
-    
-    // Convert ms to seconds for a more readable, compact display
-    uint32_t first_sec = leakHistory[i].first_seen / 1000;
-    uint32_t last_sec = lk.timestamp / 1000;
-
-    // Conditionally format the time so we don't waste horizontal space
-    if (leakHistory[i].hitCount == 1) {
-        snprintf(meta1, sizeof(meta1), "%02X%02X%02X%02X%02X%02X(%-6.6s)>%02X%02X%02X%02X%02X%02X(%-6.6s) [C%d H1 %u]",
-                 lk.src_mac[0], lk.src_mac[1], lk.src_mac[2], lk.src_mac[3], lk.src_mac[4], lk.src_mac[5],
-                 leakHistory[i].src_vendor,
-                 lk.dst_mac[0], lk.dst_mac[1], lk.dst_mac[2], lk.dst_mac[3], lk.dst_mac[4], lk.dst_mac[5],
-                 leakHistory[i].dst_vendor,
-                 lk.channel, first_sec);
-    } else {
-        snprintf(meta1, sizeof(meta1), "%02X%02X%02X%02X%02X%02X(%-6.6s)>%02X%02X%02X%02X%02X%02X(%-6.6s) [C%d H%d %u-%u]",
-                 lk.src_mac[0], lk.src_mac[1], lk.src_mac[2], lk.src_mac[3], lk.src_mac[4], lk.src_mac[5],
-                 leakHistory[i].src_vendor,
-                 lk.dst_mac[0], lk.dst_mac[1], lk.dst_mac[2], lk.dst_mac[3], lk.dst_mac[4], lk.dst_mac[5],
-                 leakHistory[i].dst_vendor,
-                 lk.channel, leakHistory[i].hitCount, first_sec, last_sec);
-    }
-             
+    char meta1[90];
+    // Print MAC and truncate vendor to 12 chars so the " > " separator doesn't fall off the screen edge
+    snprintf(meta1, sizeof(meta1), "%02X:%02X:%02X:%02X:%02X:%02X(%-12.12s)>%02X:%02X:%02X:%02X:%02X:%02X(%-12.12s)", 
+             lk.src_mac[0], lk.src_mac[1], lk.src_mac[2], lk.src_mac[3], lk.src_mac[4], lk.src_mac[5], leakHistory[i].src_vendor,
+             lk.dst_mac[0], lk.dst_mac[1], lk.dst_mac[2], lk.dst_mac[3], lk.dst_mac[4], lk.dst_mac[5], leakHistory[i].dst_vendor);
     tft.drawString(meta1, 0, y); 
 
     // ---------------------------------------------------
-    // METADATA LINE 2: Direction, Protocol, Ports, SSID
+    // METADATA LINE 2: IPs, Ports, Channel, Direction, Time
     // ---------------------------------------------------
-    tft.setTextColor(TFT_CYAN);
-    
-    // Determine Protocol String
-    const char* protoStr = "RAW";
-    if (lk.protocol == 6) protoStr = "TCP";
-    else if (lk.protocol == 17) protoStr = "UDP";
-    else if (lk.protocol == 1) protoStr = "ICMP";
-    else if (lk.protocol == 58) protoStr = "ICMPv6";
+    uint32_t first_sec = leakHistory[i].first_seen / 1000;
+    uint32_t last_sec = lk.timestamp / 1000;
+    uint8_t f_h = (first_sec / 3600);
+    uint8_t f_m = (first_sec % 3600) / 60;
+    uint8_t l_h = (last_sec / 3600);
+    uint8_t l_m = (last_sec % 3600) / 60;
 
-    // Determine Direction and extract BSSID for SSID Lookup
-    const char* dirStr = "UNK";
-    uint8_t target_bssid[6] = {0};
-    bool can_lookup_ssid = false;
-
-    if (lk.direction == 0) { 
-        dirStr = "STA>STA"; 
-    } else if (lk.direction == 1) { 
-        dirStr = "STA>AP"; 
-        memcpy(target_bssid, lk.dst_mac, 6); 
-        can_lookup_ssid = true;
-    } else if (lk.direction == 2) { 
-        dirStr = "AP>STA"; 
-        memcpy(target_bssid, lk.src_mac, 6); 
-        can_lookup_ssid = true;
-    } else if (lk.direction == 3) { 
-        dirStr = "WDS"; 
-    }
-
-    // Fast RAM lookup for SSID
-    char ssidStr[16] = "<Unknown>";
-    if (can_lookup_ssid) {
-        for (int b = 0; b < MAX_BSSID_CACHE; b++) {
-            if (memcmp(bssidCache[b].bssid, target_bssid, 6) == 0) {
-                strncpy(ssidStr, bssidCache[b].ssid, 15);
-                ssidStr[15] = '\0';
-                break;
-            }
-        }
-    }
-
-    // Format Line 2
-    char meta2[80];
-    if (lk.src_port > 0 || lk.dst_port > 0) {
-        snprintf(meta2, sizeof(meta2), "[%s] Sub:%02X | %s %d->%d | SSID:%s", 
-                 dirStr, lk.frame_subtype, protoStr, lk.src_port, lk.dst_port, ssidStr);
+    char timeStr[24];
+    if (leakHistory[i].hitCount <= 1) {
+        snprintf(timeStr, sizeof(timeStr), "%02dh%02dm", f_h, f_m);
     } else {
-        snprintf(meta2, sizeof(meta2), "[%s] Sub:%02X | %s (No Ports) | SSID:%s", 
-                 dirStr, lk.frame_subtype, protoStr, ssidStr);
+        snprintf(timeStr, sizeof(timeStr), "%02dh%02dm|%02dh%02dm", f_h, f_m, l_h, l_m);
+    }
+
+    char meta2[90];
+    if (lk.ip_version == 4 || lk.ip_version == 6) {
+        tft.setTextColor(TFT_YELLOW); 
+        char srcIp[32], dstIp[32];
+        getIpString(lk.ip_version, lk.src_ip, srcIp, sizeof(srcIp));
+        getIpString(lk.ip_version, lk.dst_ip, dstIp, sizeof(dstIp));
+        
+        if (lk.src_port > 0 || lk.dst_port > 0) {
+            snprintf(meta2, sizeof(meta2), "%s:%d>%s:%d|CH:%d|%s|%s| H:%d", 
+                     srcIp, lk.src_port, dstIp, lk.dst_port,
+                     lk.channel, getDirectionStr(lk.direction), lk.network_ssid, leakHistory[i].hitCount);
+        } else {
+            snprintf(meta2, sizeof(meta2), "%s>%s|CH:%d|%s|%s|H:%d",
+                     srcIp, dstIp,
+                     lk.channel, getDirectionStr(lk.direction), lk.network_ssid, leakHistory[i].hitCount);
+        }
+    } else {
+        tft.setTextColor(TFT_CYAN); 
+        snprintf(meta2, sizeof(meta2), "[%s]RAW|CH:%d|%s|%s|H:%d|%s", 
+                 getSubtypeStr(lk.frame_subtype), 
+                 lk.channel, getDirectionStr(lk.direction), 
+                 lk.network_ssid, leakHistory[i].hitCount, timeStr);
     }
     
-    tft.drawString(meta2, 0, y + 14);
-
+    tft.drawString(meta2, 0, y + 15);
+    
+    // Draw the time string right-aligned if it's an IP packet (since we omitted it from meta2 above to save space)
+    if (lk.ip_version == 4 || lk.ip_version == 6) {
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(timeStr, 480, y + 15);
+        tft.setTextDatum(TL_DATUM); // Reset!
+    }
     // ---------------------------------------------------
     // LINES 3, 4, 5: Cleartext Payload (Truncated)
     // ---------------------------------------------------
@@ -5943,17 +6190,18 @@ void drawLeakList() {
         snprintf(line5 + usableLine5Chars, 5, "+%d", payloadLen - ((maxChars*2) + usableLine5Chars));
     }
 
-    if (strlen(line3) > 0) tft.drawString(line3, 0, y + 28); 
-    if (strlen(line4) > 0) tft.drawString(line4, 0, y + 42); 
-    if (strlen(line5) > 0) tft.drawString(line5, 0, y + 56);
+    if (strlen(line3) > 0) tft.drawString(line3, 0, y + 30); 
+    if (strlen(line4) > 0) tft.drawString(line4, 0, y + 45); 
+    if (strlen(line5) > 0) tft.drawString(line5, 0, y + 60);
     
     // Draw row separator
-    tft.drawLine(0, y + 70, 480, y + 70, hex24to565(0x222222));
+    tft.drawLine(0, y + 75, 480, y + 75, hex24to565(0x222222));
     
     row++;
   }
+  
   // ==========================================
-  // 4. UNIFIED NAVIGATION FOOTER
+  // 3. UNIFIED NAVIGATION FOOTER
   // ==========================================
   tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
   tft.drawLine(0, 294, 480, 294, TFT_WHITE); 
@@ -5970,6 +6218,55 @@ void drawLeakList() {
     tft.setTextColor(TFT_WHITE);
     tft.drawString("NEXT ->", 360, 300);
   }
+}
+
+// --- L2 QSORT COMPARATORS ---
+int compareLeakAge(const void* a, const void* b) {
+    LeakHistoryEntry* lA = (LeakHistoryEntry*)a;
+    LeakHistoryEntry* lB = (LeakHistoryEntry*)b;
+    
+    // Push empty slots to the bottom
+    if (lA->leak.timestamp == 0 && lB->leak.timestamp == 0) return 0;
+    if (lA->leak.timestamp == 0) return 1;
+    if (lB->leak.timestamp == 0) return -1;
+    
+    if (sort_descending) return (lB->leak.timestamp > lA->leak.timestamp) ? 1 : (lB->leak.timestamp < lA->leak.timestamp) ? -1 : 0;
+    return (lA->leak.timestamp > lB->leak.timestamp) ? 1 : (lA->leak.timestamp < lB->leak.timestamp) ? -1 : 0;
+}
+
+int compareLeakLength(const void* a, const void* b) {
+    LeakHistoryEntry* lA = (LeakHistoryEntry*)a;
+    LeakHistoryEntry* lB = (LeakHistoryEntry*)b;
+    
+    if (lA->leak.timestamp == 0 && lB->leak.timestamp == 0) return 0;
+    if (lA->leak.timestamp == 0) return 1;
+    if (lB->leak.timestamp == 0) return -1;
+    
+    if (sort_descending) return (lB->leak.frame_length > lA->leak.frame_length) ? 1 : (lB->leak.frame_length < lA->leak.frame_length) ? -1 : 0;
+    return (lA->leak.frame_length > lB->leak.frame_length) ? 1 : (lA->leak.frame_length < lB->leak.frame_length) ? -1 : 0;
+}
+
+int compareLeakHits(const void* a, const void* b) {
+    LeakHistoryEntry* lA = (LeakHistoryEntry*)a;
+    LeakHistoryEntry* lB = (LeakHistoryEntry*)b;
+    
+    if (lA->leak.timestamp == 0 && lB->leak.timestamp == 0) return 0;
+    if (lA->leak.timestamp == 0) return 1;
+    if (lB->leak.timestamp == 0) return -1;
+    
+    if (sort_descending) return (lB->hitCount > lA->hitCount) ? 1 : (lB->hitCount < lA->hitCount) ? -1 : 0;
+    return (lA->hitCount > lB->hitCount) ? 1 : (lA->hitCount < lB->hitCount) ? -1 : 0;
+}
+
+// --- BULLETPROOF SORTING ENGINE ---
+void processL2Data() {
+    if (currentLeakSort == SORT_LEAK_AGE) {
+        qsort(leakHistory, MAX_LEAK_SLOTS, sizeof(LeakHistoryEntry), compareLeakAge);
+    } else if (currentLeakSort == SORT_LEAK_LENGTH) {
+        qsort(leakHistory, MAX_LEAK_SLOTS, sizeof(LeakHistoryEntry), compareLeakLength);
+    } else if (currentLeakSort == SORT_LEAK_HITS) {
+        qsort(leakHistory, MAX_LEAK_SLOTS, sizeof(LeakHistoryEntry), compareLeakHits);
+    }
 }
 
 bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
@@ -6014,13 +6311,19 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
             else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;  
             else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;  
             else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST; 
-            else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE; // <-- ADD THIS LINE
-            else currentSortMode = SORT_TOTAL;                                 // Loops back to TOTAL
+            else if (currentSortMode == SORT_DIST) currentSortMode = SORT_AGE; 
+            else currentSortMode = SORT_TOTAL;                                 
           }
           else if (currentRadioMode == RADIO_BLE) {
             if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
             else if (currentBleSortMode == SORT_BLE_DIST) currentBleSortMode = SORT_BLE_AGE;
             else currentBleSortMode = SORT_BLE_HITS;
+          }
+          // --- ADDED LAYER 2 LIVE TOGGLE ---
+          else if (currentRadioMode == RADIO_LAYER2) {
+            if (currentLeakSort == SORT_LEAK_AGE) currentLeakSort = SORT_LEAK_LENGTH;
+            else if (currentLeakSort == SORT_LEAK_LENGTH) currentLeakSort = SORT_LEAK_HITS;
+            else currentLeakSort = SORT_LEAK_AGE;
           }
           
           // 3. Redraw
@@ -6033,13 +6336,8 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
         // ZONE 2 (Center 145-290): SORT DIRECTION
         // ==========================================
         else if (t_x >= 145 && t_x <= 290) {
-          // 1. Wipe the inside
           tft.fillRect(148, 299, 139, 17, TFT_BLACK);
-          
-          // 2. Toggle the variable
           sort_descending = !sort_descending;
-          
-          // 3. Redraw
           drawChartFooter(); 
           delay(200);
         }
@@ -6048,13 +6346,8 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
         // ZONE 3 (Right 290-435): LOG/LINEAR SCALE
         // ==========================================
         else if (t_x > 290 && t_x <= 435) {
-          // 1. Wipe the inside
           tft.fillRect(293, 299, 139, 17, TFT_BLACK);
-          
-          // 2. Toggle the variable
           useLogScale = !useLogScale;
-          
-          // 3. Redraw
           drawChartFooter(); 
           delay(200);
         }
@@ -6074,24 +6367,12 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
           else if (currentRadioMode == RADIO_BLE) foxhunt_available = (sessionBleCount > 0);
           else if (currentRadioMode == RADIO_AP) foxhunt_available = (sessionApCount > 0);
 
-          // 1. THE GATE
-          if (!foxhunt_available) {
-              return false; // The button is cold. Ignore the touch entirely.
-          }
+          if (!foxhunt_available) return false; 
           
-          // 2. THE EXECUTION
           is_selecting_target = true;
           currentState = SCREEN_DEVICE_LIST;
           drawDeviceList();
-          
-          // 3. THE DEBOUNCE
-          delay(400); // Wait 400ms before accepting new touches
-      }
-      // SNIFFED LEAKS Button Touch Zone
-      else if (t_x > 300 && t_x < 450 && t_y > 90 && t_y < 130) {
-        currentState = SCREEN_LEAK_LIST; // Make sure to add this to your state enum!
-        drawLeakList();
-        delay(300); 
+          delay(400);
       }
       // Probe Request Tracker Button
       else if (t_x > 300 && t_x < 450 && t_y > 140 && t_y < 180) {
@@ -6107,7 +6388,6 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
           drawApScanner();
           delay(300);
         } else if (currentRadioMode == RADIO_AP) {
-          // Tap to cycle channels! 1-13, then back to unlocked (ALL)
           if (!target_locked) {
               target_locked = true;
               target_channel = 1;
@@ -6119,19 +6399,25 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
               }
           }
           
-          // Wipe the slate clean so the chart only shows APs on the new channel
           memset(traffic_history, 0, sizeof(traffic_history)); 
           absolute_max_traffic = 10;
           resetMonitorState(); 
           
-          drawMenu(); // Redraw the button immediately to show the new channel number
-          delay(150); // Snappy debounce for fast tapping
+          drawMenu(); 
+          delay(150); 
         }
       }
-      // Sniffed Devices Button
+      // ==========================================
+      // UNIFIED SNIFFED DEVICES / LEAK LIST BUTTON
+      // ==========================================
       else if (t_x > 50 && t_x < 250 && t_y > 240 && t_y < 280) {
         currentState = SCREEN_DEVICE_LIST;
         device_current_page = 0;
+        
+        // Force an immediate sort before drawing so the array is ready
+        if (currentRadioMode == RADIO_LAYER2) processL2Data();
+        else forceSessionSort();
+        
         drawDeviceList();
         delay(300);
       }
@@ -6140,18 +6426,17 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       // ==========================================
       else if (t_x > 300 && t_x < 450 && t_y > 190 && t_y < 230) {
         
-        target_locked = false; // Always break target locks on mode change
-        memset(traffic_history, 0, sizeof(traffic_history)); // Clear the absolute chart memory
-        absolute_max_traffic = 10;                           // Reset the absolute scaling ceiling
+        target_locked = false; 
+        memset(traffic_history, 0, sizeof(traffic_history)); 
+        absolute_max_traffic = 10;                           
 
-        // 1. Determine the next mode BEFORE we switch hardware
         RadioMode nextMode;
         if (currentRadioMode == RADIO_WIFI) nextMode = RADIO_BLE;
         else if (currentRadioMode == RADIO_BLE) nextMode = RADIO_AP;
         else if (currentRadioMode == RADIO_AP) nextMode = RADIO_CHANNELS;
+        else if (currentRadioMode == RADIO_CHANNELS) nextMode = RADIO_LAYER2;
         else nextMode = RADIO_WIFI;
 
-        // 2. INSTANT PARTIAL REDRAW (Zero Screen Flicker!)
         tft.setFreeFont(&UbuntuMono_Regular9pt7b);
         tft.setTextDatum(MC_DATUM); 
         
@@ -6170,16 +6455,18 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
           tft.drawRect(300, 190, 150, 40, TFT_WHITE);
           tft.setTextColor(TFT_WHITE);
           tft.drawString("MODE: NETWORKS", 375, 210);
-        } else {
+        } else if (nextMode == RADIO_CHANNELS) {
           tft.fillRect(300, 190, 150, 40, TFT_ORANGE);
           tft.drawRect(300, 190, 150, 40, TFT_WHITE);
           tft.setTextColor(TFT_WHITE);
           tft.drawString("MODE: CHANNELS", 375, 210);
+        } else if (nextMode == RADIO_LAYER2) {
+          tft.fillRect(300, 190, 150, 40, TFT_MAROON);
+          tft.drawRect(300, 190, 150, 40, TFT_WHITE);
+          tft.setTextColor(TFT_WHITE);
+          tft.drawString("MODE: LAYER 2", 375, 210);
         }
 
-        // ==========================================
-        // PARTIAL REDRAW FOR FOXHUNT BUTTON
-        // ==========================================
         bool foxhunt_available = false;
         
         if (nextMode == RADIO_BLE) {
@@ -6191,15 +6478,13 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
         }
 
         if (foxhunt_available) {
-            // Draw active red button
             tft.fillRoundRect(50, 90, 200, 40, 3, TFT_RED); 
             tft.drawRoundRect(50, 90, 200, 40, 3, TFT_WHITE);
             tft.setTextColor(TFT_WHITE);
             tft.drawString("FOXHUNT", 150, 110);
         } else {
-            // Overwrite with grey dead space
             uint16_t deadGrey = hex24to565(0x222222);
-            tft.fillRect(50, 90, 200, 50, deadGrey); // Height expanded to 50 to erase old hint text
+            tft.fillRect(50, 90, 200, 50, deadGrey); 
             tft.drawRect(50, 90, 200, 40, TFT_DARKGREY);
             tft.setTextColor(TFT_DARKGREY);
             tft.drawString("FOXHUNT", 150, 110);
@@ -6207,14 +6492,20 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
             tft.setTextColor(hex24to565(0x444444));
             tft.drawString("(no targets yet)", 150, 125);
         }
-        // ==========================================
         
-        tft.setTextDatum(TL_DATUM); // Reset datum for the rest of your UI
+        tft.setTextDatum(TL_DATUM); 
 
-        // 3. Let the ESP32 hang here for 500ms doing the heavy hardware swap
+        // ==========================================
+        // THE UNION SCRUB FIX
+        // Because leakHistory shares a union with Wi-Fi/BLE session data, 
+        // we MUST scrub it clean when switching to Layer 2. If we don't, the 
+        // L2 sorting engine will choke on Wi-Fi garbage bytes!
+        // ==========================================
+        if (nextMode == RADIO_LAYER2) {
+            memset(leakHistory, 0, sizeof(LeakHistoryEntry) * MAX_LEAK_SLOTS);
+        }
+
         switchRadioMode(nextMode);
-        
-        // Debounce
         delay(200);
       }
       // ==========================================
@@ -6226,21 +6517,17 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
         drawChartHeader();
         drawChartFooter();
         
-        // --- FLUSH THE DELTA-DRAW CACHE ---
         force_ui_refresh = true; 
         
-        // THE FIX: Wake the Wi-Fi radio back up if we are in ANY Wi-Fi based mode!
-        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS || currentRadioMode == RADIO_LAYER2) {
             esp_wifi_set_promiscuous(true); 
         }
         
-        // --- UPDATED: Allow AP mode to restore its target channel, and sync the hopper if unlocked ---
         if ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) && target_locked) {
           esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
         } else if (currentRadioMode != RADIO_BLE) {
           esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
         }
-        // -----------------------------------------------------------------------------
         
         current_x = 0;
         delay(300);
@@ -6254,18 +6541,16 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       
       // HEADER TOUCH (SORT CONTROLS)
       if (t_y <= 30) {
-        // ZONE 1: Sort Metric (X: 275 to 410)
         if (t_x >= 275 && t_x < 410) {
           if (currentProbeSortMode == PROBE_SORT_HITS) currentProbeSortMode = PROBE_SORT_DIST;
           else if (currentProbeSortMode == PROBE_SORT_DIST) currentProbeSortMode = PROBE_SORT_SSIDS;
           else if (currentProbeSortMode == PROBE_SORT_SSIDS) currentProbeSortMode = PROBE_SORT_AGE;
           else currentProbeSortMode = PROBE_SORT_HITS;
           
-          probe_current_page = 0; // Snap list back to page 1 upon resorting
+          probe_current_page = 0; 
           drawProbeTracker();
           delay(200);
         }
-        // ZONE 2: Sort Direction (X: 410 to 480)
         else if (t_x >= 410) {
           probe_sort_descending = !probe_sort_descending;
           probe_current_page = 0;
@@ -6276,19 +6561,16 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       
       // FOOTER TOUCH (NAVIGATION)
       else if (t_y > 285) {
-        // PREV PAGE (Left Third)
         if (t_x < 160 && probe_current_page > 0) {
           probe_current_page--;
           drawProbeTracker();
           delay(250);
         }
-        // NEXT PAGE (Right Third)
         else if (t_x > 320 && ((probe_current_page + 1) * PROBES_PER_PAGE) < total_sniffed_probes) {
           probe_current_page++;
           drawProbeTracker();
           delay(250);
         }
-        // BACK TO MENU (Center Third)
         else if (t_x >= 160 && t_x <= 320) {
           currentState = SCREEN_MENU;
           drawMenu(); 
@@ -6298,7 +6580,7 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
     }
 
     // ==========================================
-    // 3. AP SCANNER TOUCH LOGIC
+    // 4. AP SCANNER TOUCH LOGIC
     // ==========================================
     else if (currentState == SCREEN_AP_SCAN) {
       
@@ -6316,7 +6598,6 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       }
       
       // 2. AP SELECTION LIST ROWS (y: 80 to 290)
-      // THE FIX: Stretched the hot zone down to 290 to cover the 6th row
       else if (t_y >= 80 && t_y < 290) {
         
         int clicked_row = (t_y - 80) / 35; 
@@ -6329,9 +6610,6 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
           target_channel = WiFi.channel(actual_index);
           target_rssi = WiFi.RSSI(actual_index);
 
-          // ==========================================
-          // TACTICAL SUFFIX INJECTION
-          // ==========================================
           uint8_t* bssid = WiFi.BSSID(actual_index);
           String raw_ssid = WiFi.SSID(actual_index);
 
@@ -6358,7 +6636,6 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
             temp_ssid[17] = '\0';
             snprintf(target_ssid, sizeof(target_ssid), "%s", temp_ssid);
           }
-          // ==========================================
 
           target_locked = true;
 
@@ -6376,23 +6653,19 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       }
 
       // 3. PAGINATION & BACK FOOTER
-      // THE FIX: Pushed down from 280 to 290 so it doesn't overlap row 6
       else if (t_y >= 290) {
         int total_aps = WiFi.scanComplete();
         
-        // PREV PAGE
         if (t_x < 160 && ap_current_page > 0) {
           ap_current_page--;
           drawApScanner();
           delay(250);
         }
-        // NEXT PAGE
         else if (t_x > 320 && ((ap_current_page + 1) * APS_PER_PAGE) < total_aps) {
           ap_current_page++;
           drawApScanner();
           delay(250);
         }
-        // BACK TO MENU
         else if (t_x >= 160 && t_x <= 320) {
           currentState = SCREEN_MENU;
           ap_current_page = 0; 
@@ -6402,27 +6675,28 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       }
     }
 
-    // 3. FOXHUNT SCREEN TOUCH LOGIC
+    // ==========================================
+    // 5. FOXHUNT SCREEN TOUCH LOGIC
+    // ==========================================
     else if (currentState == SCREEN_FOXHUNT) {
-      // Abort Button (Bottom Center)
       if (t_x > 190 && t_x < 290 && t_y > 290) {
         is_foxhunting = false;
         is_selecting_target = false;
-        foxhunt_bounds_seeded = false; // Clear stale bounds
+        foxhunt_bounds_seeded = false; 
         
-        // --- ADD THESE 3 LINES ---
-        target_locked = false; // Release the lock
-        current_ch_idx = 0;    // Reset the hopper index cleanly
+        target_locked = false; 
+        current_ch_idx = 0;    
         esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
-        // -------------------------
 
-        currentState = SCREEN_MENU; // Route back to MENU
+        currentState = SCREEN_MENU; 
         drawMenu();
         delay(300);
       }
     }
     
-    // 4. SEEN DEVICES TOUCH LOGIC
+    // ==========================================
+    // 6. SEEN DEVICES / LEAK LIST TOUCH LOGIC
+    // ==========================================
     else if (currentState == SCREEN_DEVICE_LIST) {
       
       // ==========================================
@@ -6433,7 +6707,6 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
         if (t_x >= 275 && t_x < 405) {
           
           if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
-            // Standard Wi-Fi/AP Toggle Cycle
             if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;
             else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;
             else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;
@@ -6443,31 +6716,43 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
             else currentSortMode = SORT_TOTAL;
           } 
           else if (currentRadioMode == RADIO_CHANNELS) {
-            // Custom Channels Toggle Cycle (Loops back after PWR)
-            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;      // DN
-            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;    // UP
-            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;   // AVG Bytes
-            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;   // CV% Bytes
-            else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;  // PWR (Avg RSSI)
-            else currentSortMode = SORT_TOTAL;                                 // Skip AGE, loop back to TOTAL
+            if (currentSortMode == SORT_TOTAL) currentSortMode = SORT_TX;      
+            else if (currentSortMode == SORT_TX) currentSortMode = SORT_RX;    
+            else if (currentSortMode == SORT_RX) currentSortMode = SORT_AVG;   
+            else if (currentSortMode == SORT_AVG) currentSortMode = SORT_CV;   
+            else if (currentSortMode == SORT_CV) currentSortMode = SORT_DIST;  
+            else currentSortMode = SORT_TOTAL;                                 
           }
           else if (currentRadioMode == RADIO_BLE) {
-            // BLE Toggle Cycle
             if (currentBleSortMode == SORT_BLE_HITS) currentBleSortMode = SORT_BLE_DIST;
             else if (currentBleSortMode == SORT_BLE_DIST) currentBleSortMode = SORT_BLE_AGE;
             else currentBleSortMode = SORT_BLE_HITS;
           }
+          // --- ADDED LAYER 2 SORT TOGGLE ---
+          else if (currentRadioMode == RADIO_LAYER2) {
+            if (currentLeakSort == SORT_LEAK_AGE) currentLeakSort = SORT_LEAK_LENGTH;
+            else if (currentLeakSort == SORT_LEAK_LENGTH) currentLeakSort = SORT_LEAK_HITS;
+            else currentLeakSort = SORT_LEAK_AGE;
+          }
           
           device_current_page = 0; 
-          forceSessionSort(); 
+          
+          // Force sort array before rendering list
+          if (currentRadioMode == RADIO_LAYER2) processL2Data();
+          else forceSessionSort(); 
+          
           drawDeviceList();
           delay(200);
         }
         // ZONE 2: TOGGLE SORT DIRECTION (X: 410 to 480)
         else if (t_x >= 410) {
           sort_descending = !sort_descending;
-          device_current_page = 0; // Snap list back to page 1 upon resorting
-          forceSessionSort();
+          device_current_page = 0; 
+          
+          // Force sort array before rendering list
+          if (currentRadioMode == RADIO_LAYER2) processL2Data();
+          else forceSessionSort();
+          
           drawDeviceList();
           delay(200);
         }
@@ -6477,27 +6762,33 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       // B. FOOTER NAVIGATION (Y >= 294)
       // ==========================================
       else if (t_y >= 294) { 
-        int items_per_page = 7;
+        // --- ADDED LAYER 2 PAGINATION MATH ---
+        int items_per_page = (currentRadioMode == RADIO_LAYER2) ? 3 : 7;
         int total_devices = 0;
         
         if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
         else if (currentRadioMode == RADIO_BLE) total_devices = sessionBleCount;
         else if (currentRadioMode == RADIO_AP) total_devices = sessionApCount;
         else if (currentRadioMode == RADIO_CHANNELS) total_devices = sessionChannelCount;
+        else if (currentRadioMode == RADIO_LAYER2) {
+            for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                if (leakHistory[i].hitCount > 0) total_devices++;
+            }
+        }
 
-        // 1. PREV PAGE (X: 0 to 160)
+        // 1. PREV PAGE
         if (t_x < 160 && device_current_page > 0) {
           device_current_page--;
           drawDeviceList();
           delay(250);
         }
-        // 2. NEXT PAGE (X: 320 to 480)
+        // 2. NEXT PAGE
         else if (t_x > 320 && ((device_current_page + 1) * items_per_page) < total_devices) {
           device_current_page++;
           drawDeviceList();
           delay(250);
         }
-        // 3. BACK TO MENU (X: 160 to 320)
+        // 3. BACK TO MENU
         else if (t_x >= 160 && t_x <= 320) {
           currentState = SCREEN_MENU;
           device_current_page = 0; 
@@ -6509,8 +6800,11 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       // ==========================================
       // C. LIST ROW SELECTION (The "Hot" Devices)
       // ==========================================
-      else if (t_y >= 62 && t_y < 294) { // Protected area ends at 294
+      else if (t_y >= 62 && t_y < 294) { 
         
+        // --- ADDED LAYER 2 GUARD (No foxhunting for leaks yet) ---
+        if (currentRadioMode == RADIO_LAYER2) return false;
+
         int tapped_screen_row = (t_y - 62) / 33;
         int total_devices = 0;
         
@@ -6522,34 +6816,29 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
 
         if (tapped_screen_row < 7 && tapped_array_index < total_devices) {
           if (is_selecting_target) {
-            // --- TARGET ACQUIRED: LAUNCH FOXHUNT ---
             is_selecting_target = false;
             is_foxhunting = true;
             smoothed_rssi = -100.0f;
-            last_displayed_rssi = -999;      // Force frame 1 redraw
+            last_displayed_rssi = -999;      
 
             if (currentRadioMode == RADIO_WIFI) {
                memcpy(foxhunt_target_mac, sessionData[tapped_array_index].mac, 6);
-    
-              // The struct already contains the resolved name, "<Randomized>", or "Unknown Device"
               strncpy(foxhunt_target_vendor, sessionData[tapped_array_index].vendor, sizeof(foxhunt_target_vendor) - 1);
-              foxhunt_target_vendor[sizeof(foxhunt_target_vendor) - 1] = '\0'; // Safe null termination
+              foxhunt_target_vendor[sizeof(foxhunt_target_vendor) - 1] = '\0'; 
     
               foxhunt_rssi_min = sessionData[tapped_array_index].rssi_min;
               foxhunt_rssi_max = sessionData[tapped_array_index].rssi_max;
               foxhunt_bounds_seeded = (sessionData[tapped_array_index].packets > 6);
     
             } else if (currentRadioMode == RADIO_AP) {
-              // Allows Foxhunting routers from the AP list!
               memcpy(foxhunt_target_mac, sessionApData[tapped_array_index].bssid, 6);
               strncpy(foxhunt_target_vendor, sessionApData[tapped_array_index].ssid, sizeof(foxhunt_target_vendor) - 1);
-              foxhunt_target_vendor[sizeof(foxhunt_target_vendor) - 1] = '\0'; // Safe null termination
+              foxhunt_target_vendor[sizeof(foxhunt_target_vendor) - 1] = '\0'; 
               
               foxhunt_rssi_min = sessionApData[tapped_array_index].rssi_min;
               foxhunt_rssi_max = sessionApData[tapped_array_index].rssi_max;
               foxhunt_bounds_seeded = (sessionApData[tapped_array_index].packets > 6);
 
-              // THE INSTANT LOCK STRATEGY (Routers are Stationary)
               target_locked = true; 
               target_channel = sessionApData[tapped_array_index].channel;
               esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
@@ -6560,27 +6849,21 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
               if (foxhunt_target_vendor[0] == '\0') {
                 strncpy(foxhunt_target_vendor, "<Unnamed BLE>", 25);
               }
-              foxhunt_target_vendor[25] = '\0'; // Safe null termination
+              foxhunt_target_vendor[25] = '\0'; 
               
-              // BLE has no spatial bounds yet. Sentinels set to -100 to match globals.
               foxhunt_rssi_min = -100;
               foxhunt_rssi_max = -100;
               foxhunt_bounds_seeded = false;
               
-              // BLE does not use the channel hopper
               target_locked = false;
             }
 
             currentState = SCREEN_FOXHUNT;
             
-            // ==========================================
-            // --- THE AWAKENING FIX ---
-            // Wake the radio back up before drawing the radar!
             if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
                 esp_wifi_set_promiscuous(true);
             }
             pause_sniffing = false;
-            // ==========================================
 
             drawFoxhuntScreen(); 
             delay(200);
@@ -6589,40 +6872,10 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
       }
 
     }
-    // ==========================================
-    // 5. SNIFFED LEAKS TOUCH LOGIC
-    // ==========================================
-    else if (currentState == SCREEN_LEAK_LIST) {
-      
-      // PREV PAGE (Bottom Left)
-      if (t_y > 290 && t_x < 160) {
-        if (leak_current_page > 0) { 
-          leak_current_page--;
-          drawLeakList();
-          delay(200); // debounce touch
-        }
-      }
-      // BACK TO MENU (Center Button)
-      else if (t_y > 290 && t_x >= 160 && t_x <= 320) {
-        currentState = SCREEN_MENU;
-        drawMenu();
-        delay(300);
-      }
-      // NEXT PAGE (Bottom Right)
-      else if (t_y > 290 && t_x > 320) {
-        // Assuming ~3 entries per page with your custom 3-line formatting,
-        // and 10 MAX_LEAK_SLOTS, your maximum page index is 3 (pages 0, 1, 2, 3).
-        int maxPages = 3; 
-        
-        if (leak_current_page < maxPages) {
-          leak_current_page++;
-          drawLeakList();
-          delay(200); // debounce touch
-        }
-      }
-    }
-    return trigger_render; // 3. Return the decision back to loop()
-
+    
+    // (Notice SCREEN_LEAK_LIST block is completely deleted!)
+    
+    return trigger_render; 
 }
 
 void updateFoxhuntRadar() {
@@ -6825,7 +7078,10 @@ void runProbeCorrelationEngine() {
 // CORE 1: RAM-ONLY QUEUE CONSUMER
 // ==========================================
 void processLeakQueue() {
-    CleartextLeak incomingLeak;
+    if (leakQueue == NULL) return;
+
+    Layer2Capture incomingLeak; // Uses the unified struct
+    bool ui_needs_update = false; // Prevents UI flicker during packet bursts
     
     // Process all available items in the queue without blocking (tick delay = 0)
     while (xQueueReceive(leakQueue, &incomingLeak, 0) == pdTRUE) {
@@ -6843,59 +7099,140 @@ void processLeakQueue() {
             snprintf(incomingLeak.text, sizeof(incomingLeak.text), 
                      "ICMPv6 ND: Who has %s? Tell %s", tgt_str, src_str);
         }
+
+        // --- NEW: ADVANCED TERMINAL DEDUPLICATION (LRU CACHE) ---
+        bool foundTerminalMatch = false;
+        int matchIndex = -1;
+
+        // Scan all 5 visible terminal slots for a match
+        for (int i = 0; i < MAX_TERMINAL_LINES; i++) {
+            if (terminal_history[i].timestamp > 0 && 
+                memcmp(terminal_history[i].src_mac, incomingLeak.src_mac, 6) == 0 &&
+                strcmp(terminal_history[i].text, incomingLeak.text) == 0) {
+                foundTerminalMatch = true;
+                matchIndex = i;
+                break;
+            }
+        }
+
+        if (foundTerminalMatch) {
+            // 1. Increment hits and update LAST seen time
+            terminal_hits[matchIndex]++;
+            terminal_history[matchIndex].timestamp = incomingLeak.timestamp; 
+
+            // 2. Bubble this active flow back up to the top (index 0)
+            if (matchIndex > 0) {
+                Layer2Capture tempCap = terminal_history[matchIndex];
+                uint16_t tempHits = terminal_hits[matchIndex];
+                uint32_t tempFirst = terminal_first_seen[matchIndex]; // Grab the original first_seen
+
+                // Shift everything ABOVE the match down by one slot
+                for (int t = matchIndex; t > 0; t--) {
+                    terminal_history[t] = terminal_history[t-1];
+                    terminal_hits[t] = terminal_hits[t-1];
+                    terminal_first_seen[t] = terminal_first_seen[t-1]; // Shift first_seen
+                }
+                
+                // Put the actively hitting packet back at the top
+                terminal_history[0] = tempCap;
+                terminal_hits[0] = tempHits;
+                terminal_first_seen[0] = tempFirst; // Restore original first_seen to the top
+            }
+            ui_needs_update = true;
+        } else {
+            // It's a brand new packet. Shift everything down.
+            for (int t = MAX_TERMINAL_LINES - 1; t > 0; t--) {
+                terminal_history[t] = terminal_history[t-1];
+                terminal_hits[t] = terminal_hits[t-1]; 
+                terminal_first_seen[t] = terminal_first_seen[t-1]; 
+            }
+            terminal_history[0] = incomingLeak;
+            terminal_hits[0] = 1; 
+            terminal_first_seen[0] = incomingLeak.timestamp; // Initialize first_seen!
+            ui_needs_update = true;
+        }
         
         bool isDuplicate = false;
-        
-        // 1. Check if this exact payload from this MAC is already in RAM
+                
+        // 1. Deduplication (Sync to Session)
+        // Using your original robust identity check: Same MAC + Same Text
         for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
-            if (leakHistory[i].hitCount > 0 && 
+            if (leakHistory[i].leak.timestamp > 0 && 
                 memcmp(leakHistory[i].leak.src_mac, incomingLeak.src_mac, 6) == 0 &&
                 strcmp(leakHistory[i].leak.text, incomingLeak.text) == 0) {
                 
                 leakHistory[i].hitCount++;
                 leakHistory[i].leak.timestamp = incomingLeak.timestamp; 
-                isDuplicate = true;
                 
-                // BUBBLE UP: Move this active leak back to the top (Index 0)
-                if (i > 0) {
-                    auto tempLeak = leakHistory[i];
-                    memmove(&leakHistory[1], &leakHistory[0], sizeof(leakHistory[0]) * i);
-                    leakHistory[0] = tempLeak;
-                }
+                // (Note: We no longer memmove() to bubble-up here because 
+                // the processL2Data sorting engine handles the ordering!)
+                
+                isDuplicate = true;
+                ui_needs_update = true;
                 break;
             }
         }
 
-        // 2. If it's a new leak, insert it at the top of the history list
+        // 2. New Leak: Find an empty slot or Evict the oldest (LRU)
         if (!isDuplicate) {
-            memmove(&leakHistory[1], &leakHistory[0], sizeof(leakHistory[0]) * (MAX_LEAK_SLOTS - 1));
-
-            leakHistory[0].leak = incomingLeak;
-            leakHistory[0].hitCount = 1;
-            leakHistory[0].first_seen = incomingLeak.timestamp;
-
-            // 3. Resolve BOTH MAC vendors
-            MacRecord tempRec;
+            int targetIndex = -1;
+            uint32_t oldestTime = 0xFFFFFFFF;
             
-            memset(&tempRec, 0, sizeof(MacRecord));      
-            memcpy(tempRec.mac, incomingLeak.src_mac, 6); 
-            resolveMacVendor(&tempRec); 
-            strncpy(leakHistory[0].src_vendor, tempRec.vendor, 8);
-            leakHistory[0].src_vendor[8] = '\0'; 
-            
-            memset(&tempRec, 0, sizeof(MacRecord));      
-            memcpy(tempRec.mac, incomingLeak.dst_mac, 6); 
-            resolveMacVendor(&tempRec); 
-            strncpy(leakHistory[0].dst_vendor, tempRec.vendor, 8);
-            leakHistory[0].dst_vendor[8] = '\0'; 
+            // Scan for empty slot or find the oldest to evict
+            for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                if (leakHistory[i].leak.timestamp == 0) {
+                    targetIndex = i; // Found an empty slot!
+                    break;
+                }
+                if (leakHistory[i].leak.timestamp < oldestTime) {
+                    oldestTime = leakHistory[i].leak.timestamp;
+                    targetIndex = i; // Track the oldest slot just in case
+                }
+            }
+
+            // Insert into the target slot (Memory stays flat, no shifting!)
+            if (targetIndex != -1) {
+                leakHistory[targetIndex].leak = incomingLeak;
+                leakHistory[targetIndex].hitCount = 1;
+                leakHistory[targetIndex].first_seen = incomingLeak.timestamp;
+                leakHistory[targetIndex].flow_hash = incomingLeak.flow_hash;
+
+                // 3. Resolve BOTH MAC vendors
+                MacRecord tempRec;
+                
+                memset(&tempRec, 0, sizeof(MacRecord));      
+                memcpy(tempRec.mac, incomingLeak.src_mac, 6); 
+                resolveMacVendor(&tempRec); 
+                strncpy(leakHistory[targetIndex].src_vendor, tempRec.vendor, 15);
+                leakHistory[targetIndex].src_vendor[15] = '\0'; 
+                
+                memset(&tempRec, 0, sizeof(MacRecord));      
+                memcpy(tempRec.mac, incomingLeak.dst_mac, 6); 
+                resolveMacVendor(&tempRec); 
+                strncpy(leakHistory[targetIndex].dst_vendor, tempRec.vendor, 15);
+                leakHistory[targetIndex].dst_vendor[15] = '\0'; 
+                
+                ui_needs_update = true;
+            }
+            Serial.printf("🚨 LEAK: %s\n", incomingLeak.text);
         }
+    }
+    
+    // ==========================================
+    // 4. BATCHED UI REFRESH
+    // ==========================================
+    // Trigger render outside the while loop to prevent screen stutter
+    if (ui_needs_update && currentState == SCREEN_DEVICE_LIST && currentRadioMode == RADIO_LAYER2) {
+        processL2Data(); // Sort the array based on the current user setting
+        drawDeviceList();  // Asynchronously paint the unified screen
     }
 }
 
 bool updateRadioHopper() {
     bool trigger_render = false; // Local render trigger
 
-    if (currentState == SCREEN_CHART || currentState == SCREEN_FOXHUNT) {
+    // THE FIX: Added SCREEN_LEAK_LIST so the radio continues scanning the spectrum
+    if (currentState == SCREEN_CHART || currentState == SCREEN_FOXHUNT || currentState == SCREEN_LEAK_LIST) {
         static unsigned long lastTimer = 0;
 
         tft.setTextWrap(false);
@@ -6904,7 +7241,7 @@ bool updateRadioHopper() {
         // RADIO-AWARE TIMERS
         // ==========================================
         // Both Wi-Fi and AP modes need the Channel Hopper!
-        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS) {
+        if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_CHANNELS || currentRadioMode == RADIO_LAYER2) {
             if (!target_locked) {
                 if (millis() - lastTimer > HOP_INTERVAL) {
                     lastTimer = millis();
@@ -6917,7 +7254,7 @@ bool updateRadioHopper() {
 
                     esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
 
-                    // THE FIX: Only draw the channel indicator if we are on the main chart!
+                    // Only draw the channel indicator if we are on the main chart!
                     if (currentState == SCREEN_CHART) {
                         // 1. Reduced width from 75 to 62 to prevent clipping the " | "
                         tft.fillRect(5, 0, 62, 20, TFT_BLACK);
@@ -6949,7 +7286,7 @@ bool updateRadioHopper() {
                 lastTimer = millis();
                 trigger_render = true; // Replaces should_render = true
                 
-                // THE FIX: Only draw the BLE sniffing indicator if we are on the main chart!
+                // Only draw the BLE sniffing indicator if we are on the main chart!
                 if (currentState == SCREEN_CHART) {
                     tft.fillRect(5, 0, 200, 20, TFT_BLACK); 
                     tft.setFreeFont(&UbuntuMono_Regular9pt7b);
@@ -7423,20 +7760,30 @@ void processChannelData() {
 }
 
 void drawWaterfallChart() {
-    drawTemporalLegend();
-    drawPersistentTopN();
+    // 1. Gate the legends
+    if (currentRadioMode != RADIO_LAYER2) {
+        drawTemporalLegend();
+        drawPersistentTopN();
+    }
 
     int chart_area_height = CHART_BOTTOM - chart_start_y;
-    int split_y = chart_start_y + (chart_area_height * 3) / 4; 
-    int ERASER_WIDTH = 44;
     
-    // Pure wipe logic
+    // FIX 3: Use the exact same 3/4 split for ALL modes to keep the bottom graph height identical
+    int split_y = chart_start_y + (chart_area_height * 3) / 4; 
+    
+    int ERASER_WIDTH = 44;
+
+    // 3. Adjust the eraser to ONLY clear the bottom pane in L2 mode
+    int clear_start_y = (currentRadioMode == RADIO_LAYER2) ? (split_y + 1) : (chart_start_y + 1);
+    int clear_height = CHART_BOTTOM - clear_start_y;
+    
+    // Pure wipe logic (using dynamic clear_start_y and clear_height)
     if (current_x + ERASER_WIDTH <= 480) {
-        tft.fillRect(current_x, chart_start_y + 1, ERASER_WIDTH, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+        tft.fillRect(current_x, clear_start_y, ERASER_WIDTH, clear_height, TFT_BLACK);
     } else {
         int w1 = 480 - current_x;
-        tft.fillRect(current_x, chart_start_y + 1, w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
-        tft.fillRect(0, chart_start_y + 1, ERASER_WIDTH - w1, CHART_BOTTOM - chart_start_y, TFT_BLACK);
+        tft.fillRect(current_x, clear_start_y, w1, clear_height, TFT_BLACK);
+        tft.fillRect(0, clear_start_y, ERASER_WIDTH - w1, clear_height, TFT_BLACK);
     }
 
     // X-Axis Time Ticks
@@ -7449,7 +7796,7 @@ void drawWaterfallChart() {
     }
 
     int current_y = split_y - 1; 
-    uint32_t current_total_metric = 0; 
+    uint32_t current_total_metric = 0;
 
     // --- CHART PLOTTING ---
     if (currentRadioMode == RADIO_WIFI) {
@@ -7610,6 +7957,173 @@ void drawWaterfallChart() {
             }
         }
     }
+    static uint32_t last_rendered_leak_timestamp = 0;
+    if (currentRadioMode == RADIO_LAYER2) {
+        
+        // Redraw only if the newest packet in the buffer has changed
+        if (terminal_history[0].timestamp != last_rendered_leak_timestamp && terminal_history[0].timestamp > 0) {
+            last_rendered_leak_timestamp = terminal_history[0].timestamp;
+
+            int terminal_start_y = 26;
+            tft.fillRect(0, terminal_start_y, 480, split_y - terminal_start_y - 1, TFT_BLACK);
+            
+            tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+            tft.setTextDatum(TL_DATUM);
+            
+            int cursor_y = terminal_start_y + 4;
+            
+            // Draw oldest (highest index) to newest (index 0) to create a downward scrolling effect
+            for (int i = MAX_TERMINAL_LINES - 1; i >= 0; i--) {
+                if (terminal_history[i].timestamp == 0) continue;
+                
+                // STRICT BOUNDARY: Stop drawing if the next 4-line block (3 meta + 1 text) crosses the red line
+                if (cursor_y + 56 > split_y) break; 
+
+                // --- LIVE VENDOR LOOKUP (FAST RAM CACHE SCAN) ---
+                char srcVend[9] = "";
+                char dstVend[9] = "";
+                
+                for (int v = 0; v < MAX_LEAK_SLOTS; v++) {
+                    if (leakHistory[v].leak.timestamp == 0) continue;
+                    
+                    // Check if we already resolved the Source MAC
+                    if (srcVend[0] == '\0') {
+                        if (memcmp(terminal_history[i].src_mac, leakHistory[v].leak.src_mac, 6) == 0) {
+                            strncpy(srcVend, leakHistory[v].src_vendor, 8); srcVend[8] = '\0';
+                        } else if (memcmp(terminal_history[i].src_mac, leakHistory[v].leak.dst_mac, 6) == 0) {
+                            strncpy(srcVend, leakHistory[v].dst_vendor, 8); srcVend[8] = '\0';
+                        }
+                    }
+                    // Check if we already resolved the Dest MAC
+                    if (dstVend[0] == '\0') {
+                        if (memcmp(terminal_history[i].dst_mac, leakHistory[v].leak.src_mac, 6) == 0) {
+                            strncpy(dstVend, leakHistory[v].src_vendor, 8); dstVend[8] = '\0';
+                        } else if (memcmp(terminal_history[i].dst_mac, leakHistory[v].leak.dst_mac, 6) == 0) {
+                            strncpy(dstVend, leakHistory[v].dst_vendor, 8); dstVend[8] = '\0';
+                        }
+                    }
+                    if (srcVend[0] != '\0' && dstVend[0] != '\0') break; // Found both, stop searching
+                }
+                
+                // Fallbacks and string trimming
+                if (srcVend[0] == '\0') strcpy(srcVend, "Unknown");
+                if (dstVend[0] == '\0') strcpy(dstVend, "Unknown");
+                for (int s = 7; s >= 0; s--) { if (srcVend[s] == ' ') srcVend[s] = '\0'; else break; }
+                for (int s = 7; s >= 0; s--) { if (dstVend[s] == ' ') dstVend[s] = '\0'; else break; }
+
+                // --- INLINE FORMATTERS ---
+                // 1. Compact Length (Max 4 chars)
+                char lenStr[8];
+                uint16_t fLen = terminal_history[i].frame_length;
+                if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
+                else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
+
+                // 2. Safe IPv6 Buffers (40 bytes to prevent overflow)
+                char srcIpStr[40] = {0}, dstIpStr[40] = {0};
+                getIpString(terminal_history[i].ip_version, terminal_history[i].src_ip, srcIpStr, sizeof(srcIpStr));
+                getIpString(terminal_history[i].ip_version, terminal_history[i].dst_ip, dstIpStr, sizeof(dstIpStr));
+                
+                // 3. IPv6 Shortener (Compresses consecutive and single zero-blocks)
+                char* p;
+                while ((p = strstr(srcIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
+                while ((p = strstr(dstIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
+                while ((p = strstr(srcIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+                while ((p = strstr(dstIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+
+                // 4. Fast Live Age Calculator (Seconds Resolution)
+                char firstSeenStr[8], lastSeenStr[8], ageCombo[18];
+                uint32_t now_ms = millis();
+                uint32_t first_sec = (now_ms - terminal_first_seen[i]) / 1000;
+                uint32_t last_sec = (now_ms - terminal_history[i].timestamp) / 1000;
+                
+                if (first_sec < 60) snprintf(firstSeenStr, sizeof(firstSeenStr), "%ds", first_sec);
+                else if (first_sec < 3600) snprintf(firstSeenStr, sizeof(firstSeenStr), "%dm", first_sec / 60);
+                else snprintf(firstSeenStr, sizeof(firstSeenStr), "%dh", first_sec / 3600);
+                
+                if (last_sec < 60) snprintf(lastSeenStr, sizeof(lastSeenStr), "%ds", last_sec);
+                else if (last_sec < 3600) snprintf(lastSeenStr, sizeof(lastSeenStr), "%dm", last_sec / 60);
+                else snprintf(lastSeenStr, sizeof(lastSeenStr), "%dh", last_sec / 3600);
+                
+                snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr);
+
+                // 5. Fetch Live SSID (Using persistent cache to bypass the union)
+                char safeSsid[13] = "Unknown";
+                for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
+                    if (bssidCache[ap].last_seen == 0) continue; // Skip empty slots
+                    
+                    if (memcmp(terminal_history[i].bssid, bssidCache[ap].bssid, 6) == 0) {
+                        strncpy(safeSsid, bssidCache[ap].ssid, 12);
+                        safeSsid[12] = '\0';
+                        break;
+                    }
+                }
+
+                // --- ROW 1: [xHit] MAC(Vend)>MAC(Vend)|Len|C ---
+                tft.setTextColor(TFT_CYAN);
+                char line1[80];
+                snprintf(line1, sizeof(line1), "[x%d]%02X%02X%02X%02X%02X%02X(%s)>%02X%02X%02X%02X%02X%02X(%s)|%s|C%d", 
+                         terminal_hits[i],
+                         terminal_history[i].src_mac[0], terminal_history[i].src_mac[1], terminal_history[i].src_mac[2],
+                         terminal_history[i].src_mac[3], terminal_history[i].src_mac[4], terminal_history[i].src_mac[5],
+                         srcVend,
+                         terminal_history[i].dst_mac[0], terminal_history[i].dst_mac[1], terminal_history[i].dst_mac[2],
+                         terminal_history[i].dst_mac[3], terminal_history[i].dst_mac[4], terminal_history[i].dst_mac[5],
+                         dstVend, lenStr, terminal_history[i].channel);
+                tft.drawString(line1, 4, cursor_y);
+                cursor_y += 14; 
+
+                // --- ROW 2: BSSID(SSID)|DIR|SUBTYPE|PROTO|PORTS ---
+                tft.setTextColor(TFT_YELLOW);
+                char portStr[24] = "";
+                if (terminal_history[i].protocol == 6 || terminal_history[i].protocol == 17) {
+                    snprintf(portStr, sizeof(portStr), "|%d>%d", terminal_history[i].src_port, terminal_history[i].dst_port);
+                }
+                char line2[80];
+                snprintf(line2, sizeof(line2), "%02X%02X%02X%02X%02X%02X(%s)|%s|%s|%s%s",
+                         terminal_history[i].bssid[0], terminal_history[i].bssid[1], terminal_history[i].bssid[2],
+                         terminal_history[i].bssid[3], terminal_history[i].bssid[4], terminal_history[i].bssid[5],
+                         safeSsid,
+                         getDirectionStr(terminal_history[i].direction), 
+                         getSubtypeStr(terminal_history[i].frame_subtype),
+                         getProtocolStr(terminal_history[i].protocol), portStr);
+                tft.drawString(line2, 4, cursor_y);
+                cursor_y += 14;
+
+                // --- ROW 3: IP>IP|first/last ---
+                tft.setTextColor(TFT_ORANGE);
+                char line3[90];
+                snprintf(line3, sizeof(line3), "%s>%s|%s",
+                         srcIpStr, dstIpStr, ageCombo);
+                tft.drawString(line3, 4, cursor_y);
+                cursor_y += 14; 
+
+                // --- ROW 4 & 5: PAYLOAD ---
+                tft.setTextColor(TFT_GREEN);
+                int cursor_x = 4;
+                
+                for (int j = 0; j < MAX_LEAK_STR_LEN; j++) {
+                    char c = terminal_history[i].text[j];
+                    if (c == '\0') break; 
+
+                    if (c < 32 || c > 126) c = '.';
+
+                    char charStr[2] = {c, '\0'};
+                    tft.drawString(charStr, cursor_x, cursor_y);
+                    
+                    cursor_x += 8; 
+                    
+                    // Constrained wrap to prevent screen edge clipping (pulled back to 460px)
+                    if (cursor_x >= 460) {
+                        cursor_x = 4;
+                        cursor_y += 14;
+                        // Strict check to prevent payload wrapping over the line
+                        if (cursor_y + 14 > split_y) break; 
+                    }
+                }
+                cursor_y += 12; // Margin before the next packet begins
+            }
+        }
+    }
 
     // --- BOTTOM PANE: SCALING ENGINE ---
     static RadioMode last_seen_mode = currentRadioMode;
@@ -7695,14 +8209,15 @@ void drawWaterfallChart() {
     }
 
     // --- OVERLAYS ---
-    tft.drawFastVLine(current_x + 2, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+    // Gate the sweeping vertical lines to ONLY draw in the area below clear_start_y
+    tft.drawFastVLine(current_x + 2, clear_start_y, clear_height, COLOR_HOT_CHEST);
     
     if (current_x + ERASER_WIDTH <= 480) {
-        tft.drawFastVLine(current_x + ERASER_WIDTH - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+        tft.drawFastVLine(current_x + ERASER_WIDTH - 1, clear_start_y, clear_height, COLOR_HOT_CHEST);
         tft.drawFastHLine(current_x, split_y, ERASER_WIDTH, COLOR_HOT_CHEST);
     } else {
         int w1 = 480 - current_x;
-        tft.drawFastVLine(ERASER_WIDTH - w1 - 1, chart_start_y + 1, CHART_BOTTOM - chart_start_y, COLOR_HOT_CHEST);
+        tft.drawFastVLine(ERASER_WIDTH - w1 - 1, clear_start_y, clear_height, COLOR_HOT_CHEST);
         tft.drawFastHLine(current_x, split_y, w1, COLOR_HOT_CHEST);
         tft.drawFastHLine(0, split_y, ERASER_WIDTH - w1, COLOR_HOT_CHEST);
     }
@@ -7713,14 +8228,17 @@ void drawWaterfallChart() {
 
         tft.setFreeFont(&UbuntuMono_Regular8pt7b);
         tft.setTextDatum(TL_DATUM);
-
         tft.setTextColor(COLOR_HOT_CHEST);
-        tft.drawString("100%", text_x, chart_start_y + 4);
-        int mid_y = chart_start_y + ((split_y - chart_start_y) / 2);
-        tft.drawString("50%", text_x, mid_y - 6);
 
-        if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
-        else tft.drawString("|=2m", text_x, split_y - 15);
+        // Gate the top pane percentages AND the time scale so they don't overwrite L2 text
+        if (currentRadioMode != RADIO_LAYER2) {
+            tft.drawString("100%", text_x, chart_start_y + 4);
+            int mid_y = chart_start_y + ((split_y - chart_start_y) / 2);
+            tft.drawString("50%", text_x, mid_y - 6);
+            
+            if (currentRadioMode == RADIO_BLE || target_locked) tft.drawString("|=1m", text_x, split_y - 15); 
+            else tft.drawString("|=2m", text_x, split_y - 15);
+        }
 
         char maxStr[16];
         if (currentRadioMode == RADIO_BLE) {
@@ -7753,14 +8271,19 @@ void setup() {
   initProbeTracker();
 
   // ==========================================
-  // 1. CREATE THE LEAKY LAYER 2 QUEUE
+  // 1. CREATE THE LEAKY LAYER 2 QUEUES
   // ==========================================
-  leakQueue = xQueueCreate(10, sizeof(CleartextLeak));
+  leakQueue = xQueueCreate(10, sizeof(Layer2Capture));
   if (leakQueue == NULL) {
-      Serial.println("[!] FATAL: Failed to create leakQueue! Out of heap.");
-  } else {
-      Serial.println("[*] leakQueue created successfully.");
+      Serial.println("[!] FATAL: Failed to create leakQueue!");
   }
+  
+  // --- ADD THIS: Allocate the raw payload queue for Core 0 ---
+  liveDumpQueue = xQueueCreate(10, sizeof(Layer2Capture));
+  if (liveDumpQueue == NULL) {
+      Serial.println("[!] FATAL: Failed to create liveDumpQueue!");
+  }
+  // -----------------------------------------------------------
 
   // ==========================================
   // 2. INITIALIZE DISPLAY
@@ -7882,7 +8405,8 @@ void loop() {
   // ==========================================
   processPendingVendors();
   runProbeCorrelationEngine(); 
-  processLeakQueue();           // <--- ADD IT RIGHT HERE
+  processLiveDumpQueue();
+  processLeakQueue();
   
   uint16_t t_x = 0, t_y = 0;
   bool should_render = false;
@@ -7910,6 +8434,12 @@ void loop() {
     else if (currentRadioMode == RADIO_BLE) processBleData();
     else if (currentRadioMode == RADIO_AP) processApData();
     else if (currentRadioMode == RADIO_CHANNELS) processChannelData();
+    // --- ADDED LAYER 2 MATH GATE ---
+    else if (currentRadioMode == RADIO_LAYER2) {
+        // Snapshot the bytes for the UI and reset the ISR counter
+        l2_bytes_render = l2_bytes_tick;
+        l2_bytes_tick = 0;
+    }
 
     pause_sniffing = false; // Unlock immediately!
 
@@ -7922,9 +8452,8 @@ void loop() {
         drawApScanner();
     } else if (currentState == SCREEN_PROBE_TRACKER) {
         drawProbeTracker();
-    } else if (currentState == SCREEN_LEAK_LIST) {
-        drawLeakList(); // <--- ALSO ADD YOUR NEW SCREEN HERE!
-    }
+    } 
+    // Do NOT add SCREEN_LEAK_LIST here. It updates itself asynchronously!
     
     Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
   }
