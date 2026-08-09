@@ -1541,6 +1541,108 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
         uint16_t qtype = read_u16(payload, length, cursor);
         cursor += 4;                          // QTYPE + QCLASS
 
+        // --- RESCUED: The Noise Filter ---
+        // Ignore generic local arpa/service queries as they clutter the screen.
+        // We still advanced the cursor (above) so the parser doesn't break!
+        bool is_noisy = (strstr(qname, "in-addr.arpa") || 
+                         strstr(qname, "ip6.arpa") || 
+                         strstr(qname, "_tcp.local") || 
+                         strstr(qname, "_udp.local"));
+
+        if (!is_noisy) {
+            int n = snprintf(out_text + written, max_len - written, " Q:%s(%u)", qname, qtype);
+            written = std::min((int)max_len - 1, written + n);
+        }
+    }
+
+    // --- Answers ---
+    for (uint16_t a = 0; a < ancount && cursor < length && written < (int)max_len - 1; a++) {
+        char aname[96] = {0};
+        int next = decode_dns_name(payload, length, cursor, aname, sizeof(aname));
+        if (next <= cursor) break;
+        cursor = next;
+
+        uint16_t atype  = read_u16(payload, length, cursor);
+        uint16_t rdlen  = read_u16(payload, length, cursor + 8);
+        int rdata_off   = cursor + 10;         // past TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+
+        if (rdata_off + rdlen <= length) {
+            if (atype == 12) {  
+                // --- PTR Record (Standard Reverse Lookup) ---
+                char target[96] = {0};
+                decode_dns_name(payload, length, rdata_off, target, sizeof(target));
+                int n = snprintf(out_text + written, max_len - written, " A:%s->%s", aname, target);
+                written = std::min((int)max_len - 1, written + n);
+                
+            } else if (atype == 16 && dst_port == 5353) { 
+                // --- RESCUED: The TXT Record Sweeper (mDNS Specs) ---
+                // Targeted ASCII sweep looking for key=value pairs in the RDATA payload
+                int best_s = 0, best_l = 0, cur_s = 0, cur_l = 0;
+                bool has_equals = false;
+                bool best_has_equals = false;
+
+                for (int i = rdata_off; i < rdata_off + rdlen; i++) {
+                    char c = payload[i];
+                    if (c >= 32 && c <= 126) { // Printable ASCII
+                        if (cur_l == 0) cur_s = i;
+                        if (c == '=') has_equals = true;
+                        cur_l++;
+                        
+                        if (cur_l > best_l || (has_equals && !best_has_equals)) {
+                            best_l = cur_l; 
+                            best_s = cur_s;
+                            best_has_equals = has_equals;
+                        }
+                    } else {
+                        cur_l = 0;
+                        has_equals = false;
+                    }
+                }
+
+                if (best_l >= 6) {
+                    // Safely copy the discovered TXT string into the UI buffer
+                    int copy_len = std::min(best_l, (int)(max_len - written - 15));
+                    if (copy_len > 0) {
+                        int n = snprintf(out_text + written, max_len - written, " TXT:%.*s", copy_len, &payload[best_s]);
+                        written = std::min((int)max_len - 1, written + n);
+                    }
+                }
+            } else {
+                // --- Standard Fallback for A/AAAA/Other Records ---
+                int n = snprintf(out_text + written, max_len - written, " A:%s(t%u)", aname, atype);
+                written = std::min((int)max_len - 1, written + n);
+            }
+        }
+
+        cursor = rdata_off + rdlen;   // always skip the full RDATA, decoded or not
+    }
+
+    format_reverse_lookups(out_text, max_len);
+    return true;
+}
+
+/*
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, char* out_text, size_t max_len) {
+    if (length < 12) return false;
+
+    uint16_t qdcount = (payload[4] << 8) | payload[5];
+    uint16_t ancount = (payload[6] << 8) | payload[7];
+    if (qdcount == 0 && ancount == 0) return false;
+
+    const char* proto = (dst_port == 5353) ? "mDNS" : "DNS";
+    int written = snprintf(out_text, max_len, "%s %uQ,%uA:", proto, qdcount, ancount);
+    int cursor = 12;
+
+    // --- Questions ---
+    for (uint16_t q = 0; q < qdcount && cursor < length && written < (int)max_len - 1; q++) {
+        char qname[96] = {0};
+        int next = decode_dns_name(payload, length, cursor, qname, sizeof(qname));
+        if (next <= cursor) break;           // malformed name, bail safely
+        cursor = next;
+
+        uint16_t qtype = read_u16(payload, length, cursor);
+        cursor += 4;                          // QTYPE + QCLASS
+
         int n = snprintf(out_text + written, max_len - written, " Q:%s(%u)", qname, qtype);
         written = std::min((int)max_len - 1, written + n);
     }
@@ -1573,7 +1675,6 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
     return true;
 }
 
-/*
 // ---------------------------------------------------------
 // DNS & mDNS PARSER (Ports 53, 5353)
 // Extracts requested domains, local hostnames, and TXT specs
@@ -1639,6 +1740,341 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
 }
 */
 
+bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 16) return false; // Too small for any valid HTTP request with a Host header
+
+    const char* p = (const char*)payload;
+    const char* payload_end = p + length;
+    const char* host_start = nullptr;
+
+    // Sliding window search for "Host: " (case-insensitive for safety)
+    for (int i = 0; i < length - 6; i++) {
+        if ((p[i] == 'H' || p[i] == 'h') && 
+            (p[i+1] == 'o' || p[i+1] == 'O') && 
+            (p[i+2] == 's' || p[i+2] == 'S') && 
+            (p[i+3] == 't' || p[i+3] == 'T') && 
+            p[i+4] == ':' && p[i+5] == ' ') {
+            host_start = &p[i+6];
+            break;
+        }
+    }
+
+    if (host_start) {
+        const char* host_end = host_start;
+        
+        // Scan forward until we hit the end of the line (\r or \n)
+        while (host_end < payload_end && *host_end != '\r' && *host_end != '\n') {
+            host_end++;
+        }
+        
+        int name_len = host_end - host_start;
+        if (name_len > 0) {
+            // Safely truncate if the domain is longer than our UI buffer
+            int copy_len = std::min(name_len, (int)max_len - 12); 
+            snprintf(out_text, max_len, "HTTP Host: %.*s", copy_len, host_start);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Minimum viable TLS Record + Client Hello size
+    if (length < 44) return false; 
+
+    // We only care about Handshake records (0x16) containing a Client Hello (0x01)
+    if (payload[0] != 0x16 || payload[5] != 0x01) return false;
+
+    // Start cursor at the Session ID Length field
+    uint16_t cursor = 43; 
+
+    // 1. Skip Session ID
+    if (cursor >= length) return false;
+    uint8_t sid_len = payload[cursor];
+    cursor += 1 + sid_len;
+
+    // 2. Skip Cipher Suites
+    if (cursor + 1 >= length) return false;
+    uint16_t cipher_len = (payload[cursor] << 8) | payload[cursor + 1];
+    cursor += 2 + cipher_len;
+
+    // 3. Skip Compression Methods
+    if (cursor >= length) return false;
+    uint8_t comp_len = payload[cursor];
+    cursor += 1 + comp_len;
+
+    // 4. Get Extensions Length
+    if (cursor + 1 >= length) return false;
+    uint16_t ext_total_len = (payload[cursor] << 8) | payload[cursor + 1];
+    cursor += 2;
+
+    // 5. Walk the Extensions List
+    uint16_t ext_end = cursor + ext_total_len;
+    if (ext_end > length) ext_end = length; // Hard clamp to payload boundary
+
+    while (cursor + 3 < ext_end) {
+        uint16_t ext_type = (payload[cursor] << 8) | payload[cursor + 1];
+        uint16_t ext_len = (payload[cursor + 2] << 8) | payload[cursor + 3];
+        cursor += 4;
+
+        if (ext_type == 0x0000) { // Extension 0x0000 is Server Name Indication (SNI)
+            
+            // Inside SNI: Server Name List Length (2 bytes)
+            if (cursor + 1 >= ext_end) return false;
+            uint16_t list_cursor = cursor + 2;
+
+            // Extract the actual hostname
+            while (list_cursor + 2 < cursor + ext_len && list_cursor + 2 < ext_end) {
+                uint8_t name_type = payload[list_cursor];
+                uint16_t name_len = (payload[list_cursor + 1] << 8) | payload[list_cursor + 2];
+                list_cursor += 3;
+
+                if (name_type == 0x00) { // 0x00 designates a DNS Hostname
+                    if (list_cursor + name_len <= ext_end && name_len > 0) {
+                        int copy_len = std::min((int)name_len, (int)max_len - 15); 
+                        snprintf(out_text, max_len, "HTTPS SNI: %.*s", copy_len, &payload[list_cursor]);
+                        return true;
+                    }
+                }
+                list_cursor += name_len;
+            }
+            return false; // Found SNI but couldn't resolve string
+        }
+        cursor += ext_len; // Jump to the next extension
+    }
+
+    return false;
+}
+
+bool parse_ipp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 20) return false; // Too small to contain useful IPP attributes
+
+    const char* p = (const char*)payload;
+    char user[32] = {0};
+    char doc[64] = {0};
+    bool found_something = false;
+
+    // Sliding window to hunt for specific IPP attribute strings
+    for (int i = 0; i < length - 20; i++) {
+        
+        // 1. Hunt for the user who sent the job
+        if (memcmp(&p[i], "requesting-user-name", 20) == 0) {
+            // Ensure we have room to read the 2-byte value length
+            if (i + 20 + 2 <= length) {
+                uint16_t val_len = (payload[i+20] << 8) | payload[i+21];
+                
+                // Ensure the value itself doesn't exceed the packet boundary
+                if (val_len > 0 && i + 22 + val_len <= length) {
+                    int copy_len = std::min((int)val_len, 31);
+                    memcpy(user, &payload[i+22], copy_len);
+                    user[copy_len] = '\0';
+                    found_something = true;
+                }
+            }
+        }
+        
+        // 2. Hunt for the name of the file being printed
+        else if (memcmp(&p[i], "document-name", 13) == 0) {
+            if (i + 13 + 2 <= length) {
+                uint16_t val_len = (payload[i+13] << 8) | payload[i+14];
+                
+                if (val_len > 0 && i + 15 + val_len <= length) {
+                    int copy_len = std::min((int)val_len, 63);
+                    memcpy(doc, &payload[i+15], copy_len);
+                    doc[copy_len] = '\0';
+                    found_something = true;
+                }
+            }
+        }
+    }
+
+    // Format the output based on what we successfully extracted
+    if (found_something) {
+        if (user[0] != '\0' && doc[0] != '\0') {
+            snprintf(out_text, max_len, "IPP Print: %s -> '%s'", user, doc);
+        } else if (doc[0] != '\0') {
+            snprintf(out_text, max_len, "IPP Print: doc '%s'", doc);
+        } else if (user[0] != '\0') {
+            snprintf(out_text, max_len, "IPP Print: user '%s'", user);
+        }
+        return true;
+    }
+    
+    // Fallback: If it's an IPP port but we missed the specific binary attributes, 
+    // it might just be the initial HTTP POST header negotiating the connection.
+    if (memcmp(p, "POST ", 5) == 0) {
+        snprintf(out_text, max_len, "IPP/CUPS: Print Job Initiated");
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_syslog(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 5) return false; // Too small to be a valid syslog message
+
+    const char* p = (const char*)payload;
+    int start_idx = 0;
+
+    // Syslog typically starts with a Priority value in brackets, e.g., <14>
+    if (p[0] == '<') {
+        for (int i = 1; i < 6 && i < length; i++) {
+            if (p[i] == '>') {
+                start_idx = i + 1;
+                break;
+            }
+        }
+    }
+
+    // Clean up non-printable characters and isolate the primary log string
+    char clean_log[96] = {0};
+    int write_idx = 0;
+    
+    for (int i = start_idx; i < length && write_idx < sizeof(clean_log) - 1; i++) {
+        if (p[i] >= 32 && p[i] <= 126) { // Printable ASCII only
+            clean_log[write_idx++] = p[i];
+        } else if (p[i] == '\n' || p[i] == '\r') {
+            break; // Stop at the end of the line
+        }
+    }
+    
+    if (write_idx > 0) {
+        snprintf(out_text, max_len, "Syslog: %s", clean_log);
+        return true;
+    }
+    
+    return false;
+}
+
+bool parse_rtsp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 16) return false;
+
+    const char* p = (const char*)payload;
+    const char* payload_end = p + length;
+    const char* id_start = nullptr;
+
+    // 1. Sliding window to hunt for hardware identifiers (Server or User-Agent)
+    for (int i = 0; i < length - 12; i++) {
+        if (memcmp(&p[i], "Server: ", 8) == 0) {
+            id_start = &p[i+8];
+            break;
+        } else if (memcmp(&p[i], "User-Agent: ", 12) == 0) {
+            id_start = &p[i+12];
+            break;
+        }
+    }
+
+    if (id_start) {
+        const char* end = id_start;
+        // Read until the end of the line
+        while (end < payload_end && *end != '\r' && *end != '\n') end++;
+        
+        int copy_len = std::min((int)(end - id_start), (int)(max_len - 15));
+        if (copy_len > 0) {
+            snprintf(out_text, max_len, "RTSP Device: %.*s", copy_len, id_start);
+            return true;
+        }
+    }
+
+    // 2. Fallback: Catch the stream initialization commands
+    if (memcmp(p, "SETUP ", 6) == 0 || memcmp(p, "DESCRIBE ", 9) == 0 || memcmp(p, "PLAY ", 5) == 0) {
+        const char* end = p;
+        while (end < payload_end && *end != '\r' && *end != '\n') end++;
+        
+        int copy_len = std::min((int)(end - p), (int)(max_len - 10));
+        snprintf(out_text, max_len, "RTSP: %.*s", copy_len, p);
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_ftp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 6) return false;
+
+    const char* p = (const char*)payload;
+
+    // We specifically hunt for the authentication commands
+    if (memcmp(p, "USER ", 5) == 0 || memcmp(p, "PASS ", 5) == 0) {
+        const char* end = p;
+        
+        // Read until the end of the line
+        while (end < p + length && *end != '\r' && *end != '\n') end++;
+        
+        int copy_len = std::min((int)(end - p), (int)(max_len - 6));
+        snprintf(out_text, max_len, "FTP: %.*s", copy_len, p);
+        return true;
+    }
+
+    // Optional: Catch successful login responses from the server
+    if (memcmp(p, "230 ", 4) == 0) {
+        snprintf(out_text, max_len, "FTP: Login Successful");
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_telnet(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 1) return false;
+
+    char clean_text[64] = {0};
+    int write_idx = 0;
+
+    for (int i = 0; i < length && write_idx < sizeof(clean_text) - 1; i++) {
+        // Skip Telnet IAC (Interpret As Command) negotiations
+        // These are typically 3-byte sequences: [0xFF] [Command] [Option]
+        if (payload[i] == 0xFF) {
+            i += 2; // Jump over the next two bytes, plus the loop's i++ will push us past the block
+            continue;
+        }
+
+        // Only grab printable ASCII characters
+        if (payload[i] >= 32 && payload[i] <= 126) {
+            clean_text[write_idx++] = payload[i];
+        } 
+        // Stop if we hit a newline (end of a command or prompt)
+        else if (payload[i] == '\r' || payload[i] == '\n') {
+            if (write_idx > 0) break;
+        }
+    }
+
+    // Only print if we captured a meaningful string (e.g., "login:", "root", or a password)
+    if (write_idx > 2) {
+        snprintf(out_text, max_len, "Telnet: %s", clean_text);
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_tftp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 4) return false; // Minimum size for Opcode + 1-byte filename + Null terminator
+
+    // TFTP Opcodes are 2 bytes
+    uint16_t opcode = (payload[0] << 8) | payload[1];
+
+    if (opcode == 1 || opcode == 2) {
+        const char* action = (opcode == 1) ? "Read" : "Write";
+        
+        // The filename starts immediately at offset 2 and is null-terminated
+        const char* filename = (const char*)&payload[2];
+        int fn_len = 0;
+        
+        // Find the length of the filename safely within the payload bounds
+        while (2 + fn_len < length && payload[2 + fn_len] != '\0') {
+            fn_len++;
+        }
+
+        if (fn_len > 0) {
+            int copy_len = std::min((int)fn_len, (int)(max_len - 15));
+            snprintf(out_text, max_len, "TFTP %s: %.*s", action, copy_len, filename);
+            return true;
+        }
+    }
+
+    return false;
+}
 // ---------------------------------------------------------
 // SSDP VERBOSE PARSER (Port 1900)
 // Extracts First Line, HOST, NT/ST, SERVER, USN, LOCATION, CACHE
@@ -2676,12 +3112,55 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     return; // EXIT EARLY: Do not let Management frames hit the bandwidth math!
   }
   // ==========================================
+  // L2 handling:
+  // ==========================================
+  // 1. MASTER FRAME FILTER (Data & Deauths)
+  // ==========================================
+  uint8_t frame_type = payload[0] & 0x0C;
+  uint8_t frame_subtype = (payload[0] & 0xF0) >> 4;
 
-  // 1. Filter out everything except Data Frames (Type 0x08)
-  if ((payload[0] & 0x0C) != 0x08) return;
+  // Allow Data frames (Type 0x08) AND Deauth frames (Type 0x00, Subtype 12)
+  if (frame_type != 0x08 && !(frame_type == 0x00 && frame_subtype == 12)) return;
 
   // ==========================================
-  // LEAKY LAYER 2 CLEARTEXT EXTRACTOR
+  // 2. INSTANT DEAUTH INTERCEPTOR
+  // ==========================================
+  if (frame_type == 0x00 && frame_subtype == 12) {
+      uint32_t now_ms = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
+      
+      // Management frame headers are strictly 24 bytes. 
+      // The 2-byte Reason Code sits immediately after the header (Little-Endian).
+      uint16_t reason_code = 0;
+      if (len >= 26) {
+          reason_code = payload[24] | (payload[25] << 8);
+      }
+
+      Layer2Capture leak;
+      memset(&leak, 0, sizeof(Layer2Capture));
+      
+      leak.timestamp = now_ms;
+      leak.frame_length = pkt->rx_ctrl.sig_len;
+      leak.channel = pkt->rx_ctrl.channel;
+      leak.frame_subtype = 12;
+      leak.is_high_value = true; // Deauths are always a massive red flag!
+      
+      // Address 1: Destination, Address 2: Source, Address 3: BSSID
+      memcpy(leak.dst_mac, payload + 4, 6);
+      memcpy(leak.src_mac, payload + 10, 6);
+      memcpy(leak.bssid, payload + 16, 6);
+
+      // Create a highly visible alert using the Reason Code
+      snprintf(leak.text, MAX_LEAK_STR_LEN - 1, "DEAUTH (Reason: %d)", reason_code);
+
+      // Fire directly to the UI and Logger, completely bypassing the Data parser
+      if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
+      if (liveDumpQueue != NULL) xQueueSendFromISR(liveDumpQueue, &leak, NULL);
+      
+      return; 
+  }
+
+  // ==========================================
+  // 3. LEAKY LAYER 2 CLEARTEXT EXTRACTOR
   // ==========================================
   if (currentRadioMode == RADIO_LAYER2) { // <-- THE CRITICAL GATE
       // 1. TALLY ABSOLUTE RF VOLUME (Before the gate!)
@@ -2713,8 +3192,29 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               uint8_t captured_ip_version = 0;
               uint8_t captured_src_ip[16] = {0};
               uint8_t captured_dst_ip[16] = {0};
+
+              // --- NEW: A-MSDU DE-AGGREGATOR ---
+              // Since header_len already shifted us past the 2-byte QoS Control field,
+              // we look backward exactly 2 bytes to check the A-MSDU Present flag (Bit 7).
+              if (captured_subtype == 8) {
+                  bool is_amsdu = (frame_body[-2] & 0x80) != 0;
+                  
+                  if (is_amsdu && body_len > 14) {
+                      // Skip the 14-byte A-MSDU subframe header (DA + SA + Length)
+                      uint16_t subframe_len = (frame_body[12] << 8) | frame_body[13];
+                      
+                      frame_body += 14; 
+                      
+                      // Constrain the payload length so the extractors don't bleed into the next subframe
+                      if (subframe_len < body_len) {
+                          body_len = subframe_len;
+                      } else {
+                          body_len -= 14;
+                      }
+                  }
+              }
               
-              // 1. Skip LLC/SNAP Header (8 bytes) if present. 
+              // 1. Skip LLC/SNAP Header (8 bytes) if present.
               if (body_len > 8 && frame_body[0] == 0xAA && frame_body[1] == 0xAA) {
                   ether_type = (frame_body[6] << 8) | frame_body[7]; // <--- GRAB ETHERTYPE HERE  
                   frame_body += 8;
@@ -3156,10 +3656,28 @@ void processLiveDumpQueue() {
             custom_extracted = parse_arp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 0.5 EAPOL (WPA/WPA2/WPA3 Handshake) ---
-        else if (l2_cap.ether_type == 0x888E) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL WPA Authentication Handshake");
+        else if (l2_cap.ether_type == 0x888E && l2_cap.payload_len >= 2) {
+            uint8_t eapol_type = l2_cap.raw_payload[1];
+            
+            switch (eapol_type) {
+                case 0:
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: EAP Packet (802.1X Auth)");
+                    break;
+                case 1:
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Start");
+                    break;
+                case 2:
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Logoff");
+                    break;
+                case 3:
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL-Key (WPA Handshake)");
+                    l2_cap.is_high_value = true; // Only tag the actual handshake keys as high value!
+                    break;
+                default:
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Unknown Type %d", eapol_type);
+                    break;
+            }
             custom_extracted = true;
-            l2_cap.is_high_value = true; // Tag it as high value to ensure it survives triage!
         }
         // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
         else if (l2_cap.dst_port == 67 || l2_cap.dst_port == 68) {
@@ -3180,6 +3698,50 @@ void processLiveDumpQueue() {
         // --- 4. DNS and mDNS (Ports 53, 5353) ---
         else if (l2_cap.dst_port == 53 || l2_cap.dst_port == 5353) {
             custom_extracted = parse_dns_mdns(l2_cap.raw_payload, l2_cap.payload_len, l2_cap.dst_port, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 4.5 HTTP Host Header (Port 80) ---
+        else if (l2_cap.dst_port == 80) {
+            custom_extracted = parse_http_host(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 4.6 HTTPS SNI Extraction (Port 443) ---
+        else if (l2_cap.dst_port == 443) {
+            // Only process if the payload starts with 0x16 (TLS Handshake) and 0x03 (TLS Version 1.2/1.3)
+            if (l2_cap.payload_len > 5 && l2_cap.raw_payload[0] == 0x16 && l2_cap.raw_payload[1] == 0x03) {
+                custom_extracted = parse_tls_sni(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            }
+        }
+        // --- 4.7 IPP / CUPS Printing (Port 631) ---
+        else if (l2_cap.dst_port == 631 || l2_cap.src_port == 631) {
+            custom_extracted = parse_ipp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) {
+                l2_cap.is_high_value = true; // Tag it so it survives triage!
+            }
+        }
+        // --- 4.8 Infrastructure Syslog (Port 514) ---
+        else if (l2_cap.dst_port == 514) {
+            custom_extracted = parse_syslog(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) {
+                l2_cap.is_high_value = true; // Syslog is excellent diagnostic intel
+            }
+        }
+        // --- 4.9 RTSP IoT Video Streaming (Port 554) ---
+        else if (l2_cap.dst_port == 554 || l2_cap.src_port == 554) {
+            custom_extracted = parse_rtsp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
+        // --- 4.10 FTP Passwords & Commands (Port 21) ---
+        else if (l2_cap.dst_port == 21 || l2_cap.src_port == 21) {
+            custom_extracted = parse_ftp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true;
+        }
+        // --- 4.11 Telnet Cleartext Shell (Port 23) ---
+        else if (l2_cap.dst_port == 23 || l2_cap.src_port == 23) {
+            custom_extracted = parse_telnet(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true;
+        }
+        // --- 4.12 TFTP Firmware/Config Transfers (Port 69) ---
+        else if (l2_cap.dst_port == 69) {
+            custom_extracted = parse_tftp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true;
         }
         // --- 5. SSDP / UPnP (Port 1900) ---
         else if (l2_cap.dst_port == 1900) {
