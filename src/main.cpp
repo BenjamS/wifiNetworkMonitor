@@ -171,6 +171,18 @@ uint32_t l2_bytes_render = 0;
 Layer2Capture terminal_history[MAX_TERMINAL_LINES];
 uint16_t terminal_hits[MAX_TERMINAL_LINES] = {0};
 uint32_t terminal_first_seen[MAX_TERMINAL_LINES] = {0};
+
+volatile uint32_t debug_dropped_packets = 0;
+volatile uint32_t ui_total_arrived = 0;
+volatile uint32_t ui_dropped_packets = 0;
+
+// ISR-side (Core 0) — deauth + crypto/WEP interceptors
+volatile uint32_t leak_isr_attempts = 0;
+volatile uint32_t leak_isr_dropped  = 0;
+
+// Core 1 — processLiveDumpQueue() repush after parsing
+uint32_t leak_core1_attempts = 0;
+uint32_t leak_core1_dropped  = 0;
 // ------------------------------------------
 // FORMATTING HELPERS
 // ------------------------------------------
@@ -806,7 +818,7 @@ void updateFoxhuntSignal(int packet_rssi) {
 //              " " for extractCleartext style)
 bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t max_len,
                              uint8_t min_run = 4, bool flatten_ws = false,
-                             const char* separator = " | ") {
+                             const char* separator = "|") {
     uint16_t out_idx = 0;
     uint16_t consecutive = 0;
     uint16_t printable_count = 0;
@@ -843,12 +855,6 @@ bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t
     return printable_count > 10;
 }
 
-bool extractCleartext(const uint8_t* payload, uint16_t payload_len, char* output_buffer) {
-    // 4-char minimum run (filters noise blips), CR/LF/TAB flattened to spaces,
-    // single-space separator — preserves this function's original style.
-    return extract_printable_runs(payload, payload_len, output_buffer, MAX_LEAK_STR_LEN,
-                                   /*min_run=*/4, /*flatten_ws=*/true, /*separator=*/" ");
-}
 // ==========================================
 // PROTOCOL TRANSLATORS (NetBIOS, mDNS, Cast)
 // ==========================================
@@ -1520,6 +1526,290 @@ static inline uint16_t read_u16(const uint8_t* p, uint16_t len, int offset) {
     return (p[offset] << 8) | p[offset + 1];
 }
 
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
+    if (length < 12) return false; 
+
+    bool is_response = (payload[2] & 0x80) != 0;
+
+    // ==========================================
+    // 1. THE SMART OSINT DOMAIN RIPPER 
+    // ==========================================
+    char domains[256] = {0};
+    int d_idx = 0;
+    int offset = 12; // Start immediately after the 12-byte DNS header
+    int valid_labels = 0;
+    bool in_domain = false; 
+
+    // Helper macro to perfectly match strings and lengths at compile-time
+    #define NOISE_MATCH(str) (len_byte == (sizeof(str) - 1) && memcmp(&payload[offset+1], str, sizeof(str) - 1) == 0)
+
+    // Scan the ENTIRE payload, ignoring strict DNS structural boundaries
+    while (offset < length) {
+        uint8_t len_byte = payload[offset];
+
+        if (len_byte == 0x00) {
+            in_domain = false; 
+            offset++;
+            continue;
+        }
+
+        if ((len_byte & 0xC0) == 0xC0) {
+            in_domain = false; 
+            offset += 2;
+            continue; 
+        }
+
+        if (len_byte > 0 && len_byte <= 63 && offset + 1 + len_byte <= length) {
+            
+            bool is_printable = true;
+            for (int j = 0; j < len_byte; j++) {
+                char c = payload[offset + 1 + j];
+                if (c < 32 || c > 126) {
+                    is_printable = false;
+                    break;
+                }
+            }
+
+            if (is_printable) {
+                // The Macro-Hardened Noise Filter
+                bool is_noise = false;
+                //if (NOISE_MATCH("_tcp")) is_noise = true;
+                //else if (NOISE_MATCH("_udp")) is_noise = true;
+                //else if (NOISE_MATCH("local")) is_noise = true;
+                //else if (NOISE_MATCH("arpa")) is_noise = true;
+                //else if (NOISE_MATCH("in-addr")) is_noise = true;
+                //else if (NOISE_MATCH("ip6")) is_noise = true;
+                //else if (NOISE_MATCH("_appsvcprepair")) is_noise = true;
+                //else if (NOISE_MATCH("_companion-link")) is_noise = true;
+                //else if (NOISE_MATCH("_services")) is_noise = true;
+                //else if (NOISE_MATCH("_dns-sd")) is_noise = true;
+
+                if (!is_noise) {
+                    if (d_idx + len_byte + 3 < sizeof(domains)) {
+                        bool is_duplicate = false;
+                        if (valid_labels > 0 && !in_domain) {
+                            // Fast heuristic deduplication against the immediate prior string
+                            if (d_idx >= len_byte && memcmp(&domains[d_idx - len_byte], &payload[offset+1], len_byte) == 0) {
+                                is_duplicate = true;
+                            }
+                        }
+
+                        if (!is_duplicate) {
+                            if (valid_labels > 0) {
+                                if (in_domain) domains[d_idx++] = '.';
+                                else {
+                                    domains[d_idx++] = ','; 
+                                    domains[d_idx++] = ' ';
+                                }
+                            }
+                            memcpy(&domains[d_idx], &payload[offset+1], len_byte);
+                            d_idx += len_byte;
+                            valid_labels++;
+                            in_domain = true; 
+                        } else {
+                            in_domain = false;
+                        }
+                    }
+                } else {
+                    in_domain = false; 
+                }
+            } else {
+                in_domain = false; 
+            }
+            offset += len_byte + 1; 
+        } else {
+            in_domain = false; 
+            offset++;
+        }
+    }
+    
+    #undef NOISE_MATCH 
+
+    domains[d_idx] = '\0';
+
+    if (valid_labels > 0) {
+        snprintf(out_text, max_len, "%s %s: %s", is_mdns ? "mDNS" : "DNS", is_response ? "Ans" : "Qry", domains);
+        return true;
+    }
+
+    // ==========================================
+    // 2. SALVAGED TXT RECORD SWEEPER (Fallback)
+    // ==========================================
+    if (is_mdns) {
+        int best_score = 0, best_s = 0, best_l = 0;
+        int cur_s = 0, cur_l = 0;
+        bool has_equals = false;
+
+        for (int i = 12; i < length; i++) {
+            char c = payload[i];
+            if (c >= 32 && c <= 126) { 
+                if (cur_l == 0) cur_s = i;
+                if (c == '=') has_equals = true;
+                cur_l++;
+            } else {
+                if (cur_l > 0) {
+                    int cur_score = cur_l + (has_equals ? 15 : 0);
+                    if (cur_score > best_score) {
+                        best_score = cur_score;
+                        best_l = cur_l;
+                        best_s = cur_s;
+                    }
+                }
+                cur_l = 0;
+                has_equals = false;
+            }
+        }
+        
+        if (cur_l > 0) { 
+            int cur_score = cur_l + (has_equals ? 15 : 0);
+            if (cur_score > best_score) {
+                best_score = cur_score; best_l = cur_l; best_s = cur_s;
+            }
+        }
+
+        if (best_l >= 6 && best_score >= 15) {
+            int copy_len = std::min(best_l, (int)max_len - 15);
+            snprintf(out_text, max_len, "mDNS TXT: %.*s", copy_len, &payload[best_s]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
+    if (length < 12) return false; // Minimum size for a DNS header
+
+    const char* p = (const char*)payload;
+    
+    // Check the QR (Query/Response) bit in the DNS Flags (Byte 2)
+    bool is_response = (payload[2] & 0x80) != 0;
+
+    // ==========================================
+    // 1. mDNS TXT RECORD EXTRACTION
+    // ==========================================
+    if (is_mdns) {
+        char device_name[64] = {0};
+        char service_name[64] = {0};
+        bool found_dnm = false;
+        bool found_sn = false;
+
+        // A. Targeted Apple AWDL Extraction
+        for (int i = 12; i < length - 4; i++) {
+            if (!found_dnm && memcmp(&p[i], "dnm=", 4) == 0) {
+                int copy_len = 0;
+                while (i + 4 + copy_len < length && copy_len < 63 && 
+                       p[i + 4 + copy_len] >= 32 && p[i + 4 + copy_len] <= 126) {
+                    copy_len++;
+                }
+                memcpy(device_name, &p[i + 4], copy_len);
+                device_name[copy_len] = '\0';
+                found_dnm = true;
+            }
+            else if (!found_sn && memcmp(&p[i], "sn=", 3) == 0) {
+                int copy_len = 0;
+                while (i + 3 + copy_len < length && copy_len < 63 && 
+                       p[i + 3 + copy_len] >= 32 && p[i + 3 + copy_len] <= 126) {
+                    copy_len++;
+                }
+                memcpy(service_name, &p[i + 3], copy_len);
+                service_name[copy_len] = '\0';
+                found_sn = true;
+            }
+        }
+
+        if (found_dnm && found_sn) {
+            snprintf(out_text, max_len, "Apple mDNS: %s [%s]", device_name, service_name);
+            return true;
+        } else if (found_dnm) {
+            snprintf(out_text, max_len, "Apple mDNS: %s", device_name);
+            return true;
+        } else if (found_sn) {
+            snprintf(out_text, max_len, "Apple mDNS: Svc=[%s]", service_name);
+            return true;
+        }
+
+        // B. SALVAGED: Generic TXT Sweeper (For non-Apple devices)
+        // If no Apple tags were found, sweep for the longest key=value string
+        int best_s = 0, best_l = 0, cur_s = 0, cur_l = 0;
+        bool has_equals = false;
+        bool best_has_equals = false;
+
+        for (int i = 12; i < length; i++) {
+            char c = payload[i];
+            if (c >= 32 && c <= 126) { // Printable ASCII
+                if (cur_l == 0) cur_s = i;
+                if (c == '=') has_equals = true;
+                cur_l++;
+                
+                if (cur_l > best_l || (has_equals && !best_has_equals)) {
+                    best_l = cur_l; 
+                    best_s = cur_s;
+                    best_has_equals = has_equals;
+                }
+            } else {
+                cur_l = 0;
+                has_equals = false;
+            }
+        }
+
+        // Only trigger if we found a reasonably sized string with an equals sign
+        if (best_l >= 6 && best_has_equals) {
+            int copy_len = std::min(best_l, (int)max_len - 15);
+            snprintf(out_text, max_len, "mDNS TXT: %.*s", copy_len, &payload[best_s]);
+            return true;
+        }
+    }
+
+    // ==========================================
+    // 2. STANDARD DNS DOMAIN EXTRACTION (Fallback)
+    // ==========================================
+    char domain[128] = {0};
+    int d_idx = 0;
+    int i = 12; // Start immediately after DNS header
+    
+    while (i < length && p[i] != 0x00 && d_idx < sizeof(domain) - 2) {
+        uint8_t label_len = p[i];
+        
+        // Abort if we hit a DNS compression pointer (0xC0) to prevent infinite loops
+        if ((label_len & 0xC0) == 0xC0) {
+            break; 
+        }
+
+        if (label_len > 0 && label_len <= 63 && (i + 1 + label_len) < length) {
+            if (d_idx > 0) domain[d_idx++] = '.';
+            memcpy(&domain[d_idx], &p[i + 1], label_len);
+            d_idx += label_len;
+            i += label_len + 1;
+        } else {
+            break; // Malformed or out of bounds
+        }
+    }
+    
+    domain[d_idx] = '\0';
+
+    if (d_idx > 0) {
+        // SALVAGED: The Noise Filter
+        //if (strstr(domain, "in-addr.arpa") || 
+        //    strstr(domain, "ip6.arpa") || 
+        //    strstr(domain, "_tcp.local") || 
+        //    strstr(domain, "_udp.local")) {
+        //    return false; // Silently drop noisy infrastructure queries
+        //}
+
+        if (is_mdns) {
+            snprintf(out_text, max_len, "mDNS %s: %s", is_response ? "Ans" : "Qry", domain);
+        } else {
+            snprintf(out_text, max_len, "DNS %s: %s", is_response ? "Ans" : "Qry", domain);
+        }
+        return true;
+    }
+
+    return false;
+}
+*/
+/*
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, char* out_text, size_t max_len) {
     if (length < 12) return false;
 
@@ -1620,7 +1910,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
     format_reverse_lookups(out_text, max_len);
     return true;
 }
-
+*/
 /*
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, char* out_text, size_t max_len) {
     if (length < 12) return false;
@@ -1741,6 +2031,93 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, uint16_t dst_port, 
 */
 
 bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 16) return false;
+
+    const char* p = (const char*)payload;
+    const char* payload_end = p + length;
+    
+    char method_uri[64] = {0};
+    char host_domain[64] = {0};
+    bool found_req = false;
+    bool found_host = false;
+
+    // --- STEP 1: Extract Method and URI ---
+    // Only attempt this if the payload cleanly starts with a standard HTTP method
+    if (memcmp(p, "GET ", 4) == 0 || memcmp(p, "POST ", 5) == 0 || 
+        memcmp(p, "PUT ", 4) == 0 || memcmp(p, "HEAD ", 5) == 0) {
+        
+        // Scan forward to find the " HTTP/" string, which always terminates the URI
+        const char* uri_end = nullptr;
+        for (int i = 0; i < length - 6 && i < 256; i++) {
+            if (p[i] == ' ' && p[i+1] == 'H' && p[i+2] == 'T' && 
+                p[i+3] == 'T' && p[i+4] == 'P' && p[i+5] == '/') {
+                uri_end = &p[i];
+                break;
+            }
+        }
+
+        if (uri_end) {
+            int req_len = uri_end - p;
+            int copy_len = std::min(req_len, (int)sizeof(method_uri) - 1);
+            memcpy(method_uri, p, copy_len);
+            method_uri[copy_len] = '\0';
+            found_req = true;
+        }
+    }
+
+    // --- STEP 2: Extract Host Header ---
+    // Sliding window search for "Host: " (preserves fragmentation resilience)
+    const char* host_start = nullptr;
+    for (int i = 0; i < length - 6; i++) {
+        if ((p[i] == 'H' || p[i] == 'h') && 
+            (p[i+1] == 'o' || p[i+1] == 'O') && 
+            (p[i+2] == 's' || p[i+2] == 'S') && 
+            (p[i+3] == 't' || p[i+3] == 'T') && 
+            p[i+4] == ':' && (p[i+5] == ' ' || p[i+5] == '\t')) {
+            
+            host_start = &p[i+5];
+            
+            // Fast-forward past any extra spaces after the colon
+            while (host_start < payload_end && (*host_start == ' ' || *host_start == '\t')) {
+                host_start++;
+            }
+            break;
+        }
+    }
+
+    if (host_start) {
+        const char* host_end = host_start;
+        // Scan until the carriage return or newline
+        while (host_end < payload_end && *host_end != '\r' && *host_end != '\n') {
+            host_end++;
+        }
+        int name_len = host_end - host_start;
+        if (name_len > 0) {
+            int copy_len = std::min(name_len, (int)sizeof(host_domain) - 1);
+            memcpy(host_domain, host_start, copy_len);
+            host_domain[copy_len] = '\0';
+            found_host = true;
+        }
+    }
+
+    // --- STEP 3: UI Formatting Assembly ---
+    // Safely combine the intelligence based on what was successfully extracted
+    if (found_req && found_host) {
+        snprintf(out_text, max_len, "HTTP: %s [%s]", method_uri, host_domain);
+        return true;
+    } else if (found_req) {
+        snprintf(out_text, max_len, "HTTP Req: %s", method_uri);
+        return true;
+    } else if (found_host) {
+        snprintf(out_text, max_len, "HTTP Host: %s", host_domain);
+        return true;
+    }
+
+    return false;
+}
+
+/*
+bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     if (length < 16) return false; // Too small for any valid HTTP request with a Host header
 
     const char* p = (const char*)payload;
@@ -1777,6 +2154,69 @@ bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, si
     }
     return false;
 }
+*/
+
+// ==========================================
+// X.509 TLS CERTIFICATE PARSER (Server Hello)
+// ==========================================
+// Hunts for ASN.1 DER encoded Object Identifiers (OIDs) to extract
+// the Common Name (CN) and Organization (O) from raw TLS handshakes.
+bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Need at least enough bytes for a TLS record header + OID + Type + Length
+    if (length < 20) return false;
+
+    // Fast reject: Only process TLS Handshake records (ContentType = 0x16)
+    if (payload[0] != 0x16) return false;
+
+    char cn[64] = {0};
+    char org[64] = {0};
+    bool found_cn = false;
+    bool found_org = false;
+
+    // Sliding window looking for the X.500 attribute OID prefix: 0x06 0x03 0x55 0x04
+    for (uint16_t i = 0; i < length - 10; i++) {
+        if (payload[i] == 0x06 && payload[i+1] == 0x03 && 
+            payload[i+2] == 0x55 && payload[i+3] == 0x04) {
+            
+            uint8_t attr_type = payload[i+4]; // 0x03 = CN, 0x0A = Org
+            
+            if (attr_type == 0x03 || attr_type == 0x0A) {
+                // i+5 is the String Type (e.g., 0x13 PrintableString, 0x0C UTF8String)
+                // i+6 is the String Length
+                uint8_t str_len = payload[i+6];
+
+                // Bounds check to prevent buffer over-reads on fragmented packets
+                if (i + 7 + str_len <= length) {
+                    if (attr_type == 0x03 && !found_cn) { 
+                        int copy_len = std::min((int)str_len, 63);
+                        memcpy(cn, &payload[i+7], copy_len);
+                        cn[copy_len] = '\0';
+                        found_cn = true;
+                    } 
+                    else if (attr_type == 0x0A && !found_org) { 
+                        int copy_len = std::min((int)str_len, 63);
+                        memcpy(org, &payload[i+7], copy_len);
+                        org[copy_len] = '\0';
+                        found_org = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (found_cn && found_org) {
+        snprintf(out_text, max_len, "TLS Cert: CN=%s, O=%s", cn, org);
+        return true;
+    } else if (found_cn) {
+        snprintf(out_text, max_len, "TLS Cert: CN=%s", cn);
+        return true;
+    } else if (found_org) {
+        snprintf(out_text, max_len, "TLS Cert: O=%s", org);
+        return true;
+    }
+
+    return false;
+}
 
 bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     // Minimum viable TLS Record + Client Hello size
@@ -1785,8 +2225,8 @@ bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size
     // We only care about Handshake records (0x16) containing a Client Hello (0x01)
     if (payload[0] != 0x16 || payload[5] != 0x01) return false;
 
-    // Start cursor at the Session ID Length field
-    uint16_t cursor = 43; 
+    // --- CRITICAL FIX: 32-bit cursor prevents integer overflow wrap-arounds ---
+    uint32_t cursor = 43; 
 
     // 1. Skip Session ID
     if (cursor >= length) return false;
@@ -1795,7 +2235,7 @@ bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size
 
     // 2. Skip Cipher Suites
     if (cursor + 1 >= length) return false;
-    uint16_t cipher_len = (payload[cursor] << 8) | payload[cursor + 1];
+    uint32_t cipher_len = (payload[cursor] << 8) | payload[cursor + 1];
     cursor += 2 + cipher_len;
 
     // 3. Skip Compression Methods
@@ -1805,28 +2245,28 @@ bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size
 
     // 4. Get Extensions Length
     if (cursor + 1 >= length) return false;
-    uint16_t ext_total_len = (payload[cursor] << 8) | payload[cursor + 1];
+    uint32_t ext_total_len = (payload[cursor] << 8) | payload[cursor + 1];
     cursor += 2;
 
     // 5. Walk the Extensions List
-    uint16_t ext_end = cursor + ext_total_len;
+    uint32_t ext_end = cursor + ext_total_len;
     if (ext_end > length) ext_end = length; // Hard clamp to payload boundary
 
     while (cursor + 3 < ext_end) {
         uint16_t ext_type = (payload[cursor] << 8) | payload[cursor + 1];
-        uint16_t ext_len = (payload[cursor + 2] << 8) | payload[cursor + 3];
+        uint32_t ext_len = (payload[cursor + 2] << 8) | payload[cursor + 3];
         cursor += 4;
 
         if (ext_type == 0x0000) { // Extension 0x0000 is Server Name Indication (SNI)
             
             // Inside SNI: Server Name List Length (2 bytes)
             if (cursor + 1 >= ext_end) return false;
-            uint16_t list_cursor = cursor + 2;
+            uint32_t list_cursor = cursor + 2;
 
             // Extract the actual hostname
             while (list_cursor + 2 < cursor + ext_len && list_cursor + 2 < ext_end) {
                 uint8_t name_type = payload[list_cursor];
-                uint16_t name_len = (payload[list_cursor + 1] << 8) | payload[list_cursor + 2];
+                uint32_t name_len = (payload[list_cursor + 1] << 8) | payload[list_cursor + 2];
                 list_cursor += 3;
 
                 if (name_type == 0x00) { // 0x00 designates a DNS Hostname
@@ -2179,21 +2619,50 @@ bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t
 
     // We primarily care about the Question section (what name are they looking for?)
     if (qdcount > 0) {
-        char qname[80] = {0};
+        char domain[80] = {0};
+        int d_idx = 0;
+        int i = 12; // Start immediately after header
         
-        // We can safely reuse the DNS name decoder we wrote for mDNS!
-        decode_dns_name(payload, length, 12, qname, sizeof(qname));
-        
-        if (qname[0] != '\0') {
+        // SAFE SLIDING WINDOW (Replaces unsafe decode_dns_name)
+        while (i < length && payload[i] != 0x00 && d_idx < sizeof(domain) - 2) {
+            uint8_t label_len = payload[i];
+            
+            // Abort on compression pointer (0xC0) to prevent infinite loops
+            if ((label_len & 0xC0) == 0xC0) {
+                break; 
+            }
+
+            if (label_len > 0 && label_len <= 63 && (i + 1 + label_len) < length) {
+                if (d_idx > 0) domain[d_idx++] = '.';
+                memcpy(&domain[d_idx], &payload[i + 1], label_len);
+                d_idx += label_len;
+                i += label_len + 1;
+            } else {
+                break;
+            }
+        }
+        domain[d_idx] = '\0';
+
+        if (d_idx > 0) {
+            // NOISE FILTER: Drop WPAD, ISATAP, and reverse lookup spam
+            //if (strcasecmp(domain, "wpad") == 0 || 
+                //strcasecmp(domain, "isatap") == 0 ||
+                //strstr(domain, "in-addr.arpa") || 
+                //strstr(domain, "ip6.arpa")) {
+                //return false; 
+            //}
+
             const char* type_str = is_response ? "Reply" : "Query";
-            snprintf(out_text, max_len, "LLMNR [%s] Tgt: %s", type_str, qname);
-                format_reverse_lookups(out_text, max_len);
+            snprintf(out_text, max_len, "LLMNR [%s] Tgt: %s", type_str, domain);
+            
+            // Retained your original formatting call
+            format_reverse_lookups(out_text, max_len);
+            
             return true;
         }
     }
     return false;
 }
-
 // ---------------------------------------------------------
 // TINY JSON EXTRACTOR (No dynamic memory required)
 // ---------------------------------------------------------
@@ -2416,8 +2885,8 @@ bool parse_generic_json(const uint8_t* payload, uint16_t length, char* out_text,
     }
     if (json_start && !json_end) json_end = end - 1;
     if (!json_start || !json_end || json_end <= json_start) return false;
+    
     // Reject binary garbage that merely happens to contain '{'/'}' bytes
-
     uint16_t json_len = (json_end - json_start) + 1;
     if (!looks_like_json(json_start, json_len)) return false;
     
@@ -2432,14 +2901,13 @@ bool parse_generic_json(const uint8_t* payload, uint16_t length, char* out_text,
     if (!has_ip) has_ip = extract_nested_json_val(json_start, json_len, "deviceInfo", "ip", ip, sizeof(ip));
 
     bool has_name = extract_json_val(json_start, json_len, "name", name, sizeof(name));
-    // (no Omada-style nested fallback for "name" in the Python reference, so left as-is)
 
     // Single header write — everything below appends onto this, nothing resets it again.
     int written = snprintf(out_text, max_len, "JSON:");
     written = std::min((int)max_len - 1, written);
     bool found_something = false;
 
-    // --- Step 3: known high-value keys (no early return anymore) ---
+    // --- Step 3: known high-value keys ---
     if (has_model) {
         written += snprintf(out_text + written, max_len - written, " mod=%s", model);
         written = std::min((int)max_len - 1, written);
@@ -2456,83 +2924,85 @@ bool parse_generic_json(const uint8_t* payload, uint16_t length, char* out_text,
         found_something = true;
     }
 
-    // --- Step 4: fall through unconditionally to grab other root-level keys ---
+    // --- Step 4: fall through unconditionally to grab keys up to depth 3 ---
     int keys_found = 0;
     int brace_depth = 0;
     bool any_root_key_written = false;
     const char* curr = json_start;
 
-    while (curr <= json_end && keys_found < 8 && written < (int)max_len - 1) {
+    // EXPANDED: Allow up to 15 keys to be found
+    while (curr <= json_end && keys_found < 15 && written < (int)max_len - 1) {
         if (*curr == '{') {
             brace_depth++;
         } else if (*curr == '}') {
             brace_depth--;
-        } else if (*curr == '"' && brace_depth == 1) {
+        } 
+        // EXPANDED: Dig up to 3 JSON layers deep to catch nested telemetry
+        else if (*curr == '"' && brace_depth >= 1 && brace_depth <= 3) {
             const char* q_start = curr;
             const char* q_end = nullptr;
             for (const char* c = q_start + 1; c <= json_end; c++) {
                 if (*c == '"' && *(c - 1) != '\\') { q_end = c; break; }
             }
+            
             if (q_end) {
                 const char* colon_check = q_end + 1;
                 while (colon_check <= json_end && (*colon_check == ' ' || *colon_check == '\t')) colon_check++;
+                
                 if (colon_check <= json_end && *colon_check == ':') {
-    int key_len = std::min((int)(q_end - (q_start + 1)), 12);
+                    // EXPANDED: Allow slightly longer key names
+                    int key_len = std::min((int)(q_end - (q_start + 1)), 16);
 
-    // Find where the value starts (skip colon + whitespace)
-    const char* val_start = colon_check + 1;
-    while (val_start <= json_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
+                    // Find where the value starts (skip colon + whitespace)
+                    const char* val_start = colon_check + 1;
+                    while (val_start <= json_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
 
-    char value_buf[24] = {0};
-    bool has_scalar_value = false;
+                    // EXPANDED: 64-byte buffer to accommodate full URLs
+                    char value_buf[64] = {0};
+                    bool has_scalar_value = false;
 
-    if (val_start <= json_end) {
-        if (*val_start == '"') {
-            // String value — find closing quote, respecting escaped quotes
-            const char* v_end = nullptr;
-            for (const char* c = val_start + 1; c <= json_end; c++) {
-                if (*c == '"' && *(c - 1) != '\\') { v_end = c; break; }
-            }
-            if (v_end) {
-                int vlen = std::min((int)(v_end - (val_start + 1)), (int)sizeof(value_buf) - 1);
-                memcpy(value_buf, val_start + 1, vlen);
-                value_buf[vlen] = '\0';
-                has_scalar_value = true;
-            }
-        } else if (*val_start != '{' && *val_start != '[') {
-            // Number / bool / null — scan until a JSON delimiter
-            const char* v_end = val_start;
-            while (v_end <= json_end && *v_end != ',' && *v_end != '}' &&
-                   *v_end != ']' && *v_end != ' ' && *v_end != '\t' && *v_end != '\n') {
-                v_end++;
-            }
-            int vlen = std::min((int)(v_end - val_start), (int)sizeof(value_buf) - 1);
-            memcpy(value_buf, val_start, vlen);
-            value_buf[vlen] = '\0';
-            has_scalar_value = true;
-        }
-        // If it's '{' or '[', leave has_scalar_value false — nested object/array.
-        // We don't try to render it inline; the outer loop's existing brace_depth
-        // tracking already walks through it character-by-character on its own,
-        // exactly as it does today for the "data" key's nested object.
-    }
+                    if (val_start <= json_end) {
+                        if (*val_start == '"') {
+                            // String value — find closing quote, respecting escaped quotes
+                            const char* v_end = nullptr;
+                            for (const char* c = val_start + 1; c <= json_end; c++) {
+                                if (*c == '"' && *(c - 1) != '\\') { v_end = c; break; }
+                            }
+                            if (v_end) {
+                                int vlen = std::min((int)(v_end - (val_start + 1)), (int)sizeof(value_buf) - 1);
+                                memcpy(value_buf, val_start + 1, vlen);
+                                value_buf[vlen] = '\0';
+                                has_scalar_value = true;
+                            }
+                        } else if (*val_start != '{' && *val_start != '[') {
+                            // Number / bool / null — scan until a JSON delimiter
+                            const char* v_end = val_start;
+                            while (v_end <= json_end && *v_end != ',' && *v_end != '}' &&
+                                   *v_end != ']' && *v_end != ' ' && *v_end != '\t' && *v_end != '\n') {
+                                v_end++;
+                            }
+                            int vlen = std::min((int)(v_end - val_start), (int)sizeof(value_buf) - 1);
+                            memcpy(value_buf, val_start, vlen);
+                            value_buf[vlen] = '\0';
+                            has_scalar_value = true;
+                        }
+                    }
 
-    const char* sep = any_root_key_written ? "," : (found_something ? " keys:" : " ");
-    int n;
-    if (has_scalar_value) {
-        n = snprintf(out_text + written, max_len - written, "%s%.*s=%s",
-                     sep, key_len, q_start + 1, value_buf);
-    } else {
-        n = snprintf(out_text + written, max_len - written, "%s%.*s",
-                     sep, key_len, q_start + 1);
-    }
-    written = std::min((int)max_len - 1, written + n);
-    any_root_key_written = true;
-    keys_found++;
-
-}
-curr = q_end;   // always skip past this quoted string — key or value, doesn't matter
-
+                    const char* sep = any_root_key_written ? "," : (found_something ? " keys:" : " ");
+                    int n;
+                    if (has_scalar_value) {
+                        n = snprintf(out_text + written, max_len - written, "%s%.*s=%s",
+                                     sep, key_len, q_start + 1, value_buf);
+                    } else {
+                        // If it's an object/array, just print the key as a breadcrumb
+                        n = snprintf(out_text + written, max_len - written, "%s%.*s",
+                                     sep, key_len, q_start + 1);
+                    }
+                    written = std::min((int)max_len - 1, written + n);
+                    any_root_key_written = true;
+                    keys_found++;
+                }
+                curr = q_end; // always skip past this quoted string
             }
         }
         curr++;
@@ -2570,6 +3040,59 @@ bool parse_arp(const uint8_t* payload, uint16_t length, char* out_text, size_t m
     return true;
 }
 
+bool parse_ephemeral_upnp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (length < 16) return false;
+
+    const char* p = (const char*)payload;
+    
+    // Payload Signature Gate: Only process if it starts like an SSDP response or event
+    if (memcmp(p, "HTTP/1.", 7) != 0 && memcmp(p, "NOTIFY ", 7) != 0 && memcmp(p, "M-SEARCH ", 9) != 0) {
+        return false;
+    }
+
+    char server[64] = {0};
+    char location[64] = {0};
+    bool found_something = false;
+
+    // Sliding window for Server and Location headers
+    for (int i = 0; i < length - 10; i++) {
+        if (memcmp(&p[i], "Server: ", 8) == 0) {
+            const char* end = &p[i+8];
+            while (end < p + length && *end != '\r' && *end != '\n') end++;
+            
+            int copy_len = std::min((int)(end - (&p[i+8])), 63);
+            memcpy(server, &p[i+8], copy_len);
+            server[copy_len] = '\0';
+            found_something = true;
+        }
+        else if (memcmp(&p[i], "Location: ", 10) == 0) {
+            const char* end = &p[i+10];
+            while (end < p + length && *end != '\r' && *end != '\n') end++;
+            
+            // Clean up the URL slightly by skipping "http://" if present to save screen space
+            int offset = 10;
+            if (memcmp(&p[i+10], "http://", 7) == 0) offset = 17;
+            
+            int copy_len = std::min((int)(end - (&p[i+offset])), 63);
+            memcpy(location, &p[i+offset], copy_len);
+            location[copy_len] = '\0';
+            found_something = true;
+        }
+    }
+
+    if (server[0] != '\0' && location[0] != '\0') {
+        snprintf(out_text, max_len, "UPnP: %s @ %s", server, location);
+        return true;
+    } else if (server[0] != '\0') {
+        snprintf(out_text, max_len, "UPnP Server: %s", server);
+        return true;
+    } else if (location[0] != '\0') {
+        snprintf(out_text, max_len, "UPnP Loc: %s", location);
+        return true;
+    }
+    
+    return false; // Let it fall through to generic text extractors if we didn't find the juicy headers
+}
 // ==========================================
 // TKIP/WEP RATE LIMITER (ISR SAFE)
 // ==========================================
@@ -2593,6 +3116,37 @@ bool should_alert_crypto(const uint8_t* src, const uint8_t* dst, uint32_t curren
     
     crypto_cache_idx = (crypto_cache_idx + 1) % ALERT_CACHE_SIZE;
     return true;
+}
+
+void drawTelemetryHeader() {
+    // 1. Snapshot the volatile variables
+    uint32_t current_total = ui_total_arrived;
+    uint32_t current_drops = ui_dropped_packets;
+
+    // 2. Reset the counters for the next 3-second window
+    ui_total_arrived = 0;
+    ui_dropped_packets = 0;
+
+    // 3. Calculate how many successfully entered the queue
+    uint32_t current_processed = 0;
+    if (current_total > current_drops) {
+        current_processed = current_total - current_drops;
+    }
+
+    // 4. MATCH THE "OTHER" BANNER STYLING
+    tft.setFreeFont(&UbuntuMono_Regular9pt7b);
+    tft.setTextDatum(TL_DATUM); 
+    tft.setTextColor(COLOR_HOT_CHEST, TFT_BLACK);
+    
+    // 5. Erase the old numbers (Aligned to the OTHER wipe zone, but slightly wider)
+    tft.fillRect(285, 0, 135, 20, TFT_BLACK); 
+    
+    // 6. Format with strict 3-digit padding to prevent text jitter
+    char stat_text[32];
+    snprintf(stat_text, sizeof(stat_text), "Pkts:%3u/%3u", current_processed, current_total);
+    
+    // 7. Draw the string exactly where OTHER goes
+    tft.drawString(stat_text, 285, 1);
 }
 
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
@@ -2968,6 +3522,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Check if Frame Control byte 0 is 0x40 (Subtype 4: Probe Request)
   if (payload[0] == 0x40) {
     
+  /*  
     // --- SAFE HEX DUMPER FOR IE DEBUGGING ---
     static unsigned long last_debug_dump = 0;
     if (millis() - last_debug_dump > 2000) { // Only dump one packet every 2 seconds
@@ -3010,7 +3565,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
         Serial.println("-----------------------------------------------------------\n");
     }
     // ----------------------------------------
-
+*/
     // ==========================================
     // THE SMART BOUNCER & IE PARSER
     // ==========================================
@@ -3152,9 +3707,16 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       // Create a highly visible alert using the Reason Code
       snprintf(leak.text, MAX_LEAK_STR_LEN - 1, "DEAUTH (Reason: %d)", reason_code);
 
+      // Fire directly to the UI, completely bypassing the Data parser
+      if (leakQueue != NULL) {
+          leak_isr_attempts++;
+          if (xQueueSendFromISR(leakQueue, &leak, NULL) != pdTRUE) leak_isr_dropped++;
+      }
+      // Fire directly to the UI, completely bypassing the Data parser
+      //if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
       // Fire directly to the UI and Logger, completely bypassing the Data parser
-      if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
-      if (liveDumpQueue != NULL) xQueueSendFromISR(liveDumpQueue, &leak, NULL);
+      //if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
+      //if (liveDumpQueue != NULL) xQueueSendFromISR(liveDumpQueue, &leak, NULL);
       
       return; 
   }
@@ -3169,7 +3731,30 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       bool is_protected = (payload[1] & 0x40) != 0;
       
       if (!is_protected) {
-          uint8_t header_len = (payload[0] & 0x80) ? 26 : 24;
+          // ==========================================
+          // DYNAMIC MAC HEADER SIZING (HT Control & WDS)
+          // ==========================================
+          bool is_qos = (payload[0] & 0x80) != 0;
+          bool to_ds = (payload[1] & 0x01) != 0;
+          bool from_ds = (payload[1] & 0x02) != 0;
+          bool has_ht_ctrl = (payload[1] & 0x80) != 0; // Order bit
+          
+          uint8_t header_len = 24;          // Base MAC Header
+          if (to_ds && from_ds) {
+              header_len += 6;              // Address 4 present (WDS Bridge)
+          }
+          
+          // --- NEW: SAFE QOS OFFSET ---
+          // Save the exact location of the QoS Control field before HT Control shifts the header length!
+          uint8_t qos_offset = header_len; 
+          
+          if (is_qos) {
+              header_len += 2;              // QoS Control present
+          }
+          if (has_ht_ctrl) {
+              header_len += 4;              // HT Control present
+          }
+          // ==========================================
 
           // --- NEW: METADATA EXTRACTION ---
           uint8_t captured_subtype = (payload[0] & 0xF0) >> 4;
@@ -3185,19 +3770,18 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               // --- STRIP LLC, IP, AND UDP HEADERS ---
               uint16_t captured_src_port = 0;
               uint16_t captured_dst_port = 0;
-              uint16_t ether_type = 0; // NEW: For routing ARP
-              uint8_t tcp_flags = 0;   // NEW: For catching TCP SYN/RST connection attempts
+              uint16_t ether_type = 0; 
+              uint8_t tcp_flags = 0;   
               
-              // Variables to hold our extracted IPs before they go to the queue
               uint8_t captured_ip_version = 0;
               uint8_t captured_src_ip[16] = {0};
               uint8_t captured_dst_ip[16] = {0};
 
-              // --- NEW: A-MSDU DE-AGGREGATOR ---
-              // Since header_len already shifted us past the 2-byte QoS Control field,
-              // we look backward exactly 2 bytes to check the A-MSDU Present flag (Bit 7).
-              if (captured_subtype == 8) {
-                  bool is_amsdu = (frame_body[-2] & 0x80) != 0;
+              // --- UPGRADED: A-MSDU DE-AGGREGATOR ---
+              // Changed to is_qos so it catches all QoS subtypes (8 through 15)
+              if (is_qos) {
+                  // THE FIX: Read the exact QoS byte using the safe offset, avoiding the HT Control field!
+                  bool is_amsdu = (payload[qos_offset] & 0x80) != 0;
                   
                   if (is_amsdu && body_len > 14) {
                       // Skip the 14-byte A-MSDU subframe header (DA + SA + Length)
@@ -3205,7 +3789,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       
                       frame_body += 14; 
                       
-                      // Constrain the payload length so the extractors don't bleed into the next subframe
+                      // Constrain the payload length so extractors don't bleed into the next subframe
                       if (subframe_len < body_len) {
                           body_len = subframe_len;
                       } else {
@@ -3216,11 +3800,34 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               
               // 1. Skip LLC/SNAP Header (8 bytes) if present.
               if (body_len > 8 && frame_body[0] == 0xAA && frame_body[1] == 0xAA) {
+                  bool is_apple = (frame_body[3] == 0x00 && frame_body[4] == 0x17 && frame_body[5] == 0xF2);
                   ether_type = (frame_body[6] << 8) | frame_body[7]; // <--- GRAB ETHERTYPE HERE  
                   frame_body += 8;
                   body_len -= 8;
 
-                  // --- NEW: 802.1Q VLAN TAG STRIPPING ---
+                  // --- NEW: APPLE AWDL SHIM BYPASS ---
+                  // Apple AWDL injects a 6-byte shim before the real IPv6 header (86 DD).
+                  // --- UPGRADED: APPLE AWDL SHIM BYPASS (SLIDING WINDOW) ---
+                  if (is_apple && body_len > 8) {
+                      // Apple's shim changes size. We hunt up to 16 bytes ahead for the IPv6 header (86 DD).
+                      int shim_len = -1;
+                      for (int s = 0; s < 16; s++) {
+                          if (s + 1 < body_len && frame_body[s] == 0x86 && frame_body[s+1] == 0xDD) {
+                              shim_len = s;
+                              break;
+                          }
+                      }
+                      
+                      if (shim_len != -1) {
+                          ether_type = 0x86DD; // Force the EtherType to IPv6
+                          
+                          // THE FIX: Step OVER the 86 DD bytes (+2) to reach the 0x60 IPv6 header!
+                          frame_body += (shim_len + 2);
+                          body_len -= (shim_len + 2);
+                      }
+                  }
+
+                  // --- 802.1Q VLAN TAG STRIPPING ---
                   // If EtherType is 0x8100, the packet has a 4-byte VLAN tag injected before the IP header.
                   if (ether_type == 0x8100 && body_len > 4) {
                       // The real EtherType is located right after the 2-byte TCI (Tag Control Information)
@@ -3296,7 +3903,24 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   uint8_t next_header = frame_body[6]; // IPv6 uses "Next Header" instead of Protocol
                   uint8_t ip_header_len = 40; // Fixed size for base IPv6 header
 
-                  // Note: This assumes no extension headers for maximum speed.
+                  // ==========================================
+                  // NEW: EXTENSION HEADER HOPPER (Hop-by-Hop)
+                  // Apple injects Hop-by-Hop (0) into mDNS and ICMPv6 multicasts.
+                  // ==========================================
+                  if (next_header == 0 && body_len > ip_header_len + 8) {
+                      // The first byte of the extension is the TRUE protocol (e.g., 17 for UDP)
+                      next_header = frame_body[ip_header_len];
+                      
+                      // Length is calculated as (Byte[1] + 1) * 8
+                      uint8_t ext_len_modifier = frame_body[ip_header_len + 1];
+                      uint16_t total_ext_len = (ext_len_modifier + 1) * 8;
+                      
+                      // Safely advance the IP header boundary to step over the extension
+                      if (body_len > ip_header_len + total_ext_len) {
+                          ip_header_len += total_ext_len;
+                      }
+                  }
+                  // ==========================================
                   if (next_header == 17 && body_len > (ip_header_len + 8)) {
                       captured_protocol = 17; // UDP
                       uint8_t* udp_header = frame_body + ip_header_len;
@@ -3417,15 +4041,25 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   memcpy(l2_cap.src_mac, payload + 10, 6);
                   memcpy(l2_cap.dst_mac, payload + 4, 6);
                   
-                  // ROUTE 1: Feed the UI Engine
-                  if (leakQueue != NULL) {
-                      xQueueSendFromISR(leakQueue, &l2_cap, NULL);
+                  // ROUTE 1: Feed the Parsing Engine (Which will route to the UI later)
+                  if (liveDumpQueue != NULL) {
+                      ui_total_arrived++; // Track everything the antenna caught
+
+                    // Only increment drops if the send actually fails!
+                    if (xQueueSendFromISR(liveDumpQueue, &l2_cap, NULL) != pdTRUE) {
+                        debug_dropped_packets++; // For the Serial Monitor
+                        ui_dropped_packets++;    // For the TFT Screen
+                    }
                   }
+                  // ROUTE 1: Feed the UI Engine
+                  //if (leakQueue != NULL) {
+                  //    xQueueSendFromISR(leakQueue, &l2_cap, NULL);
+                  //}
                   
                   // ROUTE 2: Feed the Background Logger (if still active)
-                  if (liveDumpQueue != NULL) {
-                      xQueueSendFromISR(liveDumpQueue, &l2_cap, NULL);
-                  }
+                  //if (liveDumpQueue != NULL) {
+                  //    xQueueSendFromISR(liveDumpQueue, &l2_cap, NULL);
+                  //}
               }
           }
       } else {
@@ -3490,7 +4124,10 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       // Write directly to the UI Union
                       strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
                       
-                      if (leakQueue != NULL) xQueueSendFromISR(leakQueue, &leak, NULL);
+                      if (leakQueue != NULL) {
+                          leak_isr_attempts++;
+                          if (xQueueSendFromISR(leakQueue, &leak, NULL) != pdTRUE) leak_isr_dropped++;
+                      }
                   }
               }
           } 
@@ -3638,12 +4275,20 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   }
 }
 
+
 void processLiveDumpQueue() {
     if (liveDumpQueue == NULL) return;
+    // Check how many packets are waiting BEFORE we start processing
+    UBaseType_t waiting = uxQueueMessagesWaiting(liveDumpQueue);
+    if (waiting > 15) { // Assuming your queue size is 20 or 30
+        Serial.printf("WARNING: Queue backing up! (%d waiting)\n", waiting);
+    }
 
-    Layer2Capture l2_cap; // <--- Using the unified struct
+    Layer2Capture l2_cap; 
     // Process up to 5 packets per loop to prevent starvation of the UI
     int packets_processed = 0; 
+
+    uint32_t start_time = micros();
     
     while (xQueueReceive(liveDumpQueue, &l2_cap, 0) == pdTRUE && packets_processed < 5) {
         packets_processed++;
@@ -3651,6 +4296,14 @@ void processLiveDumpQueue() {
         char temp_text[MAX_LEAK_STR_LEN] = {0};
         bool custom_extracted = false;
 
+        // =========================================================
+        // --- 0 to 8: STRICT PROTOCOL PARSERS ---
+        // =========================================================
+        // --- 0.0 UPNP / SSDP RESPONSE BYPASS (Ephemeral Ports) ---
+        // Catches Smart TVs replying to cast requests on random high ports
+        if (l2_cap.payload_len > 15 && memcmp(l2_cap.raw_payload, "HTTP/1.", 7) == 0) {
+            custom_extracted = parse_ssdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
         // --- 0. ARP (EtherType 0x0806) ---
         if (l2_cap.ether_type == 0x0806) {
             custom_extracted = parse_arp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
@@ -3658,24 +4311,15 @@ void processLiveDumpQueue() {
         // --- 0.5 EAPOL (WPA/WPA2/WPA3 Handshake) ---
         else if (l2_cap.ether_type == 0x888E && l2_cap.payload_len >= 2) {
             uint8_t eapol_type = l2_cap.raw_payload[1];
-            
             switch (eapol_type) {
-                case 0:
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: EAP Packet (802.1X Auth)");
-                    break;
-                case 1:
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Start");
-                    break;
-                case 2:
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Logoff");
-                    break;
-                case 3:
+                case 0: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: EAP Packet (802.1X Auth)"); break;
+                case 1: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Start"); break;
+                case 2: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Logoff"); break;
+                case 3: 
                     snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL-Key (WPA Handshake)");
-                    l2_cap.is_high_value = true; // Only tag the actual handshake keys as high value!
+                    l2_cap.is_high_value = true; 
                     break;
-                default:
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Unknown Type %d", eapol_type);
-                    break;
+                default: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Unknown Type %d", eapol_type); break;
             }
             custom_extracted = true;
         }
@@ -3696,33 +4340,38 @@ void processLiveDumpQueue() {
             custom_extracted = parse_nbds(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 4. DNS and mDNS (Ports 53, 5353) ---
-        else if (l2_cap.dst_port == 53 || l2_cap.dst_port == 5353) {
-            custom_extracted = parse_dns_mdns(l2_cap.raw_payload, l2_cap.payload_len, l2_cap.dst_port, temp_text, MAX_LEAK_STR_LEN);
+        else if (l2_cap.dst_port == 53 || l2_cap.src_port == 53 || 
+                 l2_cap.dst_port == 5353 || l2_cap.src_port == 5353) {
+            custom_extracted = parse_dns_mdns(l2_cap.raw_payload, l2_cap.payload_len, l2_cap.dst_port == 5353 || l2_cap.src_port == 5353, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 4.5 HTTP Host Header (Port 80) ---
         else if (l2_cap.dst_port == 80) {
             custom_extracted = parse_http_host(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
-        // --- 4.6 HTTPS SNI Extraction (Port 443) ---
-        else if (l2_cap.dst_port == 443) {
-            // Only process if the payload starts with 0x16 (TLS Handshake) and 0x03 (TLS Version 1.2/1.3)
-            if (l2_cap.payload_len > 5 && l2_cap.raw_payload[0] == 0x16 && l2_cap.raw_payload[1] == 0x03) {
-                custom_extracted = parse_tls_sni(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
-            }
-        }
+        // --- 4.6 HTTPS Handshakes (Port 443) ---
+        //else if (l2_cap.dst_port == 443 || l2_cap.src_port == 443) {
+        //    // Fast gate: Only process TLS Handshake records (0x16) for TLS v1.2/1.3 (0x03)
+        //    if (l2_cap.payload_len > 5 && l2_cap.raw_payload[0] == 0x16 && l2_cap.raw_payload[1] == 0x03) {
+        //        
+        //        // Attempt 1: Is it an outbound Client Hello (SNI)?
+        //        custom_extracted = parse_tls_sni(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        //        
+        //        // Attempt 2: If not SNI, is it an inbound Server Hello (X.509 Certificate)?
+        //        if (!custom_extracted) {
+        //            custom_extracted = parse_tls_cert(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        //            if (custom_extracted) l2_cap.is_high_value = true; // Certificates are great OSINT!
+        //        }
+        //    }
+        //}
         // --- 4.7 IPP / CUPS Printing (Port 631) ---
         else if (l2_cap.dst_port == 631 || l2_cap.src_port == 631) {
             custom_extracted = parse_ipp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
-            if (custom_extracted) {
-                l2_cap.is_high_value = true; // Tag it so it survives triage!
-            }
+            if (custom_extracted) l2_cap.is_high_value = true;
         }
         // --- 4.8 Infrastructure Syslog (Port 514) ---
         else if (l2_cap.dst_port == 514) {
             custom_extracted = parse_syslog(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
-            if (custom_extracted) {
-                l2_cap.is_high_value = true; // Syslog is excellent diagnostic intel
-            }
+            if (custom_extracted) l2_cap.is_high_value = true;
         }
         // --- 4.9 RTSP IoT Video Streaming (Port 554) ---
         else if (l2_cap.dst_port == 554 || l2_cap.src_port == 554) {
@@ -3748,7 +4397,7 @@ void processLiveDumpQueue() {
             custom_extracted = parse_ssdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 6. LLMNR (Port 5355) ---
-        else if (l2_cap.dst_port == 5355) {
+        else if (l2_cap.dst_port == 5355 || l2_cap.src_port == 5355) {
             custom_extracted = parse_llmnr(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 7. Dropbox LAN Sync (Port 17500) ---
@@ -3759,54 +4408,15 @@ void processLiveDumpQueue() {
         else if (l2_cap.dst_port == 161 || l2_cap.dst_port == 162) {
             custom_extracted = parse_snmp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
-        // --- 9. Static Port Fingerprints (No payload parsing required) ---
-        else if (l2_cap.dst_port == 3478 || l2_cap.src_port == 3478) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: WebRTC/VoIP NAT Traversal");
-            custom_extracted = true;
-        }
-        else if (l2_cap.dst_port == 3544 || l2_cap.src_port == 3544) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "Teredo: Windows IPv6 Tunnel");
-            custom_extracted = true;
-        }
-        else if (l2_cap.dst_port == 5350 || l2_cap.src_port == 5350) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "PCP: Port Control Protocol");
-            custom_extracted = true;
-        }
-        else if (l2_cap.dst_port == 5351 || l2_cap.src_port == 5351) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "NAT-PMP: Apple Port Mapping");
-            custom_extracted = true;
-        }
-        else if (l2_cap.dst_port == 1883 || l2_cap.src_port == 1883) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "MQTT (IoT Telemetry/PubSub)");
-            custom_extracted = true;
-            l2_cap.is_high_value = true; // Tagged as high value for triaging
-        }
-        else if (l2_cap.dst_port == 5683 || l2_cap.src_port == 5683) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "CoAP (IoT Constrained App Protocol)");
-            custom_extracted = true;
-            l2_cap.is_high_value = true;
-        }
-        // --- 10. Payload-Based Catch-Alls ---
-        else if (l2_cap.payload_len > 0) {
-            if (parse_generic_json(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN)) {
-                custom_extracted = true;
-            }
-            else if (extractCleartext(l2_cap.raw_payload, l2_cap.payload_len, temp_text)) {
-                custom_extracted = true;
-            }
-        }
-        // --- 11. TCP Connection Flags ---
-        else if (l2_cap.protocol == 6) {
-            if (l2_cap.tcp_flags & 0x02) { 
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP SYN (Port %d)", l2_cap.dst_port); 
-                custom_extracted = true; 
-            } 
-            else if (l2_cap.tcp_flags & 0x04) { 
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", l2_cap.dst_port); 
-                custom_extracted = true; 
-            } 
-        }
-        // --- 11.5 ICMP (Ping / Control) ---
+        // --- 9. TCP Connection Flags & ICMP Control ---
+        else if (l2_cap.protocol == 6 && (l2_cap.tcp_flags & 0x02)) { 
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP SYN (Port %d)", l2_cap.dst_port); 
+            custom_extracted = true; 
+        } 
+        else if (l2_cap.protocol == 6 && (l2_cap.tcp_flags & 0x04)) { 
+            snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", l2_cap.dst_port); 
+            custom_extracted = true; 
+        } 
         else if (l2_cap.protocol == 1) {
             snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv4 Message (Ping/Control)");
             custom_extracted = true;
@@ -3816,34 +4426,127 @@ void processLiveDumpQueue() {
             custom_extracted = true;
         }
 
-        // --- 12. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
+        // =========================================================
+        // --- END OF MONOLITHIC CHAIN. BEGIN INDEPENDENT CASCADE. ---
+        // =========================================================
+        
+        // --- 10. PAYLOAD SIGNATURES & DEEP PARSERS ---
         if (!custom_extracted && l2_cap.payload_len > 0) {
-            custom_extracted = extract_printable_runs(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN,
-                                           /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/" | ");
+            const uint8_t* p = l2_cap.raw_payload;
+            uint16_t len = l2_cap.payload_len;
+
+            // 10.1 Magic Byte Signatures (Highest Precision)
+            if (len >= 8 && p[4] == 0x21 && p[5] == 0x12 && p[6] == 0xA4 && p[7] == 0x42) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: Live VoIP/WebRTC Stream");
+                custom_extracted = true;
+                l2_cap.is_high_value = true;
+            }
+            else if (len > 5 && p[0] == 0x16 && p[1] == 0x03) {
+                custom_extracted = parse_tls_sni(p, len, temp_text, MAX_LEAK_STR_LEN);
+                if (!custom_extracted) {
+                    custom_extracted = parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
+                    if (custom_extracted) l2_cap.is_high_value = true; 
+                }
+            }
+            else if ((len >= 4 && (memcmp(p, "GET ", 4) == 0 || memcmp(p, "PUT ", 4) == 0)) || 
+                     (len >= 5 && (memcmp(p, "POST ", 5) == 0 || memcmp(p, "HEAD ", 5) == 0))) {
+                
+                custom_extracted = parse_http_host(p, len, temp_text, MAX_LEAK_STR_LEN);
+                if (!custom_extracted) {
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "HTTP Request (Hidden Port)");
+                    custom_extracted = true;
+                }
+            }
+            else if (len >= 20 && p[0] == 0x13 && memcmp(&p[1], "BitTorrent protocol", 19) == 0) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "P2P: BitTorrent Handshake");
+                custom_extracted = true;
+                l2_cap.is_high_value = true;
+            }
+            else if (len == 148 && p[0] == 0x01 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x00) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "VPN: WireGuard Handshake");
+                custom_extracted = true;
+                l2_cap.is_high_value = true;
+            }
+
+            // 10.2 Structured Extractors (UPnP, JSON)
+            if (!custom_extracted) {
+                if (parse_ephemeral_upnp(p, len, temp_text, MAX_LEAK_STR_LEN)) {
+                    custom_extracted = true;
+                    l2_cap.is_high_value = true;
+                }
+                //else if (parse_generic_json(p, len, temp_text, MAX_LEAK_STR_LEN)) {
+                //    custom_extracted = true;
+                //}
+            }
         }
 
+        // --- 11. STATIC PORT FINGERPRINTS (Fallback for unparsed payloads) ---
+        if (!custom_extracted) {
+            if (l2_cap.dst_port == 3544 || l2_cap.src_port == 3544) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "Teredo: Windows IPv6 Tunnel");
+                custom_extracted = true;
+            }
+            else if (l2_cap.dst_port == 5350 || l2_cap.src_port == 5350) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "PCP: Port Control Protocol");
+                custom_extracted = true;
+            }
+            else if (l2_cap.dst_port == 5351 || l2_cap.src_port == 5351) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "NAT-PMP: Apple Port Mapping");
+                custom_extracted = true;
+            }
+            else if (l2_cap.dst_port == 1883 || l2_cap.src_port == 1883) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "MQTT (IoT Telemetry/PubSub)");
+                custom_extracted = true;
+                l2_cap.is_high_value = true;
+            }
+            else if (l2_cap.dst_port == 5683 || l2_cap.src_port == 5683) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "CoAP (IoT Constrained App Protocol)");
+                custom_extracted = true;
+                l2_cap.is_high_value = true;
+            }
+        }
+
+        // --- 12. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
+        if (!custom_extracted && l2_cap.payload_len > 0) {
+            // ==========================================
+            // THE GROUND-TRUTH DIAGNOSTIC
+            // ==========================================
+            Serial.printf("[FALLTHROUGH] ip_ver=%u proto=%u src=%u dst=%u eth=0x%04X len=%u | first16: ",
+                          l2_cap.ip_version, l2_cap.protocol, l2_cap.src_port, l2_cap.dst_port,
+                          l2_cap.ether_type, l2_cap.payload_len);
+            for (int b = 0; b < 16 && b < l2_cap.payload_len; b++) {
+                Serial.printf("%02X ", l2_cap.raw_payload[b]);
+            }
+            Serial.println();
+            // ==========================================
+            custom_extracted = extract_printable_runs(
+                l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN,
+                /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/"|"
+            );
+        }
+
+        // ==========================================
+        // IN-PLACE UNION OVERWRITE & UI ROUTING
+        // ==========================================
         if (custom_extracted) {
-            // High-Value Triage
-            l2_cap.is_high_value = false;
+            // High-Value Triage (Adds tags without erasing existing ones!)
             if (strstr(temp_text, "M-SEARCH") || strstr(temp_text, "HTTP/1.") || 
                 strstr(temp_text, "spotify") || strstr(temp_text, "cast")) {
                 l2_cap.is_high_value = true;
             }
-
-            // ==========================================
-            // IN-PLACE UNION OVERWRITE & UI ROUTING
-            // ==========================================
-            // Safely overwrite the raw payload with the parsed cleartext.
-            // DO NOT write to network_ssid here to preserve the BSSID for live lookups!
             
             strncpy(l2_cap.text, temp_text, MAX_LEAK_STR_LEN - 1);
             l2_cap.text[MAX_LEAK_STR_LEN - 1] = '\0';
 
-            // 3. Push the finalized struct directly to the UI list
             if (leakQueue != NULL) {
-                xQueueSend(leakQueue, &l2_cap, 0); 
+                leak_core1_attempts++;
+                if (xQueueSend(leakQueue, &l2_cap, 0) != pdTRUE) leak_core1_dropped++;
             }
         }
+    }
+    if (packets_processed > 0) {
+        uint32_t elapsed = micros() - start_time;
+        Serial.printf("Processed %d packets in %u us\n", packets_processed, elapsed);
     }
 }
 
@@ -4181,7 +4884,7 @@ void drawMenu() {
   // ==========================================
   // 3. AP SCANNER / CH SELECT BUTTON (Y: 190 - 230)
   // ==========================================
-  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) {
+  if (currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_LAYER2) {
     // Active State
     tft.fillRect(50, 190, 200, 40, TFT_BLACK);
     tft.drawRect(50, 190, 200, 40, TFT_WHITE);
@@ -4189,7 +4892,7 @@ void drawMenu() {
     
     if (currentRadioMode == RADIO_WIFI) {
         tft.drawString("SELECT AP", 150, 210);
-    } else if (currentRadioMode == RADIO_AP) {
+    } else if (currentRadioMode == RADIO_AP || currentRadioMode == RADIO_LAYER2) {
         if (target_locked) {
             char chStr[16];
             snprintf(chStr, sizeof(chStr), "LOCKED: CH %d", target_channel);
@@ -4304,7 +5007,11 @@ void drawChartHeader() {
     snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | SNIFFING SPECTRUM", CHANNELS[current_ch_idx]);
   }
   else if (currentRadioMode == RADIO_LAYER2) { 
-    snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | LAYER 2 CAPTURE", CHANNELS[current_ch_idx]);
+    if (!target_locked) {
+      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | L2 CAPTURE (HOPPING)", CHANNELS[current_ch_idx]);
+    } else {
+      snprintf(bannerStr, sizeof(bannerStr), "CH: %02d | L2 CAPTURE (LOCKED)", target_channel);
+    }
   }
   else if (currentRadioMode == RADIO_WIFI) {    
     if (!target_locked) {
@@ -6949,7 +7656,7 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
           currentState = SCREEN_AP_SCAN;
           drawApScanner();
           delay(300);
-        } else if (currentRadioMode == RADIO_AP) {
+        } else if (currentRadioMode == RADIO_AP || currentRadioMode == RADIO_LAYER2) {
           if (!target_locked) {
               target_locked = true;
               target_channel = 1;
@@ -7085,7 +7792,7 @@ bool handleTouchInputs(uint16_t t_x, uint16_t t_y) {
             esp_wifi_set_promiscuous(true); 
         }
         
-        if ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP) && target_locked) {
+        if ((currentRadioMode == RADIO_WIFI || currentRadioMode == RADIO_AP || currentRadioMode == RADIO_LAYER2) && target_locked) {
           esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
         } else if (currentRadioMode != RADIO_BLE) {
           esp_wifi_set_channel(CHANNELS[current_ch_idx], WIFI_SECOND_CHAN_NONE);
@@ -8521,6 +9228,7 @@ void drawWaterfallChart() {
     }
     static uint32_t last_rendered_leak_timestamp = 0;
     if (currentRadioMode == RADIO_LAYER2) {
+        current_total_metric = l2_bytes_render;
         
         // Redraw only if the newest packet in the buffer has changed
         if (terminal_history[0].timestamp != last_rendered_leak_timestamp && terminal_history[0].timestamp > 0) {
@@ -8835,13 +9543,13 @@ void setup() {
   // ==========================================
   // 1. CREATE THE LEAKY LAYER 2 QUEUES
   // ==========================================
-  leakQueue = xQueueCreate(10, sizeof(Layer2Capture));
+  leakQueue = xQueueCreate(30, sizeof(Layer2Capture));
   if (leakQueue == NULL) {
       Serial.println("[!] FATAL: Failed to create leakQueue!");
   }
   
   // --- ADD THIS: Allocate the raw payload queue for Core 0 ---
-  liveDumpQueue = xQueueCreate(10, sizeof(Layer2Capture));
+  liveDumpQueue = xQueueCreate(80, sizeof(Layer2Capture));
   if (liveDumpQueue == NULL) {
       Serial.println("[!] FATAL: Failed to create liveDumpQueue!");
   }
@@ -9001,6 +9709,9 @@ void loop() {
         // Snapshot the bytes for the UI and reset the ISR counter
         l2_bytes_render = l2_bytes_tick;
         l2_bytes_tick = 0;
+        // IF THIS PRINTS '0', THE ISR IS BROKEN. 
+        // IF THIS PRINTS '4000', THE CHART GRAPHICS ARE BROKEN.
+        Serial.printf("L2 Tick Vol: %u\n", l2_bytes_render);
     }
 
     pause_sniffing = false; // Unlock immediately!
@@ -9018,5 +9729,32 @@ void loop() {
     // Do NOT add SCREEN_LEAK_LIST here. It updates itself asynchronously!
     
     Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+    // ==========================================
+    // 5. ASYNCHRONOUS DIAGNOSTICS (Runs every 3 seconds)
+    // ==========================================
+    static uint32_t last_debug_print = 0;
+if (millis() - last_debug_print > 3000) {
+    if (debug_dropped_packets > 0) {
+        Serial.printf("liveDumpQueue Drops (3s): %u | Free Heap: %d bytes\n", debug_dropped_packets, ESP.getFreeHeap());
+        debug_dropped_packets = 0;
+    }
+
+    // Snapshot ISR-written volatiles once so the printed numbers stay self-consistent
+    uint32_t isr_att = leak_isr_attempts;
+    uint32_t isr_drop = leak_isr_dropped;
+
+    if (isr_drop > 0 || leak_core1_dropped > 0) {
+        Serial.printf("leakQueue Drops (3s): ISR %u/%u | Core1 %u/%u\n",
+                      isr_drop, isr_att,
+                      leak_core1_dropped, leak_core1_attempts);
+    }
+    leak_isr_attempts = 0; leak_isr_dropped = 0;
+    leak_core1_attempts = 0; leak_core1_dropped = 0;
+
+    if (currentState == SCREEN_CHART && currentRadioMode == RADIO_LAYER2) { 
+        drawTelemetryHeader();
+    }
+    last_debug_print = millis();
+}
   }
 }
