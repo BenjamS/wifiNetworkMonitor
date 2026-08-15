@@ -1208,209 +1208,80 @@ void translateProtocolStrings(char* text) {
 }
 
 // ---------------------------------------------------------
-// DHCPv4 (IPv4) PARSER
-// Extracts Message Type, Primary DNS, and highest-value text 
-// Priority: FQDN > Hostname > Domain > Vendor > Fallback ASCII
+// SANITIZED ASCII COPY HELPER
 // ---------------------------------------------------------
-bool parse_dhcp_v4(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length <= 240) return false;
-    
-    // Check for standard DHCP Magic Cookie
-    if (payload[236] == 0x63 && payload[237] == 0x82 && 
-        payload[238] == 0x53 && payload[239] == 0x63) {
-        
-        int offset = 240;
-        
-        const char* msg_type_str = "UNK";
-        const char* text_prefix = nullptr;
-        const uint8_t* text_ptr = nullptr;
-        int text_len = 0;
-        int current_priority = 99; 
-        
-        const uint8_t* dns_ptr = nullptr;
-
-        // --- PASS 1: Extract Options ---
-        while (offset < length && payload[offset] != 255) { // 255 is End Option
-            uint8_t opt_type = payload[offset];
-            if (opt_type == 0) { offset++; continue; } // Pad Option
-            
-            if (offset + 1 >= length) break;
-            uint8_t opt_len = payload[offset + 1];
-            if (offset + 2 + opt_len > length) break; // Truncated packet
-            
-            int opt_data_offset = offset + 2;
-            int opt_data_len = opt_len;
-            int this_priority = 99;
-            const char* this_prefix = nullptr;
-
-            // 1. Message Type (Option 53)
-            if (opt_type == 53 && opt_len == 1) {
-                switch (payload[opt_data_offset]) {
-                    case 1: msg_type_str = "DISCOVER"; break;
-                    case 2: msg_type_str = "OFFER"; break;
-                    case 3: msg_type_str = "REQUEST"; break;
-                    case 4: msg_type_str = "DECLINE"; break;
-                    case 5: msg_type_str = "ACK"; break;
-                    case 6: msg_type_str = "NAK"; break;
-                    case 7: msg_type_str = "RELEASE"; break;
-                    case 8: msg_type_str = "INFORM"; break;
-                }
-            }
-            // 2. DNS Servers (Option 6)
-            else if (opt_type == 6 && opt_len >= 4) {
-                dns_ptr = &payload[opt_data_offset]; // Grab the first IP
-            }
-            // 3. Text Fields (Ranked by Priority)
-            else if (opt_type == 81 && opt_len > 3) {
-                this_priority = 1; this_prefix = "FQDN:"; 
-                opt_data_offset += 3; opt_data_len -= 3; // Skip RCODE
-            }
-            else if (opt_type == 12) { this_priority = 2; this_prefix = "Host:"; }
-            else if (opt_type == 15) { this_priority = 3; this_prefix = "Domain:"; }
-            else if (opt_type == 60) { this_priority = 4; this_prefix = "Vendor:"; }
-            
-            // Save if it's the most valuable text we've seen so far
-            if (this_priority < current_priority && opt_data_len > 0) {
-                current_priority = this_priority;
-                text_prefix = this_prefix;
-                text_ptr = &payload[opt_data_offset];
-                text_len = opt_data_len;
-            }
-            
-            offset += 2 + opt_len;
-        }
-
-        // --- PASS 2: ASCII Fallback ---
-        // If we found NO text options, scan remainder for generic ASCII strings
-        if (text_ptr == nullptr) {
-            int best_start = 0, best_len = 0, cur_start = 0, cur_len = 0;
-            for (int i = 240; i < length; i++) {
-                char c = payload[i];
-                if (c >= 32 && c <= 126) { 
-                    if (cur_len == 0) cur_start = i;
-                    cur_len++;
-                    if (cur_len > best_len) { best_len = cur_len; best_start = cur_start; }
-                } else { cur_len = 0; }
-            }
-            if (best_len >= 6) {
-                text_prefix = "Str:";
-                text_ptr = &payload[best_start];
-                text_len = best_len;
-            }
-        }
-
-        // --- STRING ASSEMBLY ---
-        // If we found ANYTHING of value, compile the final string
-        if (text_ptr != nullptr || dns_ptr != nullptr) {
-            int written = snprintf(out_text, max_len, "DHCP [%s]", msg_type_str);
-            
-            if (text_ptr != nullptr && written < max_len) {
-                written += snprintf(out_text + written, max_len - written, " %s %.*s", 
-                                    text_prefix, text_len, text_ptr);
-            }
-            
-            if (dns_ptr != nullptr && written < max_len) {
-                snprintf(out_text + written, max_len - written, " DNS: %d.%d.%d.%d", 
-                         dns_ptr[0], dns_ptr[1], dns_ptr[2], dns_ptr[3]);
-            }
-            return true;
-        }
+int copy_printable_ascii(const uint8_t* src, int len, char* dst, int max_len) {
+    if (!src || !dst || max_len <= 0) return 0;
+    int out_idx = 0;
+    for (int i = 0; i < len && out_idx < max_len - 1; i++) {
+        char c = src[i];
+        dst[out_idx++] = (c >= 32 && c <= 126) ? c : '.';
     }
-    return false;
+    dst[out_idx] = '\0';
+    return out_idx;
 }
 
 // ---------------------------------------------------------
-// DHCPv6 (IPv6) PARSER
-// Extracts Message Type and highest-value text (FQDN > Vendor > ASCII)
+// LIGHTWEIGHT IPv6 FORMATTER (TFT-Friendly Notation)
 // ---------------------------------------------------------
-bool parse_dhcp_v6(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 4) return false; // Needs 1 byte msg type, 3 byte transaction ID
-    
-    // 1. Message Type
-    uint8_t msg_type = payload[0];
-    const char* msg_type_str = "UNK";
-    switch (msg_type) {
-        case 1: msg_type_str = "SOLICIT"; break;
-        case 2: msg_type_str = "ADVERT"; break;
-        case 3: msg_type_str = "REQUEST"; break;
-        case 4: msg_type_str = "CONFIRM"; break;
-        case 5: msg_type_str = "RENEW"; break;
-        case 7: msg_type_str = "REPLY"; break;
-        case 8: msg_type_str = "RELEASE"; break;
-        case 11: msg_type_str = "INFO-REQ"; break;
-    }
+void format_ipv6_addr(const uint8_t* ip, char* buf, size_t max_len) {
+    snprintf(buf, max_len, "%x:%x:%x:%x:%x:%x:%x:%x",
+             (ip[0]<<8)|ip[1], (ip[2]<<8)|ip[3], (ip[4]<<8)|ip[5], (ip[6]<<8)|ip[7],
+             (ip[8]<<8)|ip[9], (ip[10]<<8)|ip[11], (ip[12]<<8)|ip[13], (ip[14]<<8)|ip[15]);
+}
 
-    int offset = 4;
-    int current_priority = 99;
-    const char* text_prefix = nullptr;
-    int best_text_start = 0;
-    int best_text_len = 0;
+// ---------------------------------------------------------
+// HARDENED DNS NAME DECODER
+// ---------------------------------------------------------
+int decode_dns_name(const uint8_t* payload, int end_offset, int offset, char* out_name, int max_name_len) {
+    if (!payload || !out_name || max_name_len <= 0) return -1; 
 
-    // --- PASS 1: Extract Options ---
-    while (offset + 4 <= length) {
-        // DHCPv6 uses 16-bit Type and 16-bit Length fields (Big Endian)
-        uint16_t opt_code = (payload[offset] << 8) | payload[offset + 1];
-        uint16_t opt_len = (payload[offset + 2] << 8) | payload[offset + 3];
-        offset += 4;
+    int original_offset = offset;
+    int out_idx = 0;
+    bool jumped = false;
+    int jumps = 0;
+
+    while (offset < end_offset) {
+        uint8_t len = payload[offset];
+        if (len == 0) { 
+            if (!jumped) original_offset = offset + 1;
+            break;
+        }
         
-        if (offset + opt_len > length) break; // Truncated packet
+        if ((len & 0xC0) == 0xC0) { 
+            if (offset + 1 >= end_offset || jumps > 16) return -1; 
+            if (!jumped) original_offset = offset + 2; 
+            
+            int ptr = ((len & 0x3F) << 8) | payload[offset + 1];
+            if (ptr >= end_offset) return -1; 
+            
+            offset = ptr;
+            jumped = true;
+            jumps++;
+            continue;
+        }
         
-        int this_priority = 99;
-        const char* this_prefix = nullptr;
-
-        if (opt_code == 39) { this_priority = 1; this_prefix = "FQDN:"; }
-        else if (opt_code == 16) { this_priority = 2; this_prefix = "Vendor:"; }
-
-        // If it's a high-value option, find the longest ASCII substring inside it
-        if (this_priority < current_priority) {
-            int cur_s = 0, cur_l = 0, max_s = 0, max_l = 0;
-            for (int i = 0; i < opt_len; i++) {
+        if (len > 63 || offset + 1 > end_offset || len > end_offset - offset - 1) return -1;
+        
+        offset++;
+        if (out_idx > 0 && out_idx < max_name_len - 1) out_name[out_idx++] = '.';
+        
+        for (int i = 0; i < len; i++) {
+            if (out_idx < max_name_len - 1) {
                 char c = payload[offset + i];
-                if (c >= 32 && c <= 126) {
-                    if (cur_l == 0) cur_s = offset + i;
-                    cur_l++;
-                    if (cur_l > max_l) { max_l = cur_l; max_s = cur_s; }
-                } else { cur_l = 0; }
-            }
-            
-            if (max_l >= 3) { // Require at least 3 chars
-                current_priority = this_priority;
-                text_prefix = this_prefix;
-                best_text_start = max_s;
-                best_text_len = max_l;
+                out_name[out_idx++] = (c >= 32 && c <= 126) ? c : '.';
             }
         }
-        offset += opt_len; // Jump to next option
+        
+        offset += len;
+        if (!jumped) original_offset = offset;
     }
 
-    // --- PASS 2: ASCII Fallback ---
-    if (text_prefix == nullptr) {
-        int cur_s = 0, cur_l = 0, max_s = 0, max_l = 0;
-        for (int i = 4; i < length; i++) { // Sweep entire packet after header
-            char c = payload[i];
-            if (c >= 32 && c <= 126) {
-                if (cur_l == 0) cur_s = i;
-                cur_l++;
-                if (cur_l > max_l) { max_l = cur_l; max_s = cur_s; }
-            } else { cur_l = 0; }
-        }
-        if (max_l >= 6) {
-            text_prefix = "Str:";
-            best_text_start = max_s;
-            best_text_len = max_l;
-        }
-    }
-
-    // --- STRING ASSEMBLY ---
-    if (text_prefix != nullptr) {
-        snprintf(out_text, max_len, "DHCPv6 [%s] %s %.*s", 
-                 msg_type_str, text_prefix, best_text_len, &payload[best_text_start]);
-        return true;
-    }
-
-    return false;
+    out_name[out_idx] = '\0';
+    return original_offset; 
 }
 
+/*
 // Helper function to decode length-prefixed DNS/mDNS names and resolve pointers
 int decode_dns_name(const uint8_t* payload, uint16_t length, int offset, char* out_name, int max_name_len) {
     int original_offset = offset;
@@ -1455,6 +1326,231 @@ int decode_dns_name(const uint8_t* payload, uint16_t length, int offset, char* o
     out_name[out_idx] = '\0';
     
     return jumped ? original_offset : offset;
+}
+*/
+
+
+
+// ---------------------------------------------------------
+// DHCPv4 (IPv4) PARSER
+// Extracts Message Type, Primary DNS, and highest-value text 
+// Priority: FQDN > Hostname > Domain > Vendor > Fallback ASCII
+// ---------------------------------------------------------
+
+bool parse_dhcp_v4(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (!payload || !out_text || max_len == 0 || length < 240) return false;
+    
+    if (payload[236] == 0x63 && payload[237] == 0x82 && 
+        payload[238] == 0x53 && payload[239] == 0x63) {
+        
+        int offset = 240;
+        char msg_type_str[16] = "UNK";
+        
+        char best_text[128] = {0};
+        char dns_str[96] = {0};
+        int current_priority = 99; 
+
+        while (offset < length && payload[offset] != 255) {
+            uint8_t opt_type = payload[offset];
+            if (opt_type == 0) { offset++; continue; } 
+            
+            if (offset + 1 >= length) break;
+            uint8_t opt_len = payload[offset + 1];
+            if (offset + 2 + opt_len > length) break; 
+            
+            int opt_data = offset + 2;
+            int this_priority = 99;
+            char temp_buf[128] = {0};
+
+            if (opt_type == 53 && opt_len == 1) {
+                switch (payload[opt_data]) {
+                    case 1: strlcpy(msg_type_str, "DISCOVER", sizeof(msg_type_str)); break;
+                    case 2: strlcpy(msg_type_str, "OFFER", sizeof(msg_type_str)); break;
+                    case 3: strlcpy(msg_type_str, "REQUEST", sizeof(msg_type_str)); break;
+                    case 4: strlcpy(msg_type_str, "DECLINE", sizeof(msg_type_str)); break;
+                    case 5: strlcpy(msg_type_str, "ACK", sizeof(msg_type_str)); break;
+                    case 6: strlcpy(msg_type_str, "NAK", sizeof(msg_type_str)); break;
+                    case 7: strlcpy(msg_type_str, "RELEASE", sizeof(msg_type_str)); break;
+                    case 8: strlcpy(msg_type_str, "INFORM", sizeof(msg_type_str)); break;
+                    default: snprintf(msg_type_str, sizeof(msg_type_str), "?%d", payload[opt_data]); break;
+                }
+            }
+            else if (opt_type == 6 && opt_len >= 4 && (opt_len % 4 == 0)) {
+                int dns_idx = 0;
+                dns_idx += snprintf(dns_str, sizeof(dns_str), "DNS: ");
+                for (int i = 0; i < opt_len; i += 4) {
+                    if (dns_idx > 5 && dns_idx < (int)sizeof(dns_str) - 2) dns_str[dns_idx++] = ',';
+                    if (dns_idx > (int)sizeof(dns_str) - 16) break; // Capacity safety
+                    dns_idx += snprintf(dns_str + dns_idx, sizeof(dns_str) - dns_idx, "%d.%d.%d.%d",
+                                        payload[opt_data + i], payload[opt_data + i + 1],
+                                        payload[opt_data + i + 2], payload[opt_data + i + 3]);
+                }
+            }
+            else if (opt_type == 81 && opt_len > 3) { 
+                char fqdn_buf[64] = {0};
+                int res = decode_dns_name(payload, opt_data + opt_len, opt_data + 3, fqdn_buf, sizeof(fqdn_buf));
+                if (res >= 0 && fqdn_buf[0] != '\0') {
+                    this_priority = 1;
+                    snprintf(temp_buf, sizeof(temp_buf), "FQDN: %s", fqdn_buf);
+                }
+            }
+            else if (opt_type == 12 && opt_len > 0) { 
+                this_priority = 2; 
+                snprintf(temp_buf, sizeof(temp_buf), "Host: ");
+                copy_printable_ascii(&payload[opt_data], opt_len, temp_buf + 6, sizeof(temp_buf) - 6);
+            }
+            else if (opt_type == 60 && opt_len > 0) { 
+                this_priority = 3; 
+                snprintf(temp_buf, sizeof(temp_buf), "Vendor: ");
+                copy_printable_ascii(&payload[opt_data], opt_len, temp_buf + 8, sizeof(temp_buf) - 8);
+            }
+            else if (opt_type == 61 && opt_len > 1) { 
+                this_priority = 4;
+                snprintf(temp_buf, sizeof(temp_buf), "ClientID: ");
+                int out_idx = 10;
+                for (int i = 1; i < opt_len && out_idx < (int)sizeof(temp_buf) - 3; i++) {
+                    out_idx += snprintf(temp_buf + out_idx, sizeof(temp_buf) - out_idx, "%02X", payload[opt_data + i]);
+                }
+            }
+            else if (opt_type == 55 && opt_len > 0) { 
+                this_priority = 5;
+                snprintf(temp_buf, sizeof(temp_buf), "PRL: ");
+                int out_idx = 5;
+                for (int i = 0; i < opt_len && out_idx < (int)sizeof(temp_buf) - 4; i++) {
+                    out_idx += snprintf(temp_buf + out_idx, sizeof(temp_buf) - out_idx, "%d,", payload[opt_data + i]);
+                }
+                if (out_idx > 5) temp_buf[out_idx - 1] = '\0'; 
+            }
+            
+            if (this_priority < current_priority && temp_buf[0] != '\0') {
+                current_priority = this_priority;
+                strlcpy(best_text, temp_buf, sizeof(best_text));
+            }
+            offset += 2 + opt_len;
+        }
+
+        // Always return true for a valid DHCP packet, even if it lacks text
+        int written = snprintf(out_text, max_len, "DHCP [%s]", msg_type_str);
+        if (best_text[0] != '\0' && written < (int)max_len) {
+            written += snprintf(out_text + written, max_len - written, " %s", best_text);
+        }
+        if (dns_str[0] != '\0' && written < (int)max_len) {
+            written += snprintf(out_text + written, max_len - written, " %s", dns_str);
+        }
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------
+// DHCPv6 (IPv6) PARSER
+// Extracts Message Type and highest-value text (FQDN > Vendor > ASCII)
+// ---------------------------------------------------------
+bool parse_dhcp_v6(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    if (!payload || !out_text || max_len == 0 || length < 4) return false; 
+    
+    uint8_t msg_type = payload[0];
+    char msg_type_str[16] = "UNK";
+    
+    switch (msg_type) {
+        case 1:  strlcpy(msg_type_str, "SOLICIT", sizeof(msg_type_str)); break;
+        case 2:  strlcpy(msg_type_str, "ADVERT", sizeof(msg_type_str)); break;
+        case 3:  strlcpy(msg_type_str, "REQUEST", sizeof(msg_type_str)); break;
+        case 4:  strlcpy(msg_type_str, "CONFIRM", sizeof(msg_type_str)); break;
+        case 5:  strlcpy(msg_type_str, "RENEW", sizeof(msg_type_str)); break;
+        case 6:  strlcpy(msg_type_str, "REBIND", sizeof(msg_type_str)); break;
+        case 7:  strlcpy(msg_type_str, "REPLY", sizeof(msg_type_str)); break;
+        case 8:  strlcpy(msg_type_str, "RELEASE", sizeof(msg_type_str)); break;
+        case 9:  strlcpy(msg_type_str, "DECLINE", sizeof(msg_type_str)); break;
+        case 10: strlcpy(msg_type_str, "RECONFIG", sizeof(msg_type_str)); break;
+        case 11: strlcpy(msg_type_str, "INFO-REQ", sizeof(msg_type_str)); break;
+        case 12: strlcpy(msg_type_str, "RELAY-FWD", sizeof(msg_type_str)); break;
+        case 13: strlcpy(msg_type_str, "RELAY-REP", sizeof(msg_type_str)); break;
+        default: snprintf(msg_type_str, sizeof(msg_type_str), "?%d", msg_type); break;
+    }
+
+    // Short-circuit Relays: Do not parse outer options to avoid polluting fingerprint
+    if (msg_type == 12 || msg_type == 13) {
+        snprintf(out_text, max_len, "DHCPv6 [%s]", msg_type_str);
+        return true;
+    }
+
+    int offset = 4;
+    int current_priority = 99;
+    char best_text[128] = {0};
+    char dns_str[128] = {0};
+
+    while (offset + 4 <= length) {
+        uint16_t opt_code = (payload[offset] << 8) | payload[offset + 1];
+        uint16_t opt_len = (payload[offset + 2] << 8) | payload[offset + 3];
+        offset += 4;
+        
+        if (offset + opt_len > length) break; 
+        
+        int opt_data = offset;
+        int this_priority = 99;
+        char temp_buf[128] = {0};
+
+        if (opt_code == 39 && opt_len > 1) { 
+            char fqdn_buf[64] = {0};
+            int res = decode_dns_name(payload, opt_data + opt_len, opt_data + 1, fqdn_buf, sizeof(fqdn_buf));
+            if (res >= 0 && fqdn_buf[0] != '\0') {
+                this_priority = 1;
+                snprintf(temp_buf, sizeof(temp_buf), "FQDN: %s", fqdn_buf);
+            }
+        }
+        else if (opt_code == 16 && opt_len > 4) { // Option 16: Structured Vendor Class
+            this_priority = 2; 
+            snprintf(temp_buf, sizeof(temp_buf), "Vendor: ");
+            int out_idx = 8;
+            int v_off = 4; // Skip 4-byte enterprise ID
+            
+            while (v_off + 2 <= opt_len) {
+                uint16_t v_len = (payload[opt_data + v_off] << 8) | payload[opt_data + v_off + 1];
+                v_off += 2;
+                if (v_off + v_len > opt_len) break; // Truncated class data
+                
+                if (out_idx > 8 && out_idx < (int)sizeof(temp_buf) - 2) temp_buf[out_idx++] = ' ';
+                out_idx += copy_printable_ascii(&payload[opt_data + v_off], v_len, temp_buf + out_idx, sizeof(temp_buf) - out_idx);
+                v_off += v_len;
+            }
+        }
+        else if (opt_code == 1 && opt_len > 0) { 
+            this_priority = 3;
+            snprintf(temp_buf, sizeof(temp_buf), "DUID: ");
+            int out_idx = 6;
+            for (int i = 0; i < opt_len && out_idx < (int)sizeof(temp_buf) - 3; i++) {
+                out_idx += snprintf(temp_buf + out_idx, sizeof(temp_buf) - out_idx, "%02X", payload[opt_data + i]);
+            }
+        }
+        else if (opt_code == 23 && opt_len >= 16 && (opt_len % 16 == 0)) { // Option 23: DNS Servers
+            int dns_idx = 0;
+            dns_idx += snprintf(dns_str, sizeof(dns_str), "DNS: ");
+            for (int i = 0; i < opt_len; i += 16) {
+                if (dns_idx > 5) dns_str[dns_idx++] = ',';
+                if (dns_idx > (int)sizeof(dns_str) - 40) break; // Capacity safety
+                
+                char ip_buf[40];
+                format_ipv6_addr(&payload[opt_data + i], ip_buf, sizeof(ip_buf));
+                dns_idx += snprintf(dns_str + dns_idx, sizeof(dns_str) - dns_idx, "%s", ip_buf);
+            }
+        }
+
+        if (this_priority < current_priority && temp_buf[0] != '\0') {
+            current_priority = this_priority;
+            strlcpy(best_text, temp_buf, sizeof(best_text));
+        }
+        offset += opt_len; 
+    }
+
+    int written = snprintf(out_text, max_len, "DHCPv6 [%s]", msg_type_str);
+    if (best_text[0] != '\0' && written < (int)max_len) {
+        written += snprintf(out_text + written, max_len - written, " %s", best_text);
+    }
+    if (dns_str[0] != '\0' && written < (int)max_len) {
+        written += snprintf(out_text + written, max_len - written, " %s", dns_str);
+    }
+    return true;
 }
 
 void format_reverse_lookups(char* text, size_t max_len) {
@@ -1526,6 +1622,224 @@ static inline uint16_t read_u16(const uint8_t* p, uint16_t len, int offset) {
     return (p[offset] << 8) | p[offset + 1];
 }
 
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
+    if (length < 12) return false; 
+
+    bool is_response = (payload[2] & 0x80) != 0;
+    
+    // Read the DNS structural boundaries
+    uint16_t qdcount = (payload[4] << 8) | payload[5];
+    uint16_t ancount = (payload[6] << 8) | payload[7];
+    uint16_t nscount = (payload[8] << 8) | payload[9];
+    uint16_t arcount = (payload[10] << 8) | payload[11];
+
+    char domains[256] = {0};
+    int d_idx = 0;
+    int valid_labels = 0;
+
+    #define NOISE_MATCH(str) (len_byte == (sizeof(str) - 1) && memcmp(&payload[cur+1], str, sizeof(str) - 1) == 0)
+
+    // A helper function to safely extract names and return the exact offset where the name ends
+    auto process_name = [&](int start_offset) -> int {
+        int cur = start_offset;
+        bool in_domain = false;
+        
+        while (cur < length) {
+            uint8_t len_byte = payload[cur];
+            
+            if (len_byte == 0x00) {
+                return cur + 1; // End of name
+            }
+            if ((len_byte & 0xC0) == 0xC0) {
+                return cur + 2; // End of name (Compression Pointer)
+            }
+            
+            if (len_byte > 0 && len_byte <= 63 && cur + 1 + len_byte <= length) {
+                bool is_printable = true;
+                for (int j = 0; j < len_byte; j++) {
+                    if (payload[cur + 1 + j] < 32 || payload[cur + 1 + j] > 126) {
+                        is_printable = false;
+                        break;
+                    }
+                }
+
+                if (is_printable) {
+                    bool is_noise = false;
+                    //if (NOISE_MATCH("_tcp")) is_noise = true;
+                    //else if (NOISE_MATCH("_udp")) is_noise = true;
+                    //else if (NOISE_MATCH("local")) is_noise = true;
+                    //else if (NOISE_MATCH("arpa")) is_noise = true;
+                    //else if (NOISE_MATCH("in-addr")) is_noise = true;
+                    //else if (NOISE_MATCH("ip6")) is_noise = true;
+                    //else if (NOISE_MATCH("_appsvcprepair")) is_noise = true;
+                    //else if (NOISE_MATCH("_companion-link")) is_noise = true;
+                    //else if (NOISE_MATCH("_services")) is_noise = true;
+                    //else if (NOISE_MATCH("_dns-sd")) is_noise = true;
+                    //else if (NOISE_MATCH("_asquic")) is_noise = true; 
+                    //else if (NOISE_MATCH("_apple-mobdev2")) is_noise = true; 
+
+                    if (!is_noise) {
+                        if (d_idx + len_byte + 3 < sizeof(domains)) {
+                            bool is_duplicate = false;
+                            if (valid_labels > 0 && !in_domain) {
+                                if (d_idx >= len_byte && memcmp(&domains[d_idx - len_byte], &payload[cur+1], len_byte) == 0) {
+                                    is_duplicate = true;
+                                }
+                            }
+
+                            if (!is_duplicate) {
+                                if (valid_labels > 0) {
+                                    if (in_domain) domains[d_idx++] = '.';
+                                    else {
+                                        domains[d_idx++] = ','; 
+                                        domains[d_idx++] = ' ';
+                                    }
+                                }
+                                memcpy(&domains[d_idx], &payload[cur+1], len_byte);
+                                d_idx += len_byte;
+                                valid_labels++;
+                                in_domain = true; 
+                            } else {
+                                in_domain = false;
+                            }
+                        }
+                    } else {
+                        in_domain = false; 
+                    }
+                } else {
+                    in_domain = false; 
+                }
+                cur += len_byte + 1; // Jump to the next label in this name
+            } else {
+                return cur + 1; // Fallback for malformed bytes
+            }
+        }
+        return cur;
+    };
+
+    // ==========================================
+    // THE STATE MACHINE
+    // ==========================================
+    int offset = 12;
+
+    // 1. Process Questions
+    for (int i = 0; i < qdcount && offset < length; i++) {
+        offset = process_name(offset);
+        offset += 4; // Unconditionally skip QTYPE (2) and QCLASS (2)
+    }
+
+    // 2. Process Answers, Authorities, and Additionals
+    int total_answers = ancount + nscount + arcount;
+    for (int i = 0; i < total_answers && offset < length; i++) {
+        offset = process_name(offset);
+        
+        if (offset + 10 <= length) {
+            // CAPTURE THE RECORD TYPE BEFORE SKIPPING
+            uint16_t rr_type = (payload[offset] << 8) | payload[offset+1];
+            uint16_t rdlength = (payload[offset+8] << 8) | payload[offset+9];
+            
+            offset += 10; // Skip TYPE, CLASS, TTL, and RDLENGTH bytes
+            
+            if (offset + rdlength > length) break; // Memory safety check
+            
+            // ==========================================
+            // NEW: THE TXT RECORD EXTRACTOR
+            // ==========================================
+            if (rr_type == 16) { // 16 = TXT Record
+                int txt_off = offset;
+                int txt_end = offset + rdlength;
+                
+                while (txt_off < txt_end) {
+                    uint8_t txt_len = payload[txt_off];
+                    if (txt_off + 1 + txt_len > txt_end) break; // Bounds safety
+                    
+                    // Ensure the TXT chunk is printable ASCII
+                    bool is_printable = true;
+                    for (int j = 0; j < txt_len; j++) {
+                        char c = payload[txt_off + 1 + j];
+                        if (c < 32 || c > 126) {
+                            is_printable = false;
+                            break;
+                        }
+                    }
+                    
+                    if (is_printable && txt_len > 0) {
+                        if (d_idx + txt_len + 3 < sizeof(domains)) {
+                            // APPEND DIRECTLY: No duplicate check for TXT fields
+                            if (valid_labels > 0) {
+                                domains[d_idx++] = ','; 
+                                domains[d_idx++] = ' ';
+                            }
+                            memcpy(&domains[d_idx], &payload[txt_off+1], txt_len);
+                            d_idx += txt_len;
+                            valid_labels++;
+                        }
+                    }
+                    txt_off += 1 + txt_len; // Jump to next TXT chunk
+                }
+            }
+            // ==========================================
+
+            // Skip the RDATA block to maintain perfect alignment for the next record
+            offset += rdlength; 
+        } else {
+            break; // Malformed packet boundary
+        }
+    }
+    
+    #undef NOISE_MATCH 
+
+    domains[d_idx] = '\0';
+
+    if (valid_labels > 0) {
+        snprintf(out_text, max_len, "%s %s: %s", is_mdns ? "mDNS" : "DNS", is_response ? "Ans" : "Qry", domains);
+        return true;
+    }
+
+    // ==========================================
+    // 3. SALVAGED TXT RECORD SWEEPER (Fallback)
+    // ==========================================
+    if (is_mdns) {
+        int best_score = 0, best_s = 0, best_l = 0;
+        int cur_s = 0, cur_l = 0;
+        bool has_equals = false;
+
+        for (int i = 12; i < length; i++) {
+            char c = payload[i];
+            if (c >= 32 && c <= 126) { 
+                if (cur_l == 0) cur_s = i;
+                if (c == '=') has_equals = true;
+                cur_l++;
+            } else {
+                if (cur_l > 0) {
+                    int cur_score = cur_l + (has_equals ? 15 : 0);
+                    if (cur_score > best_score) {
+                        best_score = cur_score; best_l = cur_l; best_s = cur_s;
+                    }
+                }
+                cur_l = 0;
+                has_equals = false;
+            }
+        }
+        
+        if (cur_l > 0) { 
+            int cur_score = cur_l + (has_equals ? 15 : 0);
+            if (cur_score > best_score) {
+                best_score = cur_score; best_l = cur_l; best_s = cur_s;
+            }
+        }
+
+        if (best_l >= 6 && best_score >= 15) {
+            int copy_len = std::min(best_l, (int)max_len - 15);
+            snprintf(out_text, max_len, "mDNS TXT: %.*s", copy_len, &payload[best_s]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
     if (length < 12) return false; 
 
@@ -1676,7 +1990,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
 
     return false;
 }
-
+*/
 /*
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
     if (length < 12) return false; // Minimum size for a DNS header
@@ -3010,33 +3324,82 @@ bool parse_generic_json(const uint8_t* payload, uint16_t length, char* out_text,
 
     return found_something || keys_found > 0;
 }
-// ---------------------------------------------------------
-// ARP PARSER (Extracts IP to MAC mappings)
-// ---------------------------------------------------------
-bool parse_arp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    // ARP packet length over 802.11 LLC is typically 28 bytes
-    if (length < 28) return false;
-    
-    // Hardware Type (2), Protocol Type (2), Hw Size (1), Proto Size (1), Opcode (2)
-    uint16_t opcode = (payload[6] << 8) | payload[7];
-    
-    if (opcode != 1 && opcode != 2) return false; // 1 = Request, 2 = Reply
-    
-    // IP addresses are at offsets 14 and 24 in standard ARP
-    uint8_t src_ip[4];
-    memcpy(src_ip, &payload[14], 4);
-    
-    uint8_t dst_ip[4];
-    memcpy(dst_ip, &payload[24], 4);
 
-    if (opcode == 2) {
-        snprintf(out_text, max_len, "ARP Reply: MAC is %d.%d.%d.%d", 
-                 src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
-    } else {
-        snprintf(out_text, max_len, "ARP Req: Who has %d.%d.%d.%d?", 
-                 dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+// ---------------------------------------------------------
+// ARP PARSER
+// Extracts IPv4 <-> MAC mappings
+//
+// ARP packet layout:
+//   0-1   Hardware Type
+//   2-3   Protocol Type
+//   4     Hardware Address Length
+//   5     Protocol Address Length
+//   6-7   Opcode
+//   8-13  Sender Hardware Address (SHA)
+//   14-17 Sender Protocol Address (SPA)
+//   18-23 Target Hardware Address (THA)
+//   24-27 Target Protocol Address (TPA)
+// ---------------------------------------------------------
+bool parse_arp(const uint8_t* payload, uint16_t length,
+               char* out_text, size_t max_len) {
+
+    if (!payload || !out_text || max_len == 0 || length < 28)
+        return false;
+
+    // Standard Ethernet / IPv4 ARP validation
+    uint16_t htype = ((uint16_t)payload[0] << 8) | payload[1];
+    uint16_t ptype = ((uint16_t)payload[2] << 8) | payload[3];
+    uint8_t  hlen  = payload[4];
+    uint8_t  plen  = payload[5];
+
+    // Ethernet = 1
+    // IPv4    = 0x0800
+    // MAC     = 6 bytes
+    // IPv4    = 4 bytes
+    if (htype != 1 || ptype != 0x0800 ||
+        hlen != 6 || plen != 4)
+        return false;
+
+    uint16_t opcode = ((uint16_t)payload[6] << 8) | payload[7];
+
+    if (opcode != 1 && opcode != 2)
+        return false;
+
+    const uint8_t* sender_mac = &payload[8];
+    const uint8_t* sender_ip  = &payload[14];
+    const uint8_t* target_mac = &payload[18];
+    const uint8_t* target_ip  = &payload[24];
+
+    // -----------------------------------------------------
+    // ARP REQUEST
+    // "Who has target IP? Tell sender IP."
+    // -----------------------------------------------------
+    if (opcode == 1) {
+
+        snprintf(out_text, max_len,
+                 "ARP Req: Who has %d.%d.%d.%d? "
+                 "Tell %d.%d.%d.%d",
+                 target_ip[0], target_ip[1],
+                 target_ip[2], target_ip[3],
+                 sender_ip[0], sender_ip[1],
+                 sender_ip[2], sender_ip[3]);
+
+        return true;
     }
-    
+
+    // -----------------------------------------------------
+    // ARP REPLY
+    // "Target IP is at sender MAC."
+    // -----------------------------------------------------
+    snprintf(out_text, max_len,
+             "ARP Reply: %d.%d.%d.%d is-at "
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             sender_ip[0], sender_ip[1],
+             sender_ip[2], sender_ip[3],
+             sender_mac[0], sender_mac[1],
+             sender_mac[2], sender_mac[3],
+             sender_mac[4], sender_mac[5]);
+
     return true;
 }
 
@@ -3093,14 +3456,833 @@ bool parse_ephemeral_upnp(const uint8_t* payload, uint16_t length, char* out_tex
     
     return false; // Let it fall through to generic text extractors if we didn't find the juicy headers
 }
+
+// ---------------------------------------------------------
+// ICMPv6 DNSSL / DNS SEARCH LIST DECODER
+//
+// Decodes the Domain Names field of an ICMPv6 Neighbor
+// Discovery DNSSL option (ND option type 31).
+//
+// Input:
+//   data     = beginning of Domain Names field
+//   data_len = number of bytes available
+//
+// Output:
+//   "domain1,domain2,domain3"
+//
+// Returns number of characters written, or -1 on malformed
+// input.
+// ---------------------------------------------------------
+int decode_dns_search_list(const uint8_t* data,
+                           int data_len,
+                           char* out,
+                           int max_len) {
+
+    if (!data || !out || data_len <= 0 || max_len <= 0)
+        return -1;
+
+    out[0] = '\0';
+
+    int pos = 0;
+    int out_idx = 0;
+    bool first_domain = true;
+
+    while (pos < data_len) {
+
+        // Padding / end of domain list.
+        if (data[pos] == 0) {
+            pos++;
+            continue;
+        }
+
+        int domain_start = pos;
+        int domain_len = 0;
+        bool domain_valid = true;
+
+        while (pos < data_len) {
+
+            uint8_t label_len = data[pos];
+
+            // End of this domain.
+            if (label_len == 0) {
+                pos++;
+                break;
+            }
+
+            // Compression pointers are not expected here.
+            // Reject them rather than trying to interpret them.
+            if ((label_len & 0xC0) != 0) {
+                domain_valid = false;
+                break;
+            }
+
+            // DNS labels are limited to 63 bytes.
+            if (label_len > 63) {
+                domain_valid = false;
+                break;
+            }
+
+            // Need label bytes.
+            if (pos + 1 > data_len ||
+                label_len > data_len - pos - 1) {
+                domain_valid = false;
+                break;
+            }
+
+            // Account for this label.
+            pos += 1 + label_len;
+            domain_len += 1 + label_len;
+        }
+
+        if (!domain_valid)
+            return -1;
+
+        // Empty / malformed domain.
+        if (domain_len <= 1)
+            continue;
+
+        // Add comma separator.
+        if (!first_domain) {
+            if (out_idx >= max_len - 1)
+                break;
+
+            out[out_idx++] = ',';
+        }
+
+        first_domain = false;
+
+        // Re-decode the domain from domain_start.
+        int p = domain_start;
+        bool first_label = true;
+
+        while (p < pos && data[p] != 0) {
+
+            uint8_t label_len = data[p++];
+
+            if (label_len > 63 ||
+                p + label_len > pos) {
+                return -1;
+            }
+
+            if (!first_label) {
+                if (out_idx >= max_len - 1)
+                    break;
+
+                out[out_idx++] = '.';
+            }
+
+            first_label = false;
+
+            for (int i = 0; i < label_len; i++) {
+
+                if (out_idx >= max_len - 1)
+                    break;
+
+                uint8_t c = data[p++];
+
+                // Sanitize for TFT output.
+                out[out_idx++] =
+                    (c >= 32 && c <= 126) ? (char)c : '.';
+            }
+        }
+    }
+
+    out[out_idx] = '\0';
+    return out_idx;
+}
+
+// ---------------------------------------------------------
+// ICMPv6 / NDP PARSER
+//
+// Extracts high-value IPv6 control-plane information:
+//   - Echo Request / Reply
+//   - Destination Unreachable
+//   - Packet Too Big
+//   - Time Exceeded
+//   - Parameter Problem
+//   - Router Solicitation
+//   - Router Advertisement
+//   - Neighbor Solicitation
+//   - Neighbor Advertisement
+//   - Redirect
+//
+// NDP options:
+//   1  = Source Link-Layer Address
+//   2  = Target Link-Layer Address
+//   3  = Prefix Information
+//   5  = MTU
+//   24 = Route Information
+//   25 = RDNSS
+//   31 = DNSSL
+//
+// ICMPv6 payload begins at byte 0.
+// ---------------------------------------------------------
+
+// ---------------------------------------------------------
+// ICMPv6 MESSAGE TYPE NAME
+// ---------------------------------------------------------
+const char* icmpv6_type_name(uint8_t type) {
+
+    switch (type) {
+
+        // Errors
+        case 1:   return "Destination Unreachable";
+        case 2:   return "Packet Too Big";
+        case 3:   return "Time Exceeded";
+        case 4:   return "Parameter Problem";
+
+        // Echo / MLD / ND
+        case 128: return "Echo Request";
+        case 129: return "Echo Reply";
+        case 130: return "MLD Query";
+        case 131: return "MLD Report";
+        case 132: return "MLD Done";
+        case 133: return "Router Solicitation";
+        case 134: return "Router Advertisement";
+        case 135: return "Neighbor Solicitation";
+        case 136: return "Neighbor Advertisement";
+        case 137: return "Redirect";
+
+        // Less-common but assigned ICMPv6
+        case 138: return "Router Renumbering";
+        case 139: return "Node Information Query";
+        case 140: return "Node Information Response";
+        case 141: return "Inverse ND Solicitation";
+        case 142: return "Inverse ND Advertisement";
+        case 143: return "MLDv2 Report";
+        case 144: return "Home Agent Discovery Request";
+        case 145: return "Home Agent Discovery Reply";
+        case 146: return "Mobile Prefix Solicitation";
+        case 147: return "Mobile Prefix Advertisement";
+        case 148: return "Certification Path Solicitation";
+        case 149: return "Certification Path Advertisement";
+        case 150: return "Seamoby Mobility";
+        case 151: return "Multicast Router Advertisement";
+        case 152: return "Multicast Router Solicitation";
+        case 153: return "Multicast Router Termination";
+        case 154: return "FMIPv6";
+        case 155: return "RPL Control";
+        case 156: return "ILNPv6 Locator Update";
+        case 157: return "Duplicate Address Request";
+        case 158: return "Duplicate Address Confirmation";
+        case 159: return "MPL Control";
+        case 160: return "Extended Echo Request";
+        case 161: return "Extended Echo Reply";
+
+        default:
+            return "Unknown";
+    }
+}
+
+
+// ---------------------------------------------------------
+// ICMPv6 CODE NAME
+// ---------------------------------------------------------
+const char* icmpv6_code_name(uint8_t type, uint8_t code) {
+
+    if (type == 1) {
+
+        switch (code) {
+            case 0: return "No route";
+            case 1: return "Admin prohibited";
+            case 2: return "Beyond source scope";
+            case 3: return "Address unreachable";
+            case 4: return "Port unreachable";
+            case 5: return "Ingress/Egress policy";
+            case 6: return "Reject route";
+            case 7: return "SRH error";
+            case 8: return "Headers too long";
+            case 9: return "P-Route error";
+            default: return "Unknown";
+        }
+    }
+
+    if (type == 3) {
+        switch (code) {
+            case 0: return "Hop limit exceeded";
+            case 1: return "Fragment reassembly timeout";
+            default: return "Unknown";
+        }
+    }
+
+    if (type == 4) {
+        switch (code) {
+            case 0: return "Erroneous header field";
+            case 1: return "Unknown Next Header";
+            case 2: return "Unknown IPv6 option";
+            case 3: return "Incomplete first fragment";
+            case 4: return "SR upper-layer error";
+            case 5: return "Unknown Next Header (intermediate)";
+            case 6: return "Extension header too big";
+            case 7: return "Extension chain too long";
+            case 8: return "Too many extension headers";
+            case 9: return "Too many options";
+            case 10: return "Option too big";
+            default: return "Unknown";
+        }
+    }
+
+    return "OK";
+}
+
+
+// ---------------------------------------------------------
+// APPEND TEXT SAFELY
+// ---------------------------------------------------------
+static bool icmp6_append(char* out,
+                         size_t max_len,
+                         int& written,
+                         const char* fmt,
+                         ...) {
+
+    if (!out || written < 0 || written >= (int)max_len)
+        return false;
+
+    va_list args;
+    va_start(args, fmt);
+
+    int n = vsnprintf(out + written,
+                      max_len - written,
+                      fmt,
+                      args);
+
+    va_end(args);
+
+    if (n < 0)
+        return false;
+
+    written += n;
+
+    return written < (int)max_len;
+}
+
+
+// ---------------------------------------------------------
+// ICMPv6 PARSER
+// ---------------------------------------------------------
+bool parse_icmpv6(const uint8_t* payload,
+                  uint16_t length,
+                  char* out_text,
+                  size_t max_len,
+                  bool& is_high_value) {
+
+    if (!payload ||
+        !out_text ||
+        max_len == 0 ||
+        length < 4)
+        return false;
+
+    is_high_value = false;
+    out_text[0] = '\0';
+
+    uint8_t type = payload[0];
+    uint8_t code = payload[1];
+
+    const char* type_name = icmpv6_type_name(type);
+
+    // -----------------------------------------------------
+    // Mark particularly useful ICMPv6 traffic
+    // -----------------------------------------------------
+
+    switch (type) {
+
+        case 133: // Router Solicitation
+        case 134: // Router Advertisement
+        case 135: // Neighbor Solicitation
+        case 136: // Neighbor Advertisement
+        case 137: // Redirect
+        case 157: // DAR
+        case 158: // DAC
+            is_high_value = true;
+            break;
+
+        default:
+            break;
+    }
+
+
+    // -----------------------------------------------------
+    // BASIC HEADER-ONLY CASES
+    // -----------------------------------------------------
+
+    if (type >= 5 && type <= 127) {
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 [%u] %s Code:%u",
+                 type,
+                 type_name,
+                 code);
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // ERROR MESSAGES
+    // -----------------------------------------------------
+
+    if (type >= 1 && type <= 4) {
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 %s: %s",
+                 type_name,
+                 icmpv6_code_name(type, code));
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // ECHO REQUEST / REPLY
+    //
+    // Bytes 4-5 = Identifier
+    // Bytes 6-7 = Sequence
+    // -----------------------------------------------------
+
+    if (type == 128 || type == 129) {
+
+        if (length < 8) {
+            snprintf(out_text,
+                     max_len,
+                     "ICMPv6 %s (Malformed)",
+                     type_name);
+            return true;
+        }
+
+        uint16_t id =
+            ((uint16_t)payload[4] << 8) | payload[5];
+
+        uint16_t seq =
+            ((uint16_t)payload[6] << 8) | payload[7];
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 %s ID:%u Seq:%u",
+                 type_name,
+                 id,
+                 seq);
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // ROUTER SOLICITATION
+    //
+    // Fixed body = 4 reserved bytes
+    // Options begin at offset 8.
+    // -----------------------------------------------------
+
+    if (type == 133) {
+
+        if (length < 8) {
+            snprintf(out_text,
+                     max_len,
+                     "ICMPv6 RS (Malformed)");
+            return true;
+        }
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 Router Solicitation");
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // ROUTER ADVERTISEMENT
+    //
+    // Fixed body:
+    //
+    // 4   Type/Code/Checksum
+    // 1   Cur Hop Limit
+    // 1   Flags
+    // 2   Router Lifetime
+    // 4   Reachable Time
+    // 4   Retrans Timer
+    //
+    // Options begin at offset 16.
+    // -----------------------------------------------------
+
+    if (type == 134) {
+
+        if (length < 16) {
+            snprintf(out_text,
+                     max_len,
+                     "ICMPv6 RA (Malformed)");
+            return true;
+        }
+
+        uint8_t hop_limit = payload[4];
+        uint8_t flags = payload[5];
+
+        uint16_t lifetime =
+            ((uint16_t)payload[6] << 8) | payload[7];
+
+        bool managed = (flags & 0x80) != 0;
+        bool other   = (flags & 0x40) != 0;
+
+        char prefix_buf[96] = {0};
+        char dns_buf[128] = {0};
+        char search_buf[128] = {0};
+        char mtu_buf[32] = {0};
+
+        int offset = 16;
+
+        while (offset + 2 <= length) {
+
+            uint8_t opt_type = payload[offset];
+            uint8_t opt_units = payload[offset + 1];
+
+            // ND option length is in units of 8 bytes.
+            if (opt_units == 0)
+                break;
+
+            int opt_len = opt_units * 8;
+
+            if (opt_len < 8 ||
+                opt_len > length - offset)
+                break;
+
+            int opt_data = offset + 2;
+
+            // -------------------------------------------------
+            // Source Link-Layer Address
+            // -------------------------------------------------
+
+            if (opt_type == 1 && opt_len >= 8) {
+
+                snprintf(out_text + strlen(out_text),
+                         max_len - strlen(out_text),
+                         "\nSLLA:%02X:%02X:%02X:%02X:%02X:%02X",
+                         payload[opt_data],
+                         payload[opt_data + 1],
+                         payload[opt_data + 2],
+                         payload[opt_data + 3],
+                         payload[opt_data + 4],
+                         payload[opt_data + 5]);
+            }
+
+            // -------------------------------------------------
+            // Prefix Information
+            //
+            // Prefix length at +2.
+            // Prefix itself at +14.
+            // -------------------------------------------------
+
+            else if (opt_type == 3 && opt_len >= 32) {
+
+                uint8_t prefix_len = payload[opt_data];
+
+                char ip[40] = {0};
+
+                format_ipv6_addr(
+                    &payload[opt_data + 14],
+                    ip,
+                    sizeof(ip));
+
+                snprintf(prefix_buf,
+                         sizeof(prefix_buf),
+                         "%s/%u",
+                         ip,
+                         prefix_len);
+            }
+
+            // -------------------------------------------------
+            // MTU
+            // -------------------------------------------------
+
+            else if (opt_type == 5 && opt_len >= 8) {
+
+                uint32_t mtu =
+                    ((uint32_t)payload[opt_data + 2] << 24) |
+                    ((uint32_t)payload[opt_data + 3] << 16) |
+                    ((uint32_t)payload[opt_data + 4] << 8) |
+                    payload[opt_data + 5];
+
+                snprintf(mtu_buf,
+                         sizeof(mtu_buf),
+                         "%lu",
+                         (unsigned long)mtu);
+            }
+
+            // -------------------------------------------------
+            // RDNSS
+            //
+            // Option:
+            // +0  Reserved
+            // +4  Lifetime
+            // +8  IPv6 addresses
+            // -------------------------------------------------
+
+            else if (opt_type == 25 &&
+                     opt_len >= 24 &&
+                     ((opt_len - 8) % 16 == 0)) {
+
+                int dns_idx = 0;
+
+                dns_idx += snprintf(
+                    dns_buf + dns_idx,
+                    sizeof(dns_buf) - dns_idx,
+                    "DNS:");
+
+                for (int p = opt_data + 8;
+                     p + 16 <= offset + opt_len;
+                     p += 16) {
+
+                    if (dns_idx >=
+                        (int)sizeof(dns_buf) - 42)
+                        break;
+
+                    char ip[40] = {0};
+
+                    format_ipv6_addr(
+                        &payload[p],
+                        ip,
+                        sizeof(ip));
+
+                    dns_idx += snprintf(
+                        dns_buf + dns_idx,
+                        sizeof(dns_buf) - dns_idx,
+                        " %s",
+                        ip);
+                }
+            }
+
+            // -------------------------------------------------
+            // DNSSL
+            //
+            // +0  Reserved
+            // +4  Lifetime
+            // +8  Domain Names
+            // -------------------------------------------------
+
+            else if (opt_type == 31 &&
+                     opt_len >= 16) {
+
+                int res = decode_dns_search_list(
+                    &payload[opt_data + 6],
+                    opt_len - 6,
+                    search_buf,
+                    sizeof(search_buf));
+
+                if (res < 0)
+                    search_buf[0] = '\0';
+            }
+
+            offset += opt_len;
+        }
+
+        // -----------------------------------------------------
+        // Construct compact display.
+        //
+        // RA is one of the most information-rich packets,
+        // so prioritize:
+        //
+        //   Router / flags
+        //   Prefix
+        //   DNS
+        //   Search domain
+        //   MTU
+        // -----------------------------------------------------
+
+        int written = snprintf(
+            out_text,
+            max_len,
+            "ICMPv6 RA HL:%u LT:%u M:%u O:%u",
+            hop_limit,
+            lifetime,
+            managed ? 1 : 0,
+            other ? 1 : 0);
+
+        if (prefix_buf[0] &&
+            written < (int)max_len) {
+
+            written += snprintf(
+                out_text + written,
+                max_len - written,
+                "\nPrefix:%s",
+                prefix_buf);
+        }
+
+        if (dns_buf[0] &&
+            written < (int)max_len) {
+
+            written += snprintf(
+                out_text + written,
+                max_len - written,
+                "\n%s",
+                dns_buf);
+        }
+
+        if (search_buf[0] &&
+            written < (int)max_len) {
+
+            written += snprintf(
+                out_text + written,
+                max_len - written,
+                "\nSearch:%s",
+                search_buf);
+        }
+
+        if (mtu_buf[0] &&
+            written < (int)max_len) {
+
+            snprintf(
+                out_text + written,
+                max_len - written,
+                "\nMTU:%s",
+                mtu_buf);
+        }
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // NEIGHBOR SOLICITATION
+    //
+    // Fixed body:
+    // 4 reserved bytes
+    // 16-byte Target Address
+    //
+    // Options begin at offset 24.
+    // -----------------------------------------------------
+
+    if (type == 135) {
+
+        if (length < 24) {
+            snprintf(out_text,
+                     max_len,
+                     "ICMPv6 NS (Malformed)");
+            return true;
+        }
+
+        char target[40] = {0};
+
+        format_ipv6_addr(
+            &payload[8],
+            target,
+            sizeof(target));
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 NS Target:%s",
+                 target);
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // NEIGHBOR ADVERTISEMENT
+    //
+    // Fixed body:
+    // 4 flags/reserved
+    // 16 Target Address
+    //
+    // Options begin at offset 24.
+    // -----------------------------------------------------
+
+    if (type == 136) {
+
+        if (length < 24) {
+            snprintf(out_text,
+                     max_len,
+                     "ICMPv6 NA (Malformed)");
+            return true;
+        }
+
+        uint32_t flags =
+            ((uint32_t)payload[4] << 24) |
+            ((uint32_t)payload[5] << 16) |
+            ((uint32_t)payload[6] << 8) |
+            payload[7];
+
+        char target[40] = {0};
+
+        format_ipv6_addr(
+            &payload[8],
+            target,
+            sizeof(target));
+
+        bool router =
+            (flags & 0x80000000UL) != 0;
+
+        bool solicited =
+            (flags & 0x40000000UL) != 0;
+
+        bool override =
+            (flags & 0x20000000UL) != 0;
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 NA %s R:%u S:%u O:%u",
+                 target,
+                 router ? 1 : 0,
+                 solicited ? 1 : 0,
+                 override ? 1 : 0);
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // MLD
+    // -----------------------------------------------------
+
+    if (type == 130 ||
+        type == 131 ||
+        type == 132 ||
+        type == 143) {
+
+        snprintf(out_text,
+                 max_len,
+                 "ICMPv6 %s",
+                 type_name);
+
+        return true;
+    }
+
+
+    // -----------------------------------------------------
+    // FALLBACK
+    // -----------------------------------------------------
+
+    snprintf(out_text,
+             max_len,
+             "ICMPv6 [%u] %s Code:%u",
+             type,
+             type_name,
+             code);
+
+    return true;
+}
+
 // ==========================================
 // TKIP/WEP RATE LIMITER (ISR SAFE)
 // ==========================================
 // Returns true if we should push this alert to the queue
-bool should_alert_crypto(const uint8_t* src, const uint8_t* dst, uint32_t current_ms) {
+bool should_alert_crypto(const uint8_t* mac_a, const uint8_t* mac_b, uint32_t current_ms) {
+    
+    // --- THE MAC NORMALIZATION FIX ---
+    // Always store the numerically smaller MAC first. 
+    // This collapses AP->STA and STA->AP into a single bidirectional conversation slot.
+    const uint8_t* lo = (memcmp(mac_a, mac_b, 6) <= 0) ? mac_a : mac_b;
+    const uint8_t* hi = (lo == mac_a) ? mac_b : mac_a;
+
+    int oldest_idx = 0;
+    uint32_t oldest_time = 0xFFFFFFFF;
+
+    // 1. Scan the cache for a match AND track the oldest slot simultaneously
     for (int i = 0; i < ALERT_CACHE_SIZE; i++) {
-        if (memcmp(crypto_cache[i].mac_src, src, 6) == 0 &&
-            memcmp(crypto_cache[i].mac_dst, dst, 6) == 0) {
+        
+        // Match found using the normalized MACs!
+        if (memcmp(crypto_cache[i].mac_src, lo, 6) == 0 &&
+            memcmp(crypto_cache[i].mac_dst, hi, 6) == 0) {
             
             if (current_ms - crypto_cache[i].last_alert_ms > SEC_COOLDOWN_MS) {
                 crypto_cache[i].last_alert_ms = current_ms;
@@ -3108,13 +4290,20 @@ bool should_alert_crypto(const uint8_t* src, const uint8_t* dst, uint32_t curren
             }
             return false; // Still in cooldown
         }
+
+        // --- THE LRU EVICTION FIX ---
+        // Keep track of the stalest entry in case we need to evict.
+        if (crypto_cache[i].last_alert_ms < oldest_time) {
+            oldest_time = crypto_cache[i].last_alert_ms;
+            oldest_idx = i;
+        }
     }
-    // New flow: overwrite the oldest slot
-    memcpy(crypto_cache[crypto_cache_idx].mac_src, src, 6);
-    memcpy(crypto_cache[crypto_cache_idx].mac_dst, dst, 6);
-    crypto_cache[crypto_cache_idx].last_alert_ms = current_ms;
     
-    crypto_cache_idx = (crypto_cache_idx + 1) % ALERT_CACHE_SIZE;
+    // 2. New flow: Overwrite the genuinely oldest slot (True LRU)
+    memcpy(crypto_cache[oldest_idx].mac_src, lo, 6);
+    memcpy(crypto_cache[oldest_idx].mac_dst, hi, 6);
+    crypto_cache[oldest_idx].last_alert_ms = current_ms;
+    
     return true;
 }
 
@@ -3147,6 +4336,109 @@ void drawTelemetryHeader() {
     
     // 7. Draw the string exactly where OTHER goes
     tft.drawString(stat_text, 285, 1);
+}
+
+bool parse_eapol(const uint8_t* payload, uint16_t length,
+                 char* out_text, size_t max_len,
+                 bool& is_high_value) {
+
+    is_high_value = false;
+
+    if (!payload || !out_text || max_len == 0 || length < 2)
+        return false;
+
+    uint8_t eapol_type = payload[1];
+
+    switch (eapol_type) {
+
+        case 0:
+            snprintf(out_text, max_len,
+                     "EAPOL: EAP Packet (802.1X Auth)");
+            return true;
+
+        case 1:
+            snprintf(out_text, max_len, "EAPOL: Start");
+            return true;
+
+        case 2:
+            snprintf(out_text, max_len, "EAPOL: Logoff");
+            return true;
+
+        case 3: {   // EAPOL-Key
+
+            if (length < 7) {
+                snprintf(out_text, max_len,
+                         "EAPOL-Key (Malformed)");
+                return true;
+            }
+
+            // Descriptor Type
+            uint8_t desc_type = payload[4];
+
+            const char* desc_str = "UNK";
+
+            if (desc_type == 2)
+                desc_str = "RSN";
+            else if (desc_type == 254)
+                desc_str = "WPA";
+
+            // Key Information: network byte order
+            uint16_t key_info =
+                ((uint16_t)payload[5] << 8) | payload[6];
+
+            bool pairwise   = (key_info & 0x0008) != 0;
+            bool install    = (key_info & 0x0040) != 0;
+            bool ack        = (key_info & 0x0080) != 0;
+            bool mic        = (key_info & 0x0100) != 0;
+            bool secure     = (key_info & 0x0200) != 0;
+
+            const char* msg_type = "Unknown";
+
+            if (pairwise) {
+
+                if (ack && !mic) {
+                    // M1
+                    msg_type = "M1 (AP->STA)";
+                    is_high_value = true;
+                }
+                else if (!ack && mic && !secure) {
+                    // M2
+                    msg_type = "M2 (STA->AP)";
+                    is_high_value = true;
+                }
+                else if (ack && mic && install && secure) {
+                    // M3
+                    msg_type = "M3 (AP->STA)";
+                    is_high_value = true;
+                }
+                else if (!ack && mic && !install && secure) {
+                    // M4
+                    msg_type = "M4 (STA->AP)";
+                    is_high_value = true;
+                }
+
+            } else {
+                msg_type = "Group/Other Key";
+            }
+
+            snprintf(out_text, max_len,
+                     "EAPOL-Key [%s]: %s",
+                     desc_str, msg_type);
+
+            return true;
+        }
+
+        case 4:
+            snprintf(out_text, max_len,
+                     "EAPOL: Encapsulated-ASF-Alert");
+            return true;
+
+        default:
+            snprintf(out_text, max_len,
+                     "EAPOL: Unknown Type %d",
+                     eapol_type);
+            return true;
+    }
 }
 
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
@@ -3992,6 +5284,13 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   if (now_ms - flow_cache[cache_idx].last_printed_ms > LIVE_DUMP_COOLDOWN_MS) {
                       should_process = true;
                       flow_cache[cache_idx].last_printed_ms = now_ms;
+                  } else {
+                      // NEW
+                      static uint32_t suppressed = 0;
+                      suppressed++;
+                      if (suppressed % 20 == 1) {
+                          Serial.printf("[L2-DEDUP] Cooldown suppressed repeat (hash=0x%08X, total=%u)\n", current_hash, suppressed);
+                      }
                   }
               } else {
                   // New Flow: Evict the oldest record and claim the slot
@@ -4066,52 +5365,66 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           // ==========================================
           // INSECURE ENCRYPTION DETECTION (TKIP/WEP)
           // ==========================================
-          uint8_t header_len = (payload[0] & 0x80) ? 26 : 24;
           
-          // Ensure we have enough bytes to read the IV header
+          // --- UPGRADED: STRICT HEADER SIZING ---
+          bool is_qos = (payload[0] & 0x80) != 0;
+          bool to_ds = (payload[1] & 0x01) != 0;
+          bool from_ds = (payload[1] & 0x02) != 0;
+          
+          // The +HTC bit ONLY dictates a 4-byte shift if it is a QoS Data frame!
+          bool has_ht_ctrl = is_qos && ((payload[1] & 0x80) != 0); 
+          
+          uint8_t header_len = 24;          // Base MAC Header
+          if (to_ds && from_ds) header_len += 6; // Address 4 present (WDS Bridge)
+          if (is_qos) header_len += 2;           // QoS Control present
+          if (has_ht_ctrl) header_len += 4;      // HT Control present
+          // ---------------------------------------
+          
           if (len > header_len + 4) {
               uint8_t* iv_ptr = payload + header_len;
               
-              // Bit 5 (0x20) of the Key ID octet indicates an Extended (8-byte) IV
               bool is_ext_iv = (iv_ptr[3] & 0x20) != 0;
+              bool is_valid_key_id = (iv_ptr[3] & 0x1F) == 0;
               
-              // REQ 2: Extract TID (Traffic Identifier) if QoS bit is set
               char tid_str[16] = {0};
-              if (payload[0] & 0x80) { 
-                  // QoS Control field is at payload[24]. Lowest 4 bits = TID.
-                  uint8_t tid = payload[24] & 0x0F;
+              if (is_qos) { 
+                  uint8_t tid = payload[header_len - 2] & 0x0F;
                   snprintf(tid_str, sizeof(tid_str), "[TID:%d] ", tid);
               }
               
               bool triggered = false;
               char temp_text[MAX_LEAK_STR_LEN] = {0};
 
-              if (is_ext_iv) {
-                  // Heuristic: CCMP reserves Byte 2 as 0x00. TKIP uses it for a TSC-derived WEP seed.
-                  if (iv_ptr[2] != 0x00) {
-                      snprintf(temp_text, MAX_LEAK_STR_LEN, "%sWPA/TKIP Encryption Detected (INSECURE)", tid_str);
+              // ONLY evaluate if we mathematically proved it is a valid IV header structure
+              if (is_valid_key_id) {
+                  if (is_ext_iv) {
+                      // CCMP strictly reserves Byte 2 as 0x00. 
+                      // TKIP uses it as a Dummy Byte, mathematically computed as: (TSC1 | 0x20) & 0x7F
+                      if (iv_ptr[2] != 0x00) {
+                          // THE SILVER BULLET: Verify the IEEE TKIP RFC math
+                          if (iv_ptr[2] == ((iv_ptr[1] | 0x20) & 0x7F)) {
+                              snprintf(temp_text, MAX_LEAK_STR_LEN, "%sWPA/TKIP Encryption Detected (INSECURE)", tid_str);
+                              triggered = true;
+                          }
+                      }
+                  } else {
+                      // WEP signature: KeyID is valid, but it is NOT an Extended IV.
+                      snprintf(temp_text, MAX_LEAK_STR_LEN, "%sWEP Encryption Detected (INSECURE)", tid_str);
                       triggered = true;
                   }
-              } else {
-                  // A 4-byte IV without the Ext-IV bit set is standard WEP
-                  snprintf(temp_text, MAX_LEAK_STR_LEN, "%sWEP Encryption Detected (INSECURE)", tid_str);
-                  triggered = true;
               }
 
-              // Apply the deduplication cooldown based on MAC addresses
+              // Apply the LRU cache deduplication
               if (triggered) {
-                  uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                  uint32_t now_ms = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
                   
                   if (should_alert_crypto(payload + 10, payload + 4, now_ms)) {
                       
                       Layer2Capture leak;
                       memset(&leak, 0, sizeof(Layer2Capture));
                       
-                      // Using the correct struct member names
                       leak.timestamp = now_ms;
                       leak.frame_length = pkt->rx_ctrl.sig_len;
-                      // Generate a quick hash from a few bytes of the Dst and Src MACs
-                      // so processLeakQueue() can separate different routers!
                       leak.flow_hash = (payload[9] << 24) | (payload[8] << 16) | (payload[15] << 8) | payload[14];
                       leak.frame_subtype = (payload[0] & 0xF0) >> 4;
                       leak.direction = payload[1] & 0x03;
@@ -4121,7 +5434,6 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       memcpy(leak.dst_mac, payload + 4, 6);
                       memcpy(leak.bssid, mac3, 6);
 
-                      // Write directly to the UI Union
                       strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
                       
                       if (leakQueue != NULL) {
@@ -4309,19 +5621,10 @@ void processLiveDumpQueue() {
             custom_extracted = parse_arp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 0.5 EAPOL (WPA/WPA2/WPA3 Handshake) ---
-        else if (l2_cap.ether_type == 0x888E && l2_cap.payload_len >= 2) {
-            uint8_t eapol_type = l2_cap.raw_payload[1];
-            switch (eapol_type) {
-                case 0: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: EAP Packet (802.1X Auth)"); break;
-                case 1: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Start"); break;
-                case 2: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Logoff"); break;
-                case 3: 
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL-Key (WPA Handshake)");
-                    l2_cap.is_high_value = true; 
-                    break;
-                default: snprintf(temp_text, MAX_LEAK_STR_LEN, "EAPOL: Unknown Type %d", eapol_type); break;
+        else if (l2_cap.ether_type == 0x888E) {
+            if (parse_eapol(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN, l2_cap.is_high_value)) {
+                custom_extracted = true;
             }
-            custom_extracted = true;
         }
         // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
         else if (l2_cap.dst_port == 67 || l2_cap.dst_port == 68) {
@@ -4421,21 +5724,26 @@ void processLiveDumpQueue() {
             snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv4 Message (Ping/Control)");
             custom_extracted = true;
         }
-        else if (l2_cap.protocol == 58) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv6 Message (Ping/Control)");
-            custom_extracted = true;
-        }
 
         // =========================================================
         // --- END OF MONOLITHIC CHAIN. BEGIN INDEPENDENT CASCADE. ---
         // =========================================================
-        
         // --- 10. PAYLOAD SIGNATURES & DEEP PARSERS ---
         if (!custom_extracted && l2_cap.payload_len > 0) {
             const uint8_t* p = l2_cap.raw_payload;
             uint16_t len = l2_cap.payload_len;
 
+            // ICMPv6: IPv6 Next Header = 58
+    if (l2_cap.ip_version == 6 && l2_cap.protocol == 58) {
+        if (parse_icmpv6(p, len,
+                         temp_text, MAX_LEAK_STR_LEN,
+                         l2_cap.is_high_value)) {
+            custom_extracted = true;
+        }
+    }
+
             // 10.1 Magic Byte Signatures (Highest Precision)
+            if (!custom_extracted) {
             if (len >= 8 && p[4] == 0x21 && p[5] == 0x12 && p[6] == 0xA4 && p[7] == 0x42) {
                 snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: Live VoIP/WebRTC Stream");
                 custom_extracted = true;
@@ -4467,7 +5775,7 @@ void processLiveDumpQueue() {
                 custom_extracted = true;
                 l2_cap.is_high_value = true;
             }
-
+          }
             // 10.2 Structured Extractors (UPnP, JSON)
             if (!custom_extracted) {
                 if (parse_ephemeral_upnp(p, len, temp_text, MAX_LEAK_STR_LEN)) {
