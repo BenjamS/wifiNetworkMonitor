@@ -2470,101 +2470,276 @@ bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, si
 }
 */
 
-// ==========================================
-// X.509 TLS CERTIFICATE PARSER (Server Hello)
-// ==========================================
-// Hunts for ASN.1 DER encoded Object Identifiers (OIDs) to extract
-// the Common Name (CN) and Organization (O) from raw TLS handshakes.
+// ============================================================================
+// UPGRADED X.509 CERTIFICATE & IDENTITY EXTRACTOR
+// ============================================================================
+// Scans raw TLS Handshakes / A-MSDU blobs for ASN.1 DER structures.
+// Extracts Subject (Target Server), Issuer (CA), Geographic Location, 
+// SANs, URLs, Emails, and Establishment Dates.
+// ============================================================================
 bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    // Need at least enough bytes for a TLS record header + OID + Type + Length
-    if (length < 20) return false;
+    if (length < 24 || payload == nullptr || out_text == nullptr || max_len == 0) {
+        return false;
+    }
 
-    // Fast reject: Only process TLS Handshake records (ContentType = 0x16)
-    if (payload[0] != 0x16) return false;
+    char subject_cn[64]   = {0};
+    char subject_org[64]  = {0};
+    char subject_loc[32]  = {0};
+    char subject_state[32]= {0};
+    char subject_c[8]     = {0};
 
-    char cn[64] = {0};
-    char org[64] = {0};
-    bool found_cn = false;
-    bool found_org = false;
+    char issuer_cn[64]    = {0};
+    char issuer_org[64]   = {0};
 
-    // Sliding window looking for the X.500 attribute OID prefix: 0x06 0x03 0x55 0x04
-    for (uint16_t i = 0; i < length - 10; i++) {
+    char san_dns[64]      = {0};
+    char cert_url[64]     = {0}; 
+    char cert_email[64]   = {0};
+    char cert_date[16]    = {0};
+
+    bool has_subject_cn  = false;
+    bool has_subject_org = false;
+    bool has_issuer_cn   = false;
+    bool has_issuer_org  = false;
+    bool has_cert_url    = false;
+    bool has_email       = false;
+    bool has_date        = false;
+
+    for (uint16_t i = 0; i + 7 < length; i++) {
+        // --- 1. X.500 RDN Attributes (OID Prefix: 06 03 55 04 XX) ---
         if (payload[i] == 0x06 && payload[i+1] == 0x03 && 
             payload[i+2] == 0x55 && payload[i+3] == 0x04) {
             
-            uint8_t attr_type = payload[i+4]; // 0x03 = CN, 0x0A = Org
-            
-            if (attr_type == 0x03 || attr_type == 0x0A) {
-                // i+5 is the String Type (e.g., 0x13 PrintableString, 0x0C UTF8String)
-                // i+6 is the String Length
-                uint8_t str_len = payload[i+6];
+            uint8_t attr_type = payload[i+4];
+            uint8_t tag_type  = payload[i+5]; // 0x13 = PrintableString, 0x0C = UTF8String, etc.
+            uint8_t str_len   = payload[i+6];
 
-                // Bounds check to prevent buffer over-reads on fragmented packets
-                if (i + 7 + str_len <= length) {
-                    if (attr_type == 0x03 && !found_cn) { 
-                        int copy_len = std::min((int)str_len, 63);
-                        memcpy(cn, &payload[i+7], copy_len);
-                        cn[copy_len] = '\0';
-                        found_cn = true;
-                    } 
-                    else if (attr_type == 0x0A && !found_org) { 
-                        int copy_len = std::min((int)str_len, 63);
-                        memcpy(org, &payload[i+7], copy_len);
-                        org[copy_len] = '\0';
-                        found_org = true;
+            if ((tag_type == 0x13 || tag_type == 0x0C || tag_type == 0x16 || tag_type == 0x14) &&
+                (i + 7 + str_len <= length) && str_len > 0) {
+                
+                const uint8_t* str_data = &payload[i + 7];
+
+                switch (attr_type) {
+                    case 0x03: { // Common Name (CN)
+                        if (!has_issuer_cn) {
+                            int copy_len = std::min((int)str_len, 63);
+                            memcpy(issuer_cn, str_data, copy_len);
+                            issuer_cn[copy_len] = '\0';
+                            has_issuer_cn = true;
+                        } else {
+                            int copy_len = std::min((int)str_len, 63);
+                            memcpy(subject_cn, str_data, copy_len);
+                            subject_cn[copy_len] = '\0';
+                            has_subject_cn = true;
+                        }
+                        break;
                     }
+                    case 0x0A: { // Organization (O)
+                        if (!has_issuer_org) {
+                            int copy_len = std::min((int)str_len, 63);
+                            memcpy(issuer_org, str_data, copy_len);
+                            issuer_org[copy_len] = '\0';
+                            has_issuer_org = true;
+                        } else {
+                            int copy_len = std::min((int)str_len, 63);
+                            memcpy(subject_org, str_data, copy_len);
+                            subject_org[copy_len] = '\0';
+                            has_subject_org = true;
+                        }
+                        break;
+                    }
+                    case 0x07: { // Locality / City (L)
+                        int copy_len = std::min((int)str_len, 31);
+                        memcpy(subject_loc, str_data, copy_len);
+                        subject_loc[copy_len] = '\0';
+                        break;
+                    }
+                    case 0x08: { // State / Province (ST)
+                        int copy_len = std::min((int)str_len, 31);
+                        memcpy(subject_state, str_data, copy_len);
+                        subject_state[copy_len] = '\0';
+                        break;
+                    }
+                    case 0x06: { // Country (C)
+                        int copy_len = std::min((int)str_len, 7);
+                        memcpy(subject_c, str_data, copy_len);
+                        subject_c[copy_len] = '\0';
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                i += (6 + str_len);
+                continue;
+            }
+        }
+
+        // --- 2. Subject Alternative Name (SAN) (OID: 06 03 55 1D 11) ---
+        if (payload[i] == 0x06 && payload[i+1] == 0x03 && 
+            payload[i+2] == 0x55 && payload[i+3] == 0x1D && payload[i+4] == 0x11) {
+            
+            for (uint16_t s = i + 5; s + 2 < length && s < i + 30; s++) {
+                if (payload[s] == 0x82) { // 0x82 is context tag [2] for dNSName
+                    uint8_t dlen = payload[s+1];
+                    if (dlen > 0 && (s + 2 + dlen <= length)) {
+                        int copy_len = std::min((int)dlen, 63);
+                        memcpy(san_dns, &payload[s+2], copy_len);
+                        san_dns[copy_len] = '\0';
+                        break;
+                    }
+                }
+            }
+        }
+
+        // --- 3. Extract CA URLs (OCSP/CRL) (Tag 0x86 UniformResourceIdentifier) ---
+        if (!has_cert_url && payload[i] == 0x86 && 
+            payload[i+2] == 'h' && payload[i+3] == 't' && 
+            payload[i+4] == 't' && payload[i+5] == 'p') {
+            
+            uint8_t url_len = payload[i+1];
+            if (i + 2 + url_len <= length) {
+                uint8_t start = (payload[i+6] == 's') ? 10 : 9; // skip http(s)://
+                uint8_t end = start;
+                while (end < url_len + 2 && payload[i + end] != '/') {
+                    end++;
+                }
+
+                int domain_len = end - start;
+                if (domain_len > 0 && domain_len < 63) {
+                    memcpy(cert_url, &payload[i + start], domain_len);
+                    cert_url[domain_len] = '\0';
+                    has_cert_url = true;
+                }
+            }
+        }
+
+        // --- 4. Extract Email Addresses (OID: 1.2.840.113549.1.9.1) ---
+        if (!has_email && i + 12 < length &&
+            payload[i] == 0x06 && payload[i+1] == 0x09 &&
+            payload[i+2] == 0x2A && payload[i+3] == 0x86 && payload[i+4] == 0x48 &&
+            payload[i+5] == 0x86 && payload[i+6] == 0xF7 && payload[i+7] == 0x0D &&
+            payload[i+8] == 0x01 && payload[i+9] == 0x09 && payload[i+10] == 0x01) {
+
+            uint8_t str_len = payload[i+12];
+            
+            if (i + 13 + str_len <= length && str_len > 0 && str_len < 63) {
+                memcpy(cert_email, &payload[i+13], str_len);
+                cert_email[str_len] = '\0';
+                has_email = true;
+            }
+        }
+
+        // --- 5. Extract UTCTime (Tag 0x17) ---
+        if (!has_date && payload[i] == 0x17 && payload[i+1] == 13) {
+            if (i + 14 <= length) {
+                if (payload[i+2] >= '0' && payload[i+2] <= '9') {
+                    snprintf(cert_date, sizeof(cert_date), "20%c%c-%c%c-%c%c", 
+                        payload[i+2], payload[i+3],
+                        payload[i+4], payload[i+5],
+                        payload[i+6], payload[i+7]);
+                    has_date = true;
                 }
             }
         }
     }
 
-    if (found_cn && found_org) {
-        snprintf(out_text, max_len, "TLS Cert: CN=%s, O=%s", cn, org);
-        return true;
-    } else if (found_cn) {
-        snprintf(out_text, max_len, "TLS Cert: CN=%s", cn);
-        return true;
-    } else if (found_org) {
-        snprintf(out_text, max_len, "TLS Cert: O=%s", org);
-        return true;
+    // Determine target entity: Subject takes precedence, fall back to SAN or Issuer
+    const char* target_host = has_subject_cn ? subject_cn : (san_dns[0] != '\0' ? san_dns : issuer_cn);
+    const char* target_org  = has_subject_org ? subject_org : issuer_org;
+
+    // Fail if we didn't find ANY recognizable string
+    if (target_host[0] == '\0' && target_org[0] == '\0' && cert_url[0] == '\0' && cert_email[0] == '\0') {
+        return false; 
     }
 
-    return false;
+    // Build rich location token if present: " (Spring, Texas US)"
+    char geo_tag[48] = {0};
+    if (subject_loc[0] != '\0' || subject_state[0] != '\0' || subject_c[0] != '\0') {
+        if (subject_loc[0] != '\0' && subject_state[0] != '\0') {
+            snprintf(geo_tag, sizeof(geo_tag), " (%s, %s %s)", subject_loc, subject_state, subject_c);
+        } else if (subject_state[0] != '\0') {
+            snprintf(geo_tag, sizeof(geo_tag), " (%s %s)", subject_state, subject_c);
+        } else if (subject_c[0] != '\0') {
+            snprintf(geo_tag, sizeof(geo_tag), " (%s)", subject_c);
+        }
+    }
+
+    // Build the CA tag
+    char ca_tag[70] = {0};
+    if (has_issuer_cn && strcmp(target_host, issuer_cn) != 0) {
+        snprintf(ca_tag, sizeof(ca_tag), " [CA:%s]", issuer_cn);
+    }
+    
+    // Chain together our extra intelligence to save space
+    char ext_tag[128] = {0};
+    int ext_idx = 0;
+    if (has_email) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [E: %s]", cert_email);
+    if (has_cert_url) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [URI: %s]", cert_url);
+    if (has_date) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [Est: %s]", cert_date);
+
+    // Format output
+    if (target_host[0] != '\0' && target_org[0] != '\0') {
+        snprintf(out_text, max_len, "TLS Cert: %s|%s%s%s%s", target_host, target_org, geo_tag, ca_tag, ext_tag);
+    } else if (target_host[0] != '\0') {
+        snprintf(out_text, max_len, "TLS Cert: %s%s%s%s", target_host, geo_tag, ca_tag, ext_tag);
+    } else if (target_org[0] != '\0') {
+        snprintf(out_text, max_len, "TLS Cert Org: %s%s%s%s", target_org, geo_tag, ca_tag, ext_tag);
+    } else {
+        snprintf(out_text, max_len, "TLS Cert Info:%s", ext_tag);
+    }
+
+    return true;
 }
 
+// ==========================================
+// UPGRADED TLS SNI PARSER (Client Hello)
+// ==========================================
 bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     // Minimum viable TLS Record + Client Hello size
-    if (length < 44) return false; 
+    if (length < 44 || payload == nullptr || out_text == nullptr || max_len == 0) {
+        return false; 
+    }
 
-    // We only care about Handshake records (0x16) containing a Client Hello (0x01)
-    if (payload[0] != 0x16 || payload[5] != 0x01) return false;
+    // --- 1. THE SLIDING WINDOW (A-MSDU Bypass) ---
+    // Scan for the TLS Record Header (0x16 0x03) + Client Hello (0x01)
+    int32_t start_offset = -1;
+    for (uint16_t i = 0; i <= length - 44; i++) {
+        if (payload[i] == 0x16 &&           // Handshake Record
+            payload[i+1] == 0x03 &&         // TLS Version (usually 0x03)
+            payload[i+5] == 0x01) {         // Client Hello Type
+            
+            start_offset = i;
+            break;
+        }
+    }
 
-    // --- CRITICAL FIX: 32-bit cursor prevents integer overflow wrap-arounds ---
-    uint32_t cursor = 43; 
+    if (start_offset == -1) return false;
 
-    // 1. Skip Session ID
+    // Anchor the 32-bit cursor to the start of the Session ID length byte
+    uint32_t cursor = start_offset + 43; 
+
+    // 2. Skip Session ID
     if (cursor >= length) return false;
     uint8_t sid_len = payload[cursor];
     cursor += 1 + sid_len;
 
-    // 2. Skip Cipher Suites
+    // 3. Skip Cipher Suites
     if (cursor + 1 >= length) return false;
     uint32_t cipher_len = (payload[cursor] << 8) | payload[cursor + 1];
     cursor += 2 + cipher_len;
 
-    // 3. Skip Compression Methods
+    // 4. Skip Compression Methods
     if (cursor >= length) return false;
     uint8_t comp_len = payload[cursor];
     cursor += 1 + comp_len;
 
-    // 4. Get Extensions Length
-    if (cursor + 1 >= length) return false;
+    // 5. Get Extensions Length
+    if (cursor + 1 >= length) return false; // Note: Handshakes *can* end before extensions, this safely aborts
     uint32_t ext_total_len = (payload[cursor] << 8) | payload[cursor + 1];
     cursor += 2;
 
-    // 5. Walk the Extensions List
+    // 6. Walk the Extensions List
     uint32_t ext_end = cursor + ext_total_len;
-    if (ext_end > length) ext_end = length; // Hard clamp to payload boundary
+    if (ext_end > length) ext_end = length; // Hard clamp to payload boundary to survive fragmentation
 
     while (cursor + 3 < ext_end) {
         uint16_t ext_type = (payload[cursor] << 8) | payload[cursor + 1];
@@ -2594,6 +2769,12 @@ bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size
             }
             return false; // Found SNI but couldn't resolve string
         }
+        
+        // Defend against malicious/malformed extension lengths pushing cursor into an infinite loop
+        if (ext_len == 0 && ext_type != 0x0000) {
+            break; 
+        }
+        
         cursor += ext_len; // Jump to the next extension
     }
 
@@ -5029,14 +5210,17 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           bool is_qos = (payload[0] & 0x80) != 0;
           bool to_ds = (payload[1] & 0x01) != 0;
           bool from_ds = (payload[1] & 0x02) != 0;
-          bool has_ht_ctrl = (payload[1] & 0x80) != 0; // Order bit
+          
+          // FIX 1: Strict check for +HTC. The Order bit (0x80) only means +HTC 
+          // if it is a QoS Data frame! Otherwise, it just means "Strictly Ordered".
+          bool has_ht_ctrl = is_qos && ((payload[1] & 0x80) != 0); 
           
           uint8_t header_len = 24;          // Base MAC Header
           if (to_ds && from_ds) {
               header_len += 6;              // Address 4 present (WDS Bridge)
           }
           
-          // --- NEW: SAFE QOS OFFSET ---
+          // --- SAFE QOS OFFSET ---
           // Save the exact location of the QoS Control field before HT Control shifts the header length!
           uint8_t qos_offset = header_len; 
           
@@ -5048,7 +5232,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
           }
           // ==========================================
 
-          // --- NEW: METADATA EXTRACTION ---
+          // --- METADATA EXTRACTION ---
           uint8_t captured_subtype = (payload[0] & 0xF0) >> 4;
           uint8_t captured_direction = payload[1] & 0x03; 
           uint8_t captured_channel = pkt->rx_ctrl.channel; 
@@ -5069,29 +5253,23 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               uint8_t captured_src_ip[16] = {0};
               uint8_t captured_dst_ip[16] = {0};
 
-              // --- UPGRADED: A-MSDU DE-AGGREGATOR ---
-              // Changed to is_qos so it catches all QoS subtypes (8 through 15)
+              // =======================================================
+              // FIX 2: THE A-MSDU BYPASS
+              // =======================================================
+              bool is_amsdu = false;
               if (is_qos) {
-                  // THE FIX: Read the exact QoS byte using the safe offset, avoiding the HT Control field!
-                  bool is_amsdu = (payload[qos_offset] & 0x80) != 0;
-                  
-                  if (is_amsdu && body_len > 14) {
-                      // Skip the 14-byte A-MSDU subframe header (DA + SA + Length)
-                      uint16_t subframe_len = (frame_body[12] << 8) | frame_body[13];
-                      
-                      frame_body += 14; 
-                      
-                      // Constrain the payload length so extractors don't bleed into the next subframe
-                      if (subframe_len < body_len) {
-                          body_len = subframe_len;
-                      } else {
-                          body_len -= 14;
-                      }
-                  }
+                  is_amsdu = (payload[qos_offset] & 0x80) != 0;
+              }
+
+              if (is_amsdu) {
+                  // Do NOT chop `body_len`. Do NOT step `frame_body`.
+                  // Force an unknown protocol (255) so it bypasses all strict IP parsers.
+                  // The ENTIRE massive aggregate blob will fall straight through to the Catch-All!
+                  captured_protocol = 255;
               }
               
-              // 1. Skip LLC/SNAP Header (8 bytes) if present.
-              if (body_len > 8 && frame_body[0] == 0xAA && frame_body[1] == 0xAA) {
+              // 1. Skip LLC/SNAP Header (8 bytes) if present AND not an A-MSDU.
+              if (!is_amsdu && body_len > 8 && frame_body[0] == 0xAA && frame_body[1] == 0xAA) {
                   bool is_apple = (frame_body[3] == 0x00 && frame_body[4] == 0x17 && frame_body[5] == 0xF2);
                   ether_type = (frame_body[6] << 8) | frame_body[7]; // <--- GRAB ETHERTYPE HERE  
                   frame_body += 8;
@@ -5131,9 +5309,15 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               }
 
               // 2. Check for IPv4 (First nibble is 4)
-              if (body_len > 20 && (frame_body[0] & 0xF0) == 0x40) {
+              if (!is_amsdu && body_len > 20 && (frame_body[0] & 0xF0) == 0x40) {
                   captured_ip_version = 4;
-                  
+                  // --- NEW: Read Logical IP Length to strip Wi-Fi FCS/Padding ---
+                  uint16_t ip_total_len = (frame_body[2] << 8) | frame_body[3];
+                  // Safety check: ensure IP length isn't larger than our physical capture
+                  if (ip_total_len < body_len) {
+                  body_len = ip_total_len; 
+                  }
+                  // --------------------------------------------------------------
                   // IPv4 Source IP is at offset 12, Destination IP is at offset 16
                   memcpy(captured_src_ip, &frame_body[12], 4);
                   memcpy(captured_dst_ip, &frame_body[16], 4);
@@ -5166,13 +5350,11 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                           body_len = 0; // Prevent underflow if no payload
                       }
                   }
-                  // --- NEW: ICMPv4 (1) and Unknown Protocol Catch-All ---
-                  else if (frame_body[9] == 1 && body_len > (ip_header_len + 8)) {
+                  // --- ICMPv4 (1) and Unknown Protocol Catch-All ---
+                  else if (frame_body[9] == 1 && body_len > ip_header_len) {
                       captured_protocol = 1; // ICMPv4
-                      
-                      // Strip IP header and 8-byte ICMP header to reach pure payload
-                      frame_body += (ip_header_len + 8);
-                      body_len -= (ip_header_len + 8);
+                      frame_body += ip_header_len; 
+                      body_len -= ip_header_len;
                   } else {
                       // Unknown protocol (e.g. IGMP, GRE). 
                       // Strip the IP header so payload catch-alls don't print garbage!
@@ -5185,7 +5367,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   }
               }
               // 2.5 Check for IPv6 (First nibble is 6)
-              else if (body_len > 40 && (frame_body[0] & 0xF0) == 0x60) {
+              else if (!is_amsdu && body_len > 40 && (frame_body[0] & 0xF0) == 0x60) {
                   captured_ip_version = 6;
                   
                   // IPv6 Source IP is at offset 8, Destination IP is at offset 24
@@ -5233,11 +5415,11 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                           frame_body += (ip_header_len + tcp_header_len);
                           body_len -= (ip_header_len + tcp_header_len);
                       }
-                  } else if (next_header == 58 && body_len > (ip_header_len + 8)) {
+                  } else if (next_header == 58 && body_len > ip_header_len) {
                       // --- NEW: ICMPv6 (58) ---
                       captured_protocol = 58; // ICMPv6
-                      frame_body += (ip_header_len + 8);
-                      body_len -= (ip_header_len + 8);
+                      frame_body += ip_header_len;
+                      body_len -= ip_header_len;
                   } else {
                       // Unknown protocol or contains extension headers. Just strip the fixed IP header.
                       if (body_len > ip_header_len) {
@@ -5246,6 +5428,37 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       } else {
                           body_len = 0;
                       }
+                  }
+              }
+
+              // =========================================================
+              // TCP/443 PAYLOAD HANDOFF DIAGNOSTIC
+              // =========================================================
+              if (captured_protocol == 6 &&
+                  (captured_src_port == 443 || captured_dst_port == 443)) {
+
+                  Serial.printf(
+                      "[SNIFF-TCP443] src=%u dst=%u flags=0x%02X "
+                      "payload_len=%u ether=0x%04X ip_ver=%u\n",
+                      captured_src_port,
+                      captured_dst_port,
+                      tcp_flags,
+                      body_len,
+                      ether_type,
+                      captured_ip_version
+                  );
+
+                  if (body_len > 0 && frame_body != nullptr) {
+                      Serial.print("[SNIFF-TCP443] payload first32: ");
+
+                      uint16_t dump_len =
+                          min((uint16_t)32, body_len);
+
+                      for (uint16_t i = 0; i < dump_len; i++) {
+                          Serial.printf("%02X ", frame_body[i]);
+                      }
+
+                      Serial.println();
                   }
               }
 
@@ -5289,7 +5502,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       static uint32_t suppressed = 0;
                       suppressed++;
                       if (suppressed % 20 == 1) {
-                          Serial.printf("[L2-DEDUP] Cooldown suppressed repeat (hash=0x%08X, total=%u)\n", current_hash, suppressed);
+                          //Serial.printf("[L2-DEDUP] Cooldown suppressed repeat (hash=0x%08X, total=%u)\n", current_hash, suppressed);
                       }
                   }
               } else {
@@ -5306,6 +5519,20 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               // =========================================================
               // 4. SHIP RAW BYTES TO CORE 1 
               // =========================================================
+              //Diagnostic
+              if (!should_process && captured_protocol == 6 &&
+    (captured_src_port == 443 || captured_dst_port == 443)) {
+
+    Serial.printf(
+        "[L2-SUPPRESS-TCP443] src=%u dst=%u len=%u hash=0x%08X\n",
+        captured_src_port,
+        captured_dst_port,
+        body_len,
+        current_hash
+    );
+}
+              //---
+              
               if (should_process) {
                   
                   // Enforce memory safety boundary
@@ -5334,7 +5561,37 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   // Populating Unions Phase 1 (Binary Data)
                   memcpy(l2_cap.bssid, mac3, 6);
                   if (copy_len > 0) memcpy(l2_cap.raw_payload, frame_body, copy_len);
-                  
+                  // =========================================================
+// DIAGNOSTIC: VERIFY TCP/443 PAYLOAD AT CALLBACK HANDOFF
+// =========================================================
+if (captured_protocol == 6 &&
+    (captured_src_port == 443 || captured_dst_port == 443)) {
+
+    Serial.printf(
+        "[CALLBACK-TCP443] "
+        "src=%u dst=%u flags=0x%02X "
+        "body_len=%u copy_len=%u sig_len=%u\n",
+        captured_src_port,
+        captured_dst_port,
+        tcp_flags,
+        body_len,
+        copy_len,
+        pkt->rx_ctrl.sig_len
+    );
+
+    if (copy_len > 0) {
+        Serial.print("[CALLBACK-TCP443] first32: ");
+
+        uint16_t dump_len = min((uint16_t)32, copy_len);
+
+        for (uint16_t i = 0; i < dump_len; i++) {
+            Serial.printf("%02X ", l2_cap.raw_payload[i]);
+        }
+
+        Serial.println();
+    }
+}
+// =========================================================
                   memcpy(l2_cap.src_ip, captured_src_ip, 16);
                   memcpy(l2_cap.dst_ip, captured_dst_ip, 16);
                   memcpy(l2_cap.src_mac, payload + 10, 6);
@@ -5728,6 +5985,7 @@ void processLiveDumpQueue() {
         // =========================================================
         // --- END OF MONOLITHIC CHAIN. BEGIN INDEPENDENT CASCADE. ---
         // =========================================================
+        
         // --- 10. PAYLOAD SIGNATURES & DEEP PARSERS ---
         if (!custom_extracted && l2_cap.payload_len > 0) {
             const uint8_t* p = l2_cap.raw_payload;
@@ -5743,21 +6001,88 @@ void processLiveDumpQueue() {
     }
 
             // 10.1 Magic Byte Signatures (Highest Precision)
-            if (!custom_extracted) {
-            if (len >= 8 && p[4] == 0x21 && p[5] == 0x12 && p[6] == 0xA4 && p[7] == 0x42) {
-                snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: Live VoIP/WebRTC Stream");
-                custom_extracted = true;
-                l2_cap.is_high_value = true;
-            }
-            else if (len > 5 && p[0] == 0x16 && p[1] == 0x03) {
-                custom_extracted = parse_tls_sni(p, len, temp_text, MAX_LEAK_STR_LEN);
-                if (!custom_extracted) {
-                    custom_extracted = parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
-                    if (custom_extracted) l2_cap.is_high_value = true; 
+            
+            // =========================================================
+            // THE NEW TLS DIAGNOSTIC WALKER & PARSER
+            // =========================================================
+            if (l2_cap.protocol == 6 && (l2_cap.src_port == 443 || l2_cap.dst_port == 443) && len > 5) {
+                
+                uint16_t offset = 0;
+                bool found_tls = false;
+
+                // Walk through the TCP payload looking for consecutive TLS records
+                while (offset + 5 <= len) {
+                    uint8_t rec_type = p[offset];
+                    uint16_t rec_version = (p[offset+1] << 8) | p[offset+2];
+                    uint16_t rec_len = (p[offset+3] << 8) | p[offset+4];
+
+                    // Valid TLS Record Types: 0x14 (CCS), 0x15 (Alert), 0x16 (Handshake), 0x17 (App Data)
+                    if (rec_type >= 0x14 && rec_type <= 0x17 && 
+                       (rec_version == 0x0301 || rec_version == 0x0302 || rec_version == 0x0303)) {
+                        
+                        found_tls = true;
+                        Serial.printf("\n[TLS-RECORD] offset=%u type=%02X version=%04X len=%u\n", 
+                                      offset, rec_type, rec_version, rec_len);
+
+                        // If it's a Handshake record (0x16), look inside it!
+                        if (rec_type == 0x16 && offset + 5 < len) {
+                            uint8_t hs_type = p[offset + 5];
+                            const char* hs_str = "Unknown";
+                            
+                            if (hs_type == 0x01) hs_str = "ClientHello";
+                            else if (hs_type == 0x02) hs_str = "ServerHello";
+                            else if (hs_type == 0x0B) hs_str = "Certificate";
+                            else if (hs_type == 0x0E) hs_str = "ServerHelloDone";
+                            else if (hs_type == 0x10) hs_str = "ClientKeyExchange";
+                            
+                            Serial.printf("  -> [TLS-HS] type=%02X %s\n", hs_type, hs_str);
+                            
+                            // If we see a 0x0B (Certificate) but the rec_len is larger than our remaining 
+                            // TCP payload (len - offset), we mathematically prove TCP segmentation is happening!
+                            if (hs_type == 0x0B && (offset + 5 + rec_len > len)) {
+                                Serial.printf("  -> [TLS-FRAG] Warning: Certificate record extends beyond this TCP segment!\n");
+                            }
+                        }
+
+                        // We must break if the record length exceeds the payload to avoid out-of-bounds reads
+                        if (offset + 5 + rec_len > len) {
+                            break;
+                        }
+                        
+                        // Jump over this record to see if there is another one chained behind it
+                        offset += 5 + rec_len;
+                    } else {
+                        // Not a recognized TLS record boundary. Break the loop.
+                        break;
+                    }
+                }
+
+                if (found_tls) {
+                    // Attempt the old parsers just in case they work
+                    custom_extracted = parse_tls_sni(p, len, temp_text, MAX_LEAK_STR_LEN);
+                    if (!custom_extracted) {
+                        custom_extracted = parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
+                        if (custom_extracted) l2_cap.is_high_value = true;
+                    }
+
+                    // CRITICAL: If the parsers failed (e.g. because of fragmentation), we still claim the packet 
+                    // so the Catch-All doesn't print binary garbage to the UI!
+                    if (!custom_extracted) {
+                        snprintf(temp_text, MAX_LEAK_STR_LEN, "TLS Encrypted Traffic (Port %u)", l2_cap.dst_port == 443 ? l2_cap.src_port : l2_cap.dst_port);
+                        custom_extracted = true;
+                    }
                 }
             }
-            else if ((len >= 4 && (memcmp(p, "GET ", 4) == 0 || memcmp(p, "PUT ", 4) == 0)) || 
-                     (len >= 5 && (memcmp(p, "POST ", 5) == 0 || memcmp(p, "HEAD ", 5) == 0))) {
+            // =========================================================
+
+            if (!custom_extracted) {
+                if (len >= 8 && p[4] == 0x21 && p[5] == 0x12 && p[6] == 0xA4 && p[7] == 0x42) {
+                    snprintf(temp_text, MAX_LEAK_STR_LEN, "STUN: Live VoIP/WebRTC Stream");
+                    custom_extracted = true;
+                    l2_cap.is_high_value = true;
+                }
+                else if ((len >= 4 && (memcmp(p, "GET ", 4) == 0 || memcmp(p, "PUT ", 4) == 0)) || 
+                         (len >= 5 && (memcmp(p, "POST ", 5) == 0 || memcmp(p, "HEAD ", 5) == 0))) {
                 
                 custom_extracted = parse_http_host(p, len, temp_text, MAX_LEAK_STR_LEN);
                 if (!custom_extracted) {
@@ -5832,6 +6157,22 @@ void processLiveDumpQueue() {
                 /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/"|"
             );
         }
+
+        // =========================================================
+// TEMP DIAGNOSTIC: WHY TCP/443 PACKET DOES OR DOESN'T ROUTE
+// =========================================================
+if (l2_cap.protocol == 6 &&
+    (l2_cap.src_port == 443 || l2_cap.dst_port == 443)) {
+
+    Serial.printf(
+        "[TCP443-ROUTING] src=%u dst=%u len=%u custom=%d text=\"%s\"\n",
+        l2_cap.src_port,
+        l2_cap.dst_port,
+        l2_cap.payload_len,
+        custom_extracted,
+        custom_extracted ? temp_text : ""
+    );
+}
 
         // ==========================================
         // IN-PLACE UNION OVERWRITE & UI ROUTING
@@ -10851,13 +11192,13 @@ void setup() {
   // ==========================================
   // 1. CREATE THE LEAKY LAYER 2 QUEUES
   // ==========================================
-  leakQueue = xQueueCreate(30, sizeof(Layer2Capture));
+  leakQueue = xQueueCreate(20, sizeof(Layer2Capture));
   if (leakQueue == NULL) {
       Serial.println("[!] FATAL: Failed to create leakQueue!");
   }
   
   // --- ADD THIS: Allocate the raw payload queue for Core 0 ---
-  liveDumpQueue = xQueueCreate(80, sizeof(Layer2Capture));
+  liveDumpQueue = xQueueCreate(50, sizeof(Layer2Capture));
   if (liveDumpQueue == NULL) {
       Serial.println("[!] FATAL: Failed to create liveDumpQueue!");
   }
