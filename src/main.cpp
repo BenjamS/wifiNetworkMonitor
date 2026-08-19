@@ -804,6 +804,75 @@ void updateFoxhuntSignal(int packet_rssi) {
 }
 
 // ==========================================
+// CLEARTEXT EXTRACTOR (OSINT UPGRADED)
+// ==========================================
+bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t max_len,
+                             uint8_t min_run = 4, bool flatten_ws = false,
+                             const char* separator = "|") {
+
+    if (!data || !out || max_len < 16 || len == 0) return false;
+
+    uint16_t out_idx = 0;
+    uint16_t consecutive = 0;
+    uint16_t printable_count = 0;
+    size_t sep_len = strlen(separator);
+
+    // --- Phase 1: Raw Extraction ---
+    for (uint16_t i = 0; i < len && out_idx < (max_len - 4); i++) {
+        char c = (char)data[i];
+        bool is_ws = (c == '\n' || c == '\r' || c == '\t');
+        bool is_printable = (c >= 32 && c <= 126) || (flatten_ws && is_ws);
+
+        if (is_printable) {
+            consecutive++;
+            if (consecutive == min_run) {
+                for (int back = min_run; back >= 1 && out_idx < max_len - 1; back--) {
+                    char rc = (char)data[i - back + 1];
+                    if (flatten_ws && (rc == '\n' || rc == '\r' || rc == '\t')) rc = ' ';
+                    out[out_idx++] = rc;
+                }
+                printable_count += min_run;
+            } else if (consecutive > min_run && out_idx < max_len - 1) {
+                out[out_idx++] = (flatten_ws && is_ws) ? ' ' : c;
+                printable_count++;
+            }
+        } else {
+            if (consecutive >= min_run && out_idx + sep_len < max_len - 1) {
+                memcpy(out + out_idx, separator, sep_len);
+                out_idx += sep_len;
+            }
+            consecutive = 0;
+        }
+    }
+
+    out[out_idx] = '\0';
+    
+    // First line of defense: Must have at least 12 printable characters total
+    if (printable_count < 12) return false;
+
+    // --- Phase 2: Signature Classification ---
+    const char* tag = nullptr;
+
+    if (strstr(out, "HTTP/1.")) tag = "[HTTP]";
+    else if (strstr(out, "<?xml") || (strchr(out, '<') && strchr(out, '>'))) tag = "[XML]";
+    else if (strstr(out, "{\"") && strstr(out, "\":")) tag = "[JSON]";
+    else if (strstr(out, "ocsp.") || strstr(out, "/ocsp")) tag = "[OCSP]";
+    else if (strstr(out, ".crl")) tag = "[CRL]";
+    else if (strstr(out, ".crt") || strstr(out, "cacerts.")) tag = "[CERT-URI]";
+    else if (strstr(out, "://")) tag = "[URI]";
+    else tag = "[TEXT]"; // Semantically precise fallback
+
+    // --- Phase 3: Prepend Tag ---
+    size_t tag_len = strlen(tag);
+    if (out_idx + tag_len + 1 < max_len) {
+        memmove(out + tag_len + 1, out, out_idx + 1);
+        memcpy(out, tag, tag_len);
+        out[tag_len] = ' '; 
+    }
+
+    return true;
+}
+// ==========================================
 // CLEARTEXT EXTRACTOR 
 // ==========================================
 // Scans raw bytes for runs of printable ASCII, filtering out short noise
@@ -816,6 +885,7 @@ void updateFoxhuntSignal(int packet_rssi) {
 //              space instead of breaking the run (matches old extractCleartext)
 // separator:   inserted between chunks on a gap (" | " for Step 13 style,
 //              " " for extractCleartext style)
+/*
 bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t max_len,
                              uint8_t min_run = 4, bool flatten_ws = false,
                              const char* separator = "|") {
@@ -854,7 +924,7 @@ bool extract_printable_runs(const uint8_t* data, uint16_t len, char* out, size_t
     out[out_idx] = '\0';
     return printable_count > 10;
 }
-
+*/
 // ==========================================
 // PROTOCOL TRANSLATORS (NetBIOS, mDNS, Cast)
 // ==========================================
@@ -1657,7 +1727,8 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
             if (len_byte > 0 && len_byte <= 63 && cur + 1 + len_byte <= length) {
                 bool is_printable = true;
                 for (int j = 0; j < len_byte; j++) {
-                    if (payload[cur + 1 + j] < 32 || payload[cur + 1 + j] > 126) {
+                    uint8_t c = payload[cur + 1 + j]; // Cast to unsigned to handle UTF-8 safely
+                    if (c < 32 || c == 127) {         // Block control chars and DEL. Allow 128+ for UTF-8
                         is_printable = false;
                         break;
                     }
@@ -1743,7 +1814,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
             if (offset + rdlength > length) break; // Memory safety check
             
             // ==========================================
-            // NEW: THE TXT RECORD EXTRACTOR
+            // RECORD EXTRACTORS
             // ==========================================
             if (rr_type == 16) { // 16 = TXT Record
                 int txt_off = offset;
@@ -1753,11 +1824,11 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
                     uint8_t txt_len = payload[txt_off];
                     if (txt_off + 1 + txt_len > txt_end) break; // Bounds safety
                     
-                    // Ensure the TXT chunk is printable ASCII
+                    // Ensure the TXT chunk is printable ASCII or UTF-8
                     bool is_printable = true;
                     for (int j = 0; j < txt_len; j++) {
-                        char c = payload[txt_off + 1 + j];
-                        if (c < 32 || c > 126) {
+                        uint8_t c = payload[txt_off + 1 + j];
+                        if (c < 32 || c == 127) {
                             is_printable = false;
                             break;
                         }
@@ -1765,7 +1836,6 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
                     
                     if (is_printable && txt_len > 0) {
                         if (d_idx + txt_len + 3 < sizeof(domains)) {
-                            // APPEND DIRECTLY: No duplicate check for TXT fields
                             if (valid_labels > 0) {
                                 domains[d_idx++] = ','; 
                                 domains[d_idx++] = ' ';
@@ -1775,8 +1845,44 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
                             valid_labels++;
                         }
                     }
-                    txt_off += 1 + txt_len; // Jump to next TXT chunk
+                    txt_off += 1 + txt_len; 
                 }
+            }
+            else if (rr_type == 1 && rdlength == 4) { // 1 = A Record (IPv4)
+                char ip_str[32];
+                snprintf(ip_str, sizeof(ip_str), "[IP: %d.%d.%d.%d]", 
+                         payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]);
+                int ip_len = strlen(ip_str);
+                
+                if (d_idx + ip_len + 3 < sizeof(domains)) {
+                    if (valid_labels > 0) {
+                        domains[d_idx++] = ','; 
+                        domains[d_idx++] = ' ';
+                    }
+                    memcpy(&domains[d_idx], ip_str, ip_len);
+                    d_idx += ip_len;
+                    valid_labels++;
+                }
+            }
+            else if (rr_type == 12 || rr_type == 5) { // 12 = PTR (Pointer), 5 = CNAME (Alias)
+                process_name(offset); 
+            }
+            else if (rr_type == 33 && rdlength >= 7) { // 33 = SRV Record (Service Location)
+                uint16_t srv_port = (payload[offset+4] << 8) | payload[offset+5];
+                char port_str[32];
+                snprintf(port_str, sizeof(port_str), "[Port: %u]", srv_port);
+                int p_len = strlen(port_str);
+                
+                if (d_idx + p_len + 3 < sizeof(domains)) {
+                    if (valid_labels > 0) {
+                        domains[d_idx++] = ','; 
+                        domains[d_idx++] = ' ';
+                    }
+                    memcpy(&domains[d_idx], port_str, p_len);
+                    d_idx += p_len;
+                    valid_labels++;
+                }
+                process_name(offset + 6); 
             }
             // ==========================================
 
@@ -2494,7 +2600,7 @@ bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, siz
     char san_dns[64]      = {0};
     char cert_url[64]     = {0}; 
     char cert_email[64]   = {0};
-    char cert_date[16]    = {0};
+    char cert_date[32]    = {0};
 
     bool has_subject_cn  = false;
     bool has_subject_org = false;
@@ -2630,14 +2736,22 @@ bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, siz
 
         // --- 5. Extract UTCTime (Tag 0x17) ---
         if (!has_date && payload[i] == 0x17 && payload[i+1] == 13) {
-            if (i + 14 <= length) {
-                if (payload[i+2] >= '0' && payload[i+2] <= '9') {
-                    snprintf(cert_date, sizeof(cert_date), "20%c%c-%c%c-%c%c", 
-                        payload[i+2], payload[i+3],
-                        payload[i+4], payload[i+5],
-                        payload[i+6], payload[i+7]);
-                    has_date = true;
+            if (i + 14 <= length && payload[i+2] >= '0' && payload[i+2] <= '9') {
+                
+                // Peek exactly 15 bytes ahead to see if the "Not After" date is appended
+                if (i + 15 + 14 <= length && payload[i+15] == 0x17 && payload[i+16] == 13 && payload[i+17] >= '0') {
+                    // We successfully caught both dates!
+                    snprintf(cert_date, sizeof(cert_date), "20%c%c/%c%c/%c%c-20%c%c/%c%c/%c%c", 
+                        payload[i+2], payload[i+3], payload[i+4], payload[i+5], payload[i+6], payload[i+7],
+                        payload[i+17], payload[i+18], payload[i+19], payload[i+20], payload[i+21], payload[i+22]);
+                    i += 28; // Fast-forward past both date blocks to save CPU cycles
+                } else {
+                    // Fallback: We only found the first date
+                    snprintf(cert_date, sizeof(cert_date), "20%c%c/%c%c/%c%c", 
+                        payload[i+2], payload[i+3], payload[i+4], payload[i+5], payload[i+6], payload[i+7]);
+                    i += 14; 
                 }
+                has_date = true;
             }
         }
     }
@@ -2674,7 +2788,7 @@ bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, siz
     int ext_idx = 0;
     if (has_email) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [E: %s]", cert_email);
     if (has_cert_url) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [URI: %s]", cert_url);
-    if (has_date) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [Est: %s]", cert_date);
+    if (has_date) ext_idx += snprintf(ext_tag + ext_idx, sizeof(ext_tag) - ext_idx, " [Valid:%s]", cert_date);
 
     // Format output
     if (target_host[0] != '\0' && target_org[0] != '\0') {
@@ -2694,20 +2808,46 @@ bool parse_tls_cert(const uint8_t* payload, uint16_t length, char* out_text, siz
 // UPGRADED TLS SNI PARSER (Client Hello)
 // ==========================================
 bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    // Minimum viable TLS Record + Client Hello size
-    if (length < 44 || payload == nullptr || out_text == nullptr || max_len == 0) {
+    const char prefix[] = "HTTPS SNI: ";
+    const size_t prefix_len = sizeof(prefix) - 1;
+
+    // Minimum captured length required for our fixed-offset ClientHello parsing.
+    if (length < 44 || payload == nullptr || out_text == nullptr || max_len <= prefix_len) {
         return false; 
     }
 
-    // --- 1. THE SLIDING WINDOW (A-MSDU Bypass) ---
-    // Scan for the TLS Record Header (0x16 0x03) + Client Hello (0x01)
     int32_t start_offset = -1;
+    uint32_t record_end = 0;
+
+    // --- 1. THE SLIDING WINDOW (A-MSDU Bypass & Validation) ---
     for (uint16_t i = 0; i <= length - 44; i++) {
-        if (payload[i] == 0x16 &&           // Handshake Record
-            payload[i+1] == 0x03 &&         // TLS Version (usually 0x03)
-            payload[i+5] == 0x01) {         // Client Hello Type
-            
+
+        // Check for TLS Handshake (0x16), Major Version (0x03), Valid Minor Version (0x00-0x04), ClientHello (0x01)
+        if (payload[i] == 0x16 && 
+            payload[i+1] == 0x03 && 
+            payload[i+2] <= 0x04 &&   // <-- TIGHTER FILTER: Covers SSL 3.0 through theoretical TLS 1.4
+            payload[i+5] == 0x01) {       
+
+            uint16_t record_len = ((uint16_t)payload[i+3] << 8) | payload[i+4];
+            uint32_t hs_len = ((uint32_t)payload[i+6] << 16) |
+                              ((uint32_t)payload[i+7] << 8)  |
+                               payload[i+8];
+
+            // Safety Check 1: TLS record must fit entirely inside our captured buffer
+            if ((uint32_t)i + 5 + record_len > length) {
+                continue;
+            }
+
+            // Safety Check 2: The ClientHello (4-byte header + body) must fit inside its own TLS record
+            if (hs_len + 4 > record_len) {
+                continue;
+            }
+
+            // Passed all physical bounds checks. Lock onto this offset!
             start_offset = i;
+            
+            // --- STRICT RECORD BOUNDARY ---
+            record_end = start_offset + 5 + record_len;
             break;
         }
     }
@@ -2718,61 +2858,72 @@ bool parse_tls_sni(const uint8_t* payload, uint16_t length, char* out_text, size
     uint32_t cursor = start_offset + 43; 
 
     // 2. Skip Session ID
-    if (cursor >= length) return false;
-    uint8_t sid_len = payload[cursor];
-    cursor += 1 + sid_len;
+    if (cursor >= record_end) return false;
+    uint8_t sid_len = payload[cursor++];
+    if (sid_len > record_end - cursor) return false;
+    cursor += sid_len;
 
     // 3. Skip Cipher Suites
-    if (cursor + 1 >= length) return false;
-    uint32_t cipher_len = (payload[cursor] << 8) | payload[cursor + 1];
-    cursor += 2 + cipher_len;
+    if (cursor + 2 > record_end) return false;
+    uint16_t cipher_len = ((uint16_t)payload[cursor] << 8) | payload[cursor + 1];
+    cursor += 2;
+    if (cipher_len > record_end - cursor) return false;
+    cursor += cipher_len;
 
     // 4. Skip Compression Methods
-    if (cursor >= length) return false;
-    uint8_t comp_len = payload[cursor];
-    cursor += 1 + comp_len;
+    if (cursor >= record_end) return false;
+    uint8_t comp_len = payload[cursor++];
+    if (comp_len > record_end - cursor) return false;
+    cursor += comp_len;
 
     // 5. Get Extensions Length
-    if (cursor + 1 >= length) return false; // Note: Handshakes *can* end before extensions, this safely aborts
-    uint32_t ext_total_len = (payload[cursor] << 8) | payload[cursor + 1];
+    if (cursor + 2 > record_end) return false; 
+    uint16_t ext_total_len = ((uint16_t)payload[cursor] << 8) | payload[cursor + 1];
     cursor += 2;
 
-    // 6. Walk the Extensions List
+    // Explicitly fail if extensions declare a length that bleeds outside the known TLS record
+    if (ext_total_len > record_end - cursor) return false;
+    
     uint32_t ext_end = cursor + ext_total_len;
-    if (ext_end > length) ext_end = length; // Hard clamp to payload boundary to survive fragmentation
 
-    while (cursor + 3 < ext_end) {
+    // 6. Walk the Extensions List
+    while (cursor + 4 <= ext_end) {
         uint16_t ext_type = (payload[cursor] << 8) | payload[cursor + 1];
-        uint32_t ext_len = (payload[cursor + 2] << 8) | payload[cursor + 3];
+        uint16_t ext_len = (payload[cursor + 2] << 8) | payload[cursor + 3];
         cursor += 4;
 
-        if (ext_type == 0x0000) { // Extension 0x0000 is Server Name Indication (SNI)
+        // Ensure this specific extension doesn't bleed past the total extensions block
+        if (ext_len > ext_end - cursor) return false;
+
+        if (ext_type == 0x0000) { // Server Name Indication (SNI)
             
-            // Inside SNI: Server Name List Length (2 bytes)
-            if (cursor + 1 >= ext_end) return false;
+            // Validate the SNI list length before reading
+            if (ext_len < 2) return false;
+            uint16_t list_len = ((uint16_t)payload[cursor] << 8) | payload[cursor + 1];
+            if (list_len > ext_len - 2) return false;
+
+            uint32_t list_end = cursor + 2 + list_len;
             uint32_t list_cursor = cursor + 2;
 
-            // Extract the actual hostname
-            while (list_cursor + 2 < cursor + ext_len && list_cursor + 2 < ext_end) {
+            // Walk to list_end instead of ext_end
+            while (list_cursor + 3 <= list_end) {
                 uint8_t name_type = payload[list_cursor];
-                uint32_t name_len = (payload[list_cursor + 1] << 8) | payload[list_cursor + 2];
+                uint16_t name_len = ((uint16_t)payload[list_cursor + 1] << 8) | payload[list_cursor + 2];
                 list_cursor += 3;
 
+                // Ensure the individual domain name doesn't bleed past the SNI list boundary
+                if (name_len > list_end - list_cursor) return false;
+
                 if (name_type == 0x00) { // 0x00 designates a DNS Hostname
-                    if (list_cursor + name_len <= ext_end && name_len > 0) {
-                        int copy_len = std::min((int)name_len, (int)max_len - 15); 
-                        snprintf(out_text, max_len, "HTTPS SNI: %.*s", copy_len, &payload[list_cursor]);
+                    if (name_len > 0) {
+                        int copy_len = std::min((int)name_len, (int)(max_len - prefix_len - 1)); 
+                        snprintf(out_text, max_len, "%s%.*s", prefix, copy_len, &payload[list_cursor]);
                         return true;
                     }
                 }
                 list_cursor += name_len;
             }
             return false; // Found SNI but couldn't resolve string
-        }
-        
-        // Defend against malicious/malformed extension lengths pushing cursor into an infinite loop
-        if (ext_len == 0 && ext_type != 0x0000) {
-            break; 
         }
         
         cursor += ext_len; // Jump to the next extension
@@ -3937,6 +4088,55 @@ static bool icmp6_append(char* out,
     return written < (int)max_len;
 }
 
+// ==========================================
+// LIGHTWEIGHT ICMPv4 PARSER (OSINT Upgraded)
+// ==========================================
+bool parse_icmpv4(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // ICMPv4 header is 8 bytes.
+    if (length < 8 || payload == nullptr || out_text == nullptr || max_len == 0) {
+        return false;
+    }
+
+    uint8_t type = payload[0];
+    uint8_t code = payload[1];
+
+    switch (type) {
+        case 0:  
+            snprintf(out_text, max_len, "ICMPv4: Echo Reply"); 
+            return true;
+        case 3: 
+            // Destination Unreachable has highly specific codes
+            switch(code) {
+                case 0: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Network)"); return true;
+                case 1: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Host)"); return true;
+                case 3: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Port Closed)"); return true;
+                case 9: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Admin Prohibited)"); return true;
+                case 13: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Firewall Block)"); return true;
+                default: snprintf(out_text, max_len, "ICMPv4: Dest Unreachable (Code %u)", code); return true;
+            }
+        case 4:
+            snprintf(out_text, max_len, "ICMPv4: Source Quench");
+            return true;
+        case 8:  
+            snprintf(out_text, max_len, "ICMPv4: Echo Request (Ping)"); 
+            return true;
+        case 11: 
+            snprintf(out_text, max_len, "ICMPv4: Time Exceeded (Traceroute)"); 
+            return true;
+        case 12:
+            snprintf(out_text, max_len, "ICMPv4: Parameter Problem");
+            return true;
+        case 13:
+            snprintf(out_text, max_len, "ICMPv4: Timestamp Request (Recon)");
+            return true;
+        case 14:
+            snprintf(out_text, max_len, "ICMPv4: Timestamp Reply (Recon)");
+            return true;
+        default: 
+            snprintf(out_text, max_len, "ICMPv4: Type %u, Code %u", type, code); 
+            return true;
+    }
+}
 
 // ---------------------------------------------------------
 // ICMPv6 PARSER
@@ -5908,21 +6108,6 @@ void processLiveDumpQueue() {
         else if (l2_cap.dst_port == 80) {
             custom_extracted = parse_http_host(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
-        // --- 4.6 HTTPS Handshakes (Port 443) ---
-        //else if (l2_cap.dst_port == 443 || l2_cap.src_port == 443) {
-        //    // Fast gate: Only process TLS Handshake records (0x16) for TLS v1.2/1.3 (0x03)
-        //    if (l2_cap.payload_len > 5 && l2_cap.raw_payload[0] == 0x16 && l2_cap.raw_payload[1] == 0x03) {
-        //        
-        //        // Attempt 1: Is it an outbound Client Hello (SNI)?
-        //        custom_extracted = parse_tls_sni(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
-        //        
-        //        // Attempt 2: If not SNI, is it an inbound Server Hello (X.509 Certificate)?
-        //        if (!custom_extracted) {
-        //            custom_extracted = parse_tls_cert(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
-        //            if (custom_extracted) l2_cap.is_high_value = true; // Certificates are great OSINT!
-        //        }
-        //    }
-        //}
         // --- 4.7 IPP / CUPS Printing (Port 631) ---
         else if (l2_cap.dst_port == 631 || l2_cap.src_port == 631) {
             custom_extracted = parse_ipp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
@@ -5976,9 +6161,10 @@ void processLiveDumpQueue() {
         else if (l2_cap.protocol == 6 && (l2_cap.tcp_flags & 0x04)) { 
             snprintf(temp_text, MAX_LEAK_STR_LEN, "TCP RST (Port %d)", l2_cap.dst_port); 
             custom_extracted = true; 
-        } 
-        else if (l2_cap.protocol == 1) {
-            snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv4 Message (Ping/Control)");
+        } else if (l2_cap.protocol == 1) {
+            if (!parse_icmpv4(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN)) {
+                snprintf(temp_text, MAX_LEAK_STR_LEN, "ICMPv4: Malformed");
+            }
             custom_extracted = true;
         }
 
@@ -6141,38 +6327,61 @@ void processLiveDumpQueue() {
 
         // --- 12. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
         if (!custom_extracted && l2_cap.payload_len > 0) {
-            // ==========================================
-            // THE GROUND-TRUTH DIAGNOSTIC
-            // ==========================================
-            Serial.printf("[FALLTHROUGH] ip_ver=%u proto=%u src=%u dst=%u eth=0x%04X len=%u | first16: ",
-                          l2_cap.ip_version, l2_cap.protocol, l2_cap.src_port, l2_cap.dst_port,
-                          l2_cap.ether_type, l2_cap.payload_len);
-            for (int b = 0; b < 16 && b < l2_cap.payload_len; b++) {
-                Serial.printf("%02X ", l2_cap.raw_payload[b]);
+            
+            // Try generic printable extraction.
+            // Signature/quality filtering is handled inside the extractor.
+            if (extract_printable_runs(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN, 4, false, "|")) {
+                // SUCCESS: Meaningful cleartext found.
+                // Set the flag so your global LEAK printer handles it, 
+                // and SKIP printing the noisy hex header.
+                custom_extracted = true; 
+            } else {
+                // FAILED: Junk/Binary noise.
+                // Print the [FALLTHROUGH] routing header and the 16-byte hex preview.
+                Serial.printf("[FALLTHROUGH] ip_ver=%u proto=%u src=%u dst=%u eth=0x%04X len=%u | first16: ",
+                              l2_cap.ip_version, l2_cap.protocol, l2_cap.src_port, l2_cap.dst_port,
+                              l2_cap.ether_type, l2_cap.payload_len);
+                for (int b = 0; b < 16 && b < l2_cap.payload_len; b++) {
+                    Serial.printf("%02X ", l2_cap.raw_payload[b]);
+                }
+                Serial.println();
             }
-            Serial.println();
-            // ==========================================
-            custom_extracted = extract_printable_runs(
-                l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN,
-                /*min_run=*/4, /*flatten_ws=*/false, /*separator=*/"|"
-            );
         }
+
+        // --- 12. CATCH-ALL FOR UNKNOWN CLEARTEXT ---
+//if (!custom_extracted && l2_cap.payload_len > 0) {
+// ==========================================
+// THE GROUND-TRUTH DIAGNOSTIC
+// ==========================================
+//Serial.printf("[FALLTHROUGH] ip_ver=%u proto=%u src=%u dst=%u eth=0x%04X len=%u | first16: ",
+//l2_cap.ip_version, l2_cap.protocol, l2_cap.src_port, l2_cap.dst_port,
+//l2_cap.ether_type, l2_cap.payload_len);
+//for (int b = 0; b < 16 && b < l2_cap.payload_len; b++) {
+//Serial.printf("%02X ", l2_cap.raw_payload[b]);
+//}
+//Serial.println();
+// ==========================================
+//custom_extracted = extract_printable_runs(
+//l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN,
+///*min_run=*/4, /*flatten_ws=*/false, /*separator=*/"|"
+//);
+//} 
 
         // =========================================================
 // TEMP DIAGNOSTIC: WHY TCP/443 PACKET DOES OR DOESN'T ROUTE
 // =========================================================
-if (l2_cap.protocol == 6 &&
-    (l2_cap.src_port == 443 || l2_cap.dst_port == 443)) {
+//if (l2_cap.protocol == 6 &&
+//    (l2_cap.src_port == 443 || l2_cap.dst_port == 443)) {
 
-    Serial.printf(
-        "[TCP443-ROUTING] src=%u dst=%u len=%u custom=%d text=\"%s\"\n",
-        l2_cap.src_port,
-        l2_cap.dst_port,
-        l2_cap.payload_len,
-        custom_extracted,
-        custom_extracted ? temp_text : ""
-    );
-}
+//    Serial.printf(
+//        "[TCP443-ROUTING] src=%u dst=%u len=%u custom=%d text=\"%s\"\n",
+//        l2_cap.src_port,
+//        l2_cap.dst_port,
+//        l2_cap.payload_len,
+//        custom_extracted,
+//        custom_extracted ? temp_text : ""
+//    );
+//}
 
         // ==========================================
         // IN-PLACE UNION OVERWRITE & UI ROUTING

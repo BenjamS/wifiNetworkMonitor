@@ -1,0 +1,17 @@
+
+TCP SYN (0x02): This is a connection request. If someone on the network is running a stealth port scan (like nmap -sS), they send thousands of SYN packets to various ports without ever actually completing the connection or sending data. Catching these alerts you immediately that a device is mapping the network.
+
+TCP RST (0x04): This is a connection reset/rejection. If you see a flurry of RST packets, it usually means a device is trying to talk to a closed port, or a firewall/Intrusion Detection System (IDS) is actively terminating an unauthorized connection.
+
+
+Where the Architecture Will Still "Fail"
+
+Because Wave Hound operates on a stateless, packet-by-packet basis, there are three scenarios on the modern internet where these parsers will intentionally fail to extract text:
+
+    The TCP Boundary Guillotine: If a TCP fragment splits an ASN.1 header perfectly in half (e.g., the 0x06 tag is the last byte of Packet A, and the 0x03 length is the first byte of Packet B), the sliding window will miss it. This is normal and acceptable for your hardware constraints.
+
+    The 127-Byte ASN.1 Limit: As your friend pointed out, if a single element inside a certificate (like a massive list of 50 Subject Alternative Names) exceeds 127 bytes, it uses a "long-form" length flag (0x81 or 0x82). Our parser assumes short-form lengths to save CPU cycles. It will safely skip over these massive blocks, meaning you might occasionally miss a domain name if it is buried inside a giant SAN block.
+
+    Encrypted Client Hello (ECH): Cloudflare and Chrome are currently rolling out ECH, which encrypts the SNI extension so middleboxes cannot read it. When Wave Hound captures an ECH packet, it will correctly parse the TLS headers, but it will only see the "outer" cover domain (usually something generic like cloudflare-ech.com) rather than the true target.
+
+Overall, the logic is highly robust and ready to tackle random network traffic.
