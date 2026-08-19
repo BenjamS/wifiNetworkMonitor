@@ -3033,85 +3033,218 @@ bool parse_syslog(const uint8_t* payload, uint16_t length, char* out_text, size_
 }
 
 bool parse_rtsp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 16) return false;
+    // 9 bytes is the absolute minimum for an RTSP command (e.g., "PLAY \r\n\r\n")
+    if (length < 9) return false;
 
     const char* p = (const char*)payload;
     const char* payload_end = p + length;
-    const char* id_start = nullptr;
 
-    // 1. Sliding window to hunt for hardware identifiers (Server or User-Agent)
-    for (int i = 0; i < length - 12; i++) {
-        if (memcmp(&p[i], "Server: ", 8) == 0) {
-            id_start = &p[i+8];
-            break;
-        } else if (memcmp(&p[i], "User-Agent: ", 12) == 0) {
-            id_start = &p[i+12];
-            break;
-        }
-    }
+    // Fast gate: Ensure this is actually RTSP traffic
+    bool is_rtsp = (memcmp(p, "RTSP/1.", 7) == 0 || memcmp(p, "OPTIONS ", 8) == 0 || 
+                    memcmp(p, "DESCRIBE ", 9) == 0 || memcmp(p, "SETUP ", 6) == 0 || 
+                    memcmp(p, "PLAY ", 5) == 0 || memcmp(p, "TEARDOWN ", 9) == 0);
+    
+    if (!is_rtsp) return false;
 
-    if (id_start) {
-        const char* end = id_start;
-        // Read until the end of the line
-        while (end < payload_end && *end != '\r' && *end != '\n') end++;
+    char device_info[64] = {0};
+    char uri[64] = {0};
+    char auth_type[16] = {0};
+    char auth_creds[64] = {0}; 
+    bool found_intel = false;
+
+    // The longest needles we check inside the loop are exactly 21 bytes long
+    // ("Authorization: Basic " and "Authorization: Digest")
+    int max_i = (int)length - 21;
+
+    // Sliding window to sweep for all metadata in one pass
+    for (int i = 0; i <= max_i; i++) {
         
-        int copy_len = std::min((int)(end - id_start), (int)(max_len - 15));
-        if (copy_len > 0) {
-            snprintf(out_text, max_len, "RTSP Device: %.*s", copy_len, id_start);
-            return true;
+        // 1. Extract Hardware / Software Identifier (First match wins)
+        if (device_info[0] == '\0') {
+            const char* id_start = nullptr;
+            if (memcmp(&p[i], "Server: ", 8) == 0) id_start = &p[i+8];
+            else if (memcmp(&p[i], "User-Agent: ", 12) == 0) id_start = &p[i+12];
+            
+            if (id_start) {
+                const char* end = id_start;
+                while (end < payload_end && *end != '\r' && *end != '\n') end++;
+                int copy_len = std::min((int)(end - id_start), 63);
+                memcpy(device_info, id_start, copy_len);
+                device_info[copy_len] = '\0';
+                found_intel = true;
+            }
+        }
+
+        // 2. Extract Stream URI
+        if (uri[0] == '\0' && memcmp(&p[i], "rtsp://", 7) == 0) {
+            const char* uri_end = &p[i];
+            while (uri_end < payload_end && *uri_end != ' ' && *uri_end != '\r' && *uri_end != '\n') uri_end++;
+            int copy_len = std::min((int)(uri_end - &p[i]), 63);
+            memcpy(uri, &p[i], copy_len);
+            uri[copy_len] = '\0';
+            found_intel = true;
+        }
+
+        // 3. Extract Authentication State & Credentials
+        if (auth_type[0] == '\0') {
+            if (memcmp(&p[i], "Authorization: Basic ", 21) == 0) {
+                snprintf(auth_type, sizeof(auth_type), "Basic");
+                
+                const char* b64_start = &p[i + 21];
+                const char* b64_end = b64_start;
+                while (b64_end < payload_end && *b64_end != '\r' && *b64_end != '\n' && *b64_end != ' ') b64_end++;
+                
+                int copy_len = std::min((int)(b64_end - b64_start), 63);
+                if (copy_len > 0) {
+                    memcpy(auth_creds, b64_start, copy_len);
+                    auth_creds[copy_len] = '\0';
+                }
+                found_intel = true;
+            }
+            else if (memcmp(&p[i], "Authorization: Digest", 21) == 0) {
+                snprintf(auth_type, sizeof(auth_type), "Digest");
+                found_intel = true;
+            }
+            else if (memcmp(&p[i], "WWW-Authenticate: ", 18) == 0) {
+                snprintf(auth_type, sizeof(auth_type), "Req");
+                found_intel = true;
+            }
         }
     }
 
-    // 2. Fallback: Catch the stream initialization commands
-    if (memcmp(p, "SETUP ", 6) == 0 || memcmp(p, "DESCRIBE ", 9) == 0 || memcmp(p, "PLAY ", 5) == 0) {
+    // Fallback: If it's an RTSP packet but has no headers
+    if (!found_intel) {
         const char* end = p;
         while (end < payload_end && *end != '\r' && *end != '\n') end++;
-        
-        int copy_len = std::min((int)(end - p), (int)(max_len - 10));
-        snprintf(out_text, max_len, "RTSP: %.*s", copy_len, p);
+        int copy_len = std::min((int)(end - p), (int)(max_len - 15));
+        snprintf(out_text, max_len, "RTSP Cmd: %.*s", copy_len, p);
         return true;
     }
 
-    return false;
+    // Assemble the final tactical string
+    int idx = snprintf(out_text, max_len, "RTSP Cam");
+    
+    if (device_info[0] != '\0') {
+        idx += snprintf(out_text + idx, max_len - idx, ": %s", device_info);
+    }
+    if (uri[0] != '\0') {
+        idx += snprintf(out_text + idx, max_len - idx, " | %s", uri);
+    }
+    if (auth_type[0] != '\0') {
+        if (auth_creds[0] != '\0') {
+            snprintf(out_text + idx, max_len - idx, " (Auth:%s [%s])", auth_type, auth_creds);
+        } else {
+            snprintf(out_text + idx, max_len - idx, " (Auth:%s)", auth_type);
+        }
+    }
+
+    return true;
 }
 
 bool parse_ftp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 6) return false;
+    // Defensive entry guard
+    if (length < 6 || payload == nullptr || out_text == nullptr || max_len < 20) return false;
 
     const char* p = (const char*)payload;
 
-    // We specifically hunt for the authentication commands
-    if (memcmp(p, "USER ", 5) == 0 || memcmp(p, "PASS ", 5) == 0) {
+    // 1. Hunt for authentication commands (Case-insensitive using strncasecmp)
+    if (strncasecmp(p, "USER ", 5) == 0 || strncasecmp(p, "PASS ", 5) == 0) {
         const char* end = p;
         
         // Read until the end of the line
         while (end < p + length && *end != '\r' && *end != '\n') end++;
         
         int copy_len = std::min((int)(end - p), (int)(max_len - 6));
-        snprintf(out_text, max_len, "FTP: %.*s", copy_len, p);
-        return true;
+        if (copy_len > 0) {
+            snprintf(out_text, max_len, "FTP: %.*s", copy_len, p);
+            return true;
+        }
     }
 
-    // Optional: Catch successful login responses from the server
+    // 2. Catch Authentication Responses (Status codes are always numeric)
     if (memcmp(p, "230 ", 4) == 0) {
         snprintf(out_text, max_len, "FTP: Login Successful");
         return true;
+    }
+    else if (memcmp(p, "530 ", 4) == 0) {
+        snprintf(out_text, max_len, "FTP: Login Failed");
+        return true;
+    }
+    
+    // 3. Catch Data Connection Routing (PASV / PORT)
+    if (strncasecmp(p, "PORT ", 5) == 0 || memcmp(p, "227 ", 4) == 0) {
+        const char* tuple_start = nullptr;
+        int search_len = std::min((int)length, 64); // Bound the search space
+        
+        if (memcmp(p, "227 ", 4) == 0) {
+            // Find the opening parenthesis for PASV: 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+            for (int i = 4; i < search_len; i++) {
+                if (p[i] == '(') {
+                    tuple_start = &p[i + 1];
+                    break;
+                }
+            }
+        } else {
+            // PORT command: numbers start immediately after "PORT "
+            tuple_start = p + 5;
+        }
+
+        if (tuple_start) {
+            // Extract the tuple into a safe, null-terminated buffer
+            char tuple_buf[64] = {0};
+            int i = 0;
+            while (tuple_start + i < p + length && tuple_start[i] != '\r' && 
+                   tuple_start[i] != ')' && i < 63) {
+                tuple_buf[i] = tuple_start[i];
+                i++;
+            }
+
+            int h1, h2, h3, h4, p1, p2;
+            if (sscanf(tuple_buf, "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2) == 6) {
+                // Ensure all octets and port bytes strictly conform to 8-bit limits (0-255)
+                bool valid = (h1 >= 0 && h1 <= 255) && (h2 >= 0 && h2 <= 255) &&
+                             (h3 >= 0 && h3 <= 255) && (h4 >= 0 && h4 <= 255) &&
+                             (p1 >= 0 && p1 <= 255) && (p2 >= 0 && p2 <= 255);
+                
+                if (valid) {
+                    uint16_t port = (p1 << 8) | p2; 
+                    snprintf(out_text, max_len, "FTP Data: %d.%d.%d.%d:%u", h1, h2, h3, h4, port);
+                    return true;
+                }
+            }
+        }
     }
 
     return false;
 }
 
 bool parse_telnet(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 1) return false;
+    // Defensive entry guard
+    if (length < 1 || payload == nullptr || out_text == nullptr || max_len < 16) return false;
 
     char clean_text[64] = {0};
-    int write_idx = 0;
+    uint8_t write_idx = 0;
 
-    for (int i = 0; i < length && write_idx < sizeof(clean_text) - 1; i++) {
-        // Skip Telnet IAC (Interpret As Command) negotiations
-        // These are typically 3-byte sequences: [0xFF] [Command] [Option]
+    // Use uint16_t to strictly match the 'length' variable type
+    for (uint16_t i = 0; i < length && write_idx < sizeof(clean_text) - 1; i++) {
+        
+        // Handle Telnet IAC (Interpret As Command)
         if (payload[i] == 0xFF) {
-            i += 2; // Jump over the next two bytes, plus the loop's i++ will push us past the block
+            if (i + 1 >= length) break;
+
+            // IAC IAC = literal 0xFF data byte.
+            // Not printable ASCII, so discard it.
+            if (payload[i + 1] == 0xFF) {
+                i++;
+                continue;
+            }
+
+            // Most standard Telnet negotiation commands are 3 bytes: IAC <command> <option>
+            if (i + 2 < length) {
+                i += 2;
+            } else {
+                break;
+            }
             continue;
         }
 
@@ -3119,13 +3252,12 @@ bool parse_telnet(const uint8_t* payload, uint16_t length, char* out_text, size_
         if (payload[i] >= 32 && payload[i] <= 126) {
             clean_text[write_idx++] = payload[i];
         } 
-        // Stop if we hit a newline (end of a command or prompt)
+        // Stop if we hit a newline (extracts only the first line of the packet)
         else if (payload[i] == '\r' || payload[i] == '\n') {
             if (write_idx > 0) break;
         }
     }
 
-    // Only print if we captured a meaningful string (e.g., "login:", "root", or a password)
     if (write_idx > 2) {
         snprintf(out_text, max_len, "Telnet: %s", clean_text);
         return true;
@@ -3135,32 +3267,210 @@ bool parse_telnet(const uint8_t* payload, uint16_t length, char* out_text, size_
 }
 
 bool parse_tftp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 4) return false; // Minimum size for Opcode + 1-byte filename + Null terminator
+    if (!payload || !out_text || length < 4 || max_len < 20) return false;
 
-    // TFTP Opcodes are 2 bytes
-    uint16_t opcode = (payload[0] << 8) | payload[1];
+    uint16_t opcode = ((uint16_t)payload[0] << 8) | payload[1];
+    if (opcode != 1 && opcode != 2) return false;
 
-    if (opcode == 1 || opcode == 2) {
-        const char* action = (opcode == 1) ? "Read" : "Write";
-        
-        // The filename starts immediately at offset 2 and is null-terminated
-        const char* filename = (const char*)&payload[2];
-        int fn_len = 0;
-        
-        // Find the length of the filename safely within the payload bounds
-        while (2 + fn_len < length && payload[2 + fn_len] != '\0') {
-            fn_len++;
-        }
+    const char* action = (opcode == 1) ? "Read" : "Write";
 
-        if (fn_len > 0) {
-            int copy_len = std::min((int)fn_len, (int)(max_len - 15));
-            snprintf(out_text, max_len, "TFTP %s: %.*s", action, copy_len, filename);
+    // ------------------------------------------
+    // 1. Locate filename
+    // ------------------------------------------
+    uint16_t pos = 2;
+    while (pos < length && payload[pos] != '\0') pos++;
+    
+    if (pos >= length || pos == 2) return false;
+    uint16_t filename_len = pos - 2;
+
+    pos++; // Move past filename NUL
+
+    // ------------------------------------------
+    // 2. Locate mode
+    // ------------------------------------------
+    uint16_t mode_start = pos;
+    while (pos < length && payload[pos] != '\0') pos++;
+    
+    if (pos >= length || pos == mode_start) return false;
+    uint16_t mode_len = pos - mode_start;
+
+    // ------------------------------------------
+    // 3. Validate common TFTP modes (Case-Insensitive per RFC 1350)
+    // ------------------------------------------
+    bool valid_mode =
+        (mode_len == 5 && strncasecmp((const char*)&payload[mode_start], "octet", 5) == 0) ||
+        (mode_len == 8 && strncasecmp((const char*)&payload[mode_start], "netascii", 8) == 0) ||
+        (mode_len == 4 && strncasecmp((const char*)&payload[mode_start], "mail", 4) == 0);
+
+    if (!valid_mode) return false;
+
+    // ------------------------------------------
+    // 4. Extract filename
+    // ------------------------------------------
+    int copy_len = std::min((int)filename_len, (int)(max_len - 15));
+    if (copy_len <= 0) return false;
+
+    snprintf(out_text, max_len, "TFTP %s: %.*s", action, copy_len, (const char*)&payload[2]);
+    return true;
+}
+
+bool parse_smtp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Defensive entry guard
+    if (length < 5 || payload == nullptr || out_text == nullptr || max_len < 30) return false;
+
+    const char* p = (const char*)payload;
+    const char* payload_end = p + length;
+    const char* target_label = nullptr;
+
+    // 1. Hunt for standard SMTP commands (Case-insensitive per RFC 5321)
+    if (strncasecmp(p, "EHLO ", 5) == 0 || strncasecmp(p, "HELO ", 5) == 0) {
+        target_label = "HELO";
+        p += 5;
+    } 
+    else if (strncasecmp(p, "MAIL FROM:", 10) == 0) {
+        target_label = "From";
+        p += 10;
+    } 
+    else if (strncasecmp(p, "RCPT TO:", 8) == 0) {
+        target_label = "To";
+        p += 8;
+    } 
+    // 2. Catch the server banner (Handles both "220 " and multi-line "220-")
+    else if (memcmp(p, "220", 3) == 0 && (p[3] == ' ' || p[3] == '-')) {
+        target_label = "Banner";
+        p += 4;
+    } 
+    // 3. Flag cleartext authentication attempts
+    else if (strncasecmp(p, "AUTH LOGIN", 10) == 0 || strncasecmp(p, "AUTH PLAIN", 10) == 0) {
+        snprintf(out_text, max_len, "SMTP: Cleartext Auth Started!");
+        return true;
+    }
+
+    // 4. Extract the target string if we matched a command
+    if (target_label) {
+        // Skip leading spaces or brackets (e.g., MAIL FROM:<user@domain.com>)
+        while (p < payload_end && (*p == ' ' || *p == '<')) p++;
+
+        const char* end = p;
+        // Read until we hit a newline, carriage return, or closing bracket
+        while (end < payload_end && *end != '\r' && *end != '\n' && *end != '>') end++;
+
+        int copy_len = std::min((int)(end - p), (int)(max_len - 15));
+        if (copy_len > 0) {
+            snprintf(out_text, max_len, "SMTP %s: %.*s", target_label, copy_len, p);
             return true;
         }
     }
 
     return false;
 }
+
+bool parse_smb(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Defensive entry guard. 
+    // NTLMSSP Type 3 headers require at least 52 bytes to read the pointer offsets safely.
+    if (length < 52 || payload == nullptr || out_text == nullptr || max_len < 40) return false;
+
+    // The universal NTLMSSP magic byte signature
+    const char magic_sig[] = "NTLMSSP\0";
+    
+    // We cast length to signed (int) to prevent unsigned underflow.
+    int max_i = (int)length - 52; 
+
+    for (int i = 0; i <= max_i; i++) {
+        if (memcmp(&payload[i], magic_sig, 8) == 0) {
+            
+            // Byte 8 defines the NTLM Message Type
+            uint8_t msg_type = payload[i + 8];
+
+            // ---------------------------------------------------------
+            // Type 1: Negotiate (Client -> Server)
+            // Leaks the Client's Workstation Name and Domain
+            // ---------------------------------------------------------
+            if (msg_type == 0x01) {
+                // Domain fields start at offset 16 (2 byte len, 4 byte offset)
+                uint16_t dom_len = payload[i + 16] | (payload[i + 17] << 8);
+                uint32_t dom_off = payload[i + 20] | (payload[i + 21] << 8) | (payload[i + 22] << 16) | (payload[i + 23] << 24);
+                
+                // Workstation fields start at offset 24 (2 byte len, 4 byte offset)
+                uint16_t ws_len = payload[i + 24] | (payload[i + 25] << 8);
+                uint32_t ws_off = payload[i + 28] | (payload[i + 29] << 8) | (payload[i + 30] << 16) | (payload[i + 31] << 24);
+
+                char dom_name[32] = {0};
+                char ws_name[32] = {0};
+
+                // Embedded-friendly ASCII extraction (Filters out UTF-16LE null padding)
+                if (dom_len > 0 && i + dom_off + dom_len <= length) {
+                    int d_idx = 0;
+                    for (int k = 0; k < dom_len && d_idx < 31; k++) {
+                        char c = payload[i + dom_off + k];
+                        if (c >= 32 && c <= 126) dom_name[d_idx++] = c;
+                    }
+                }
+
+                if (ws_len > 0 && i + ws_off + ws_len <= length) {
+                    int w_idx = 0;
+                    for (int k = 0; k < ws_len && w_idx < 31; k++) {
+                        char c = payload[i + ws_off + k];
+                        if (c >= 32 && c <= 126) ws_name[w_idx++] = c;
+                    }
+                }
+
+                if (ws_name[0] != '\0') {
+                    snprintf(out_text, max_len, "SMB Client: %s\\%s", dom_name[0] ? dom_name : "WORKGROUP", ws_name);
+                    return true;
+                }
+            }
+            
+            // ---------------------------------------------------------
+            // Type 2: Challenge (Server -> Client)
+            // Leaks the Server's Name or Active Directory Domain
+            // ---------------------------------------------------------
+            else if (msg_type == 0x02) {
+                // Target Name fields start at offset 12
+                uint16_t tgt_len = payload[i + 12] | (payload[i + 13] << 8);
+                uint32_t tgt_off = payload[i + 16] | (payload[i + 17] << 8) | (payload[i + 18] << 16) | (payload[i + 19] << 24);
+
+                if (tgt_len > 0 && i + tgt_off + tgt_len <= length) {
+                    char tgt_name[32] = {0};
+                    int t_idx = 0;
+                    for (int k = 0; k < tgt_len && t_idx < 31; k++) {
+                        char c = payload[i + tgt_off + k];
+                        if (c >= 32 && c <= 126) tgt_name[t_idx++] = c;
+                    }
+                    if (t_idx > 0) {
+                        snprintf(out_text, max_len, "SMB Server: %s", tgt_name);
+                        return true;
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------
+            // Type 3: Authenticate (Client -> Server)
+            // The Holy Grail: Leaks the logged-in Username
+            // ---------------------------------------------------------
+            else if (msg_type == 0x03) {
+                // Username fields start at offset 36
+                uint16_t usr_len = payload[i + 36] | (payload[i + 37] << 8);
+                uint32_t usr_off = payload[i + 40] | (payload[i + 41] << 8) | (payload[i + 42] << 16) | (payload[i + 43] << 24);
+
+                if (usr_len > 0 && i + usr_off + usr_len <= length) {
+                    char usr_name[32] = {0};
+                    int u_idx = 0;
+                    for (int k = 0; k < usr_len && u_idx < 31; k++) {
+                        char c = payload[i + usr_off + k];
+                        if (c >= 32 && c <= 126) usr_name[u_idx++] = c;
+                    }
+                    if (u_idx > 0) {
+                        snprintf(out_text, max_len, "SMB Auth [User: %s]", usr_name);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------
 // SSDP VERBOSE PARSER (Port 1900)
 // Extracts First Line, HOST, NT/ST, SERVER, USN, LOCATION, CACHE
@@ -3257,6 +3567,67 @@ bool parse_ssdp(const uint8_t* payload, uint16_t length, char* out_text, size_t 
 // Extracts Windows local network name resolution queries
 // ---------------------------------------------------------
 bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Defensive entry guard
+    if (length < 12 || payload == nullptr || out_text == nullptr || max_len < 30) {
+        return false; 
+    }
+
+    uint16_t flags = (payload[2] << 8) | payload[3];
+    bool is_response = (flags & 0x8000) != 0; // Check the QR bit (Query vs Response)
+    uint16_t qdcount = (payload[4] << 8) | payload[5];
+
+    // We primarily care about the Question section (what name are they looking for?)
+    if (qdcount > 0) {
+        char domain[80] = {0};
+        int d_idx = 0;
+        int i = 12; // Start immediately after header
+        
+        // SAFE SLIDING WINDOW
+        while (i < length && payload[i] != 0x00) {
+            uint8_t label_len = payload[i];
+            
+            // Abort on compression pointer (0xC0) to prevent infinite loops
+            if ((label_len & 0xC0) == 0xC0) {
+                break; 
+            }
+
+            // 1. Verify label doesn't exceed the packet payload
+            if (label_len > 0 && label_len <= 63 && (i + 1 + label_len) <= length) {
+                
+                // 2. Verify label won't overflow our local domain buffer!
+                if (d_idx + label_len + 1 >= sizeof(domain)) {
+                    break;
+                }
+                
+                if (d_idx > 0) domain[d_idx++] = '.';
+                memcpy(&domain[d_idx], &payload[i + 1], label_len);
+                d_idx += label_len;
+                i += label_len + 1;
+            } else {
+                break;
+            }
+        }
+        domain[d_idx] = '\0';
+
+        if (d_idx > 0) {
+            const char* type_str = is_response ? "Reply" : "Query";
+            snprintf(out_text, max_len, "LLMNR [%s] Tgt: %s", type_str, domain);
+            
+            // Retained your original formatting call
+            format_reverse_lookups(out_text, max_len);
+            
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------
+// LLMNR PARSER (Port 5355)
+// Extracts Windows local network name resolution queries
+// ---------------------------------------------------------
+/*
+bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     if (length < 12) return false; // Standard DNS header is 12 bytes
 
     uint16_t flags = (payload[2] << 8) | payload[3];
@@ -3309,6 +3680,7 @@ bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t
     }
     return false;
 }
+*/
 // ---------------------------------------------------------
 // TINY JSON EXTRACTOR (No dynamic memory required)
 // ---------------------------------------------------------
@@ -4822,6 +5194,79 @@ bool parse_eapol(const uint8_t* payload, uint16_t length,
     }
 }
 
+bool parse_ssh(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Defensive entry guard: valid pointers, minimum payload size, and sufficient output buffer
+    if (length < 10 || payload == nullptr || out_text == nullptr || max_len < 16) {
+        return false;
+    }
+
+    // SSH banners are strictly required to sit at the absolute beginning of the payload
+    if (memcmp(payload, "SSH-", 4) == 0) {
+        const char* p = (const char*)payload;
+        const char* end = p;
+        const char* payload_end = p + length;
+
+        // Read until the end of the line (usually \r\n)
+        while (end < payload_end && *end != '\r' && *end != '\n') end++;
+
+        // Safely bound the copy to our UI limits
+        int copy_len = std::min((int)(end - p), (int)(max_len - 15));
+        if (copy_len > 0) {
+            snprintf(out_text, max_len, "SSH Banner: %.*s", copy_len, p);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parse_rdp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
+    // Defensive entry guard: valid pointers, minimum payload size, and sufficient output buffer
+    if (length < 17 || payload == nullptr || out_text == nullptr || max_len < 40) {
+        return false;
+    }
+
+    // Fast gate: RDP X.224 Connection Requests ride on top of TPKT.
+    // TPKT headers always start with Version 3 (0x03) and Reserved (0x00).
+    if (payload[0] != 0x03 || payload[1] != 0x00) return false;
+
+    const char* p = (const char*)payload;
+    const char* payload_end = p + length;
+    
+    // The needle is 17 bytes long. Signed int prevents underflow.
+    int max_i = (int)length - 17; 
+
+    // Sliding window to hunt for the routing cookie
+    for (int i = 0; i <= max_i; i++) {
+        if (memcmp(&p[i], "Cookie: mstshash=", 17) == 0) {
+            const char* user_start = &p[i + 17];
+            const char* user_end = user_start;
+            
+            // Read the username until we hit a newline or space
+            while (user_end < payload_end && *user_end != '\r' && *user_end != '\n' && *user_end != ' ') {
+                user_end++;
+            }
+
+            int copy_len = std::min((int)(user_end - user_start), (int)(max_len - 30));
+            if (copy_len > 0) {
+                snprintf(out_text, max_len, "RDP Connect [User: %.*s]", copy_len, user_start);
+                return true;
+            }
+        }
+    }
+    
+    // Fallback: It passed the TPKT gate but didn't have a username cookie.
+    // Is it actually an initial Connection Request (X.224 CR)? 
+    // Byte 5 must be 0xE0 for a Connection Request.
+    if (length > 5 && payload[5] == 0xE0) {
+        snprintf(out_text, max_len, "RDP Connection Request (No Cookie)");
+        return true;
+    }
+
+    // It is just ordinary TPKT-framed encrypted RDP traffic (e.g., mouse movements).
+    // Silently ignore it to prevent display spam.
+    return false;
+}
+
 // --- The Smart Endpoint Wi-Fi Sniffer Callback ---
 void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (pause_sniffing) return;
@@ -6132,13 +6577,33 @@ void processLiveDumpQueue() {
             custom_extracted = parse_telnet(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
             if (custom_extracted) l2_cap.is_high_value = true;
         }
+        // --- 4.11.5 SSH Banner (Port 22) ---
+        else if (l2_cap.dst_port == 22 || l2_cap.src_port == 22) {
+            custom_extracted = parse_ssh(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+        }
         // --- 4.12 TFTP Firmware/Config Transfers (Port 69) ---
         else if (l2_cap.dst_port == 69) {
             custom_extracted = parse_tftp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
             if (custom_extracted) l2_cap.is_high_value = true;
         }
-        // --- 5. SSDP / UPnP (Port 1900) ---
-        else if (l2_cap.dst_port == 1900) {
+        // --- 4.13 RDP Connection Requests (Port 3389) ---
+        else if (l2_cap.dst_port == 3389 || l2_cap.src_port == 3389) {
+            custom_extracted = parse_rdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true;
+        }
+        // --- 4.15 Simple Mail Transfer Protocol (Ports 25, 587) ---
+        else if (l2_cap.dst_port == 25 || l2_cap.src_port == 25 || 
+                 l2_cap.dst_port == 587 || l2_cap.src_port == 587) {
+            custom_extracted = parse_smtp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true;
+        }
+        // --- 4.16 Server Message Block (Port 445) ---
+        else if (l2_cap.dst_port == 445 || l2_cap.src_port == 445) {
+            custom_extracted = parse_smb(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            if (custom_extracted) l2_cap.is_high_value = true; // Usernames and AD Domains are red alerts
+        }
+        else if (l2_cap.dst_port == 1900 || l2_cap.src_port == 1900) {
+        //else if (l2_cap.dst_port == 1900) {
             custom_extracted = parse_ssdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
         }
         // --- 6. LLMNR (Port 5355) ---
