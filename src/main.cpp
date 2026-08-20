@@ -1624,25 +1624,35 @@ bool parse_dhcp_v6(const uint8_t* payload, uint16_t length, char* out_text, size
 }
 
 void format_reverse_lookups(char* text, size_t max_len) {
-    char temp_buffer[max_len];
+    // 1. Entry Guard: Match defensive conventions applied everywhere else
+    if (text == nullptr || max_len == 0) return;
+
+    // 2. VLA Removal: Use compile-time constant to enforce stack ceiling
+    char temp_buffer[MAX_LEAK_STR_LEN];
+    
+    // Ensure we don't write past our fixed buffer if max_len is somehow larger
+    size_t safe_len = (max_len < MAX_LEAK_STR_LEN) ? max_len : MAX_LEAK_STR_LEN;
 
     // ----------------------------------------------------
     // 1. IPv4 Reverse Lookup (.in-addr.arpa)
     // ----------------------------------------------------
     char* in_addr = strstr(text, "in-addr");
-    if (in_addr != NULL) {
+    if (in_addr != nullptr) {
         int o1, o2, o3, o4;
         char* ptr = text;
         
         while (ptr < in_addr) {
-            // Updated to look for standard dot notation instead of spaces
             if (sscanf(ptr, "%d.%d.%d.%d.in-addr", &o4, &o3, &o2, &o1) == 4) {
-                // Reconstruct the original prefix (e.g., "mDNS 0Q,1A: ")
-                int prefix_len = ptr - text;
-                snprintf(temp_buffer, max_len, "%.*sReverse Query: %d.%d.%d.%d", 
-                         prefix_len, text, o1, o2, o3, o4);
-                strncpy(text, temp_buffer, max_len);
-                return;
+                // 3. Octet Range Validation: Protect against integer overflow/garbage
+                if (o1 >= 0 && o1 <= 255 && o2 >= 0 && o2 <= 255 &&
+                    o3 >= 0 && o3 <= 255 && o4 >= 0 && o4 <= 255) {
+                    
+                    int prefix_len = ptr - text;
+                    snprintf(temp_buffer, safe_len, "%.*sReverse Query: %d.%d.%d.%d", 
+                             prefix_len, text, o1, o2, o3, o4);
+                    strncpy(text, temp_buffer, safe_len);
+                    return;
+                }
             }
             ptr++;
         }
@@ -1652,7 +1662,7 @@ void format_reverse_lookups(char* text, size_t max_len) {
     // 2. IPv6 Reverse Lookup (.ip6.arpa)
     // ----------------------------------------------------
     char* ip6 = strstr(text, "ip6");
-    if (ip6 != NULL) {
+    if (ip6 != nullptr) {
         char nibbles[32];
         int n_idx = 0;
         char* ptr = ip6 - 1;
@@ -1680,8 +1690,8 @@ void format_reverse_lookups(char* text, size_t max_len) {
             ipv6_str[out_idx] = '\0';
             
             int prefix_len = (ptr + 1) - text;
-            snprintf(temp_buffer, max_len, "%.*s%s", prefix_len, text, ipv6_str);
-            strncpy(text, temp_buffer, max_len);
+            snprintf(temp_buffer, safe_len, "%.*s%s", prefix_len, text, ipv6_str);
+            strncpy(text, temp_buffer, safe_len);
             return;
         }
     }
@@ -3316,49 +3326,126 @@ bool parse_tftp(const uint8_t* payload, uint16_t length, char* out_text, size_t 
 
 bool parse_smtp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     // Defensive entry guard
-    if (length < 5 || payload == nullptr || out_text == nullptr || max_len < 30) return false;
+    if (length < 4 || payload == nullptr || out_text == nullptr || max_len < 30) return false;
 
     const char* p = (const char*)payload;
     const char* payload_end = p + length;
-    const char* target_label = nullptr;
 
-    // 1. Hunt for standard SMTP commands (Case-insensitive per RFC 5321)
-    if (strncasecmp(p, "EHLO ", 5) == 0 || strncasecmp(p, "HELO ", 5) == 0) {
-        target_label = "HELO";
-        p += 5;
-    } 
-    else if (strncasecmp(p, "MAIL FROM:", 10) == 0) {
-        target_label = "From";
-        p += 10;
-    } 
-    else if (strncasecmp(p, "RCPT TO:", 8) == 0) {
-        target_label = "To";
-        p += 8;
-    } 
-    // 2. Catch the server banner (Handles both "220 " and multi-line "220-")
-    else if (memcmp(p, "220", 3) == 0 && (p[3] == ' ' || p[3] == '-')) {
-        target_label = "Banner";
-        p += 4;
-    } 
-    // 3. Flag cleartext authentication attempts
-    else if (strncasecmp(p, "AUTH LOGIN", 10) == 0 || strncasecmp(p, "AUTH PLAIN", 10) == 0) {
-        snprintf(out_text, max_len, "SMTP: Cleartext Auth Started!");
-        return true;
-    }
+    int max_i = (int)length - 4;
 
-    // 4. Extract the target string if we matched a command
-    if (target_label) {
-        // Skip leading spaces or brackets (e.g., MAIL FROM:<user@domain.com>)
-        while (p < payload_end && (*p == ' ' || *p == '<')) p++;
+    // Slide through the packet looking for line boundaries
+    for (int i = 0; i <= max_i; i++) {
 
-        const char* end = p;
-        // Read until we hit a newline, carriage return, or closing bracket
-        while (end < payload_end && *end != '\r' && *end != '\n' && *end != '>') end++;
+        // A command must start at the very beginning of the payload
+        // OR immediately after a newline.
+        if (i == 0 || p[i - 1] == '\n') {
+            const char* line = p + i;
+            int rem = length - i;
 
-        int copy_len = std::min((int)(end - p), (int)(max_len - 15));
-        if (copy_len > 0) {
-            snprintf(out_text, max_len, "SMTP %s: %.*s", target_label, copy_len, p);
-            return true;
+            // Skip leading CR/LF just in case of unusual formatting.
+            while (rem > 0 && (*line == '\r' || *line == '\n')) {
+                line++;
+                rem--;
+            }
+
+            if (rem < 4) continue;
+
+            const char* target_label = nullptr;
+            int skip_bytes = 0;
+
+            // EHLO / HELO
+            if (rem >= 5 &&
+                (strncasecmp(line, "EHLO ", 5) == 0 ||
+                 strncasecmp(line, "HELO ", 5) == 0)) {
+
+                target_label = "HELO";
+                skip_bytes = 5;
+            }
+
+            // MAIL FROM
+            else if (rem >= 10 &&
+                     strncasecmp(line, "MAIL FROM:", 10) == 0) {
+
+                target_label = "From";
+                skip_bytes = 10;
+            }
+
+            // RCPT TO
+            else if (rem >= 8 &&
+                     strncasecmp(line, "RCPT TO:", 8) == 0) {
+
+                target_label = "To";
+                skip_bytes = 8;
+            }
+
+            // SMTP server banner: 220 text / 220-text
+            else if (rem >= 4 &&
+                     memcmp(line, "220", 3) == 0 &&
+                     (line[3] == ' ' || line[3] == '-')) {
+
+                target_label = "Server";
+                skip_bytes = 4;
+            }
+
+            // AUTH LOGIN
+            else if (rem >= 10 &&
+                     strncasecmp(line, "AUTH LOGIN", 10) == 0) {
+
+                if (rem == 10 ||
+                    line[10] == ' ' ||
+                    line[10] == '\r' ||
+                    line[10] == '\n') {
+
+                    snprintf(out_text, max_len, "SMTP AUTH LOGIN");
+                    return true;
+                }
+            }
+
+            // AUTH PLAIN
+            else if (rem >= 10 &&
+                     strncasecmp(line, "AUTH PLAIN", 10) == 0) {
+
+                if (rem == 10 ||
+                    line[10] == ' ' ||
+                    line[10] == '\r' ||
+                    line[10] == '\n') {
+
+                    snprintf(out_text, max_len, "SMTP AUTH PLAIN");
+                    return true;
+                }
+            }
+
+            // Extract matched field
+            if (target_label) {
+                const char* target_data = line + skip_bytes;
+
+                while (target_data < payload_end &&
+                       (*target_data == ' ' || *target_data == '<')) {
+                    target_data++;
+                }
+
+                const char* end = target_data;
+
+                while (end < payload_end &&
+                       *end != '\r' &&
+                       *end != '\n' &&
+                       *end != '>') {
+                    end++;
+                }
+
+                int copy_len =
+                    std::min((int)(end - target_data),
+                             (int)(max_len - 15));
+
+                if (copy_len > 0) {
+                    snprintf(out_text, max_len,
+                             "SMTP %s: %.*s",
+                             target_label,
+                             copy_len,
+                             target_data);
+                    return true;
+                }
+            }
         }
     }
 
@@ -3366,40 +3453,35 @@ bool parse_smtp(const uint8_t* payload, uint16_t length, char* out_text, size_t 
 }
 
 bool parse_smb(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    // Defensive entry guard. 
-    // NTLMSSP Type 3 headers require at least 52 bytes to read the pointer offsets safely.
-    if (length < 52 || payload == nullptr || out_text == nullptr || max_len < 40) return false;
+    // 1. Lower global minimum length to 20
+    if (length < 20 || payload == nullptr || out_text == nullptr || max_len < 40) return false;
 
-    // The universal NTLMSSP magic byte signature
     const char magic_sig[] = "NTLMSSP\0";
-    
-    // We cast length to signed (int) to prevent unsigned underflow.
-    int max_i = (int)length - 52; 
+    int max_i = (int)length - 20; 
 
     for (int i = 0; i <= max_i; i++) {
         if (memcmp(&payload[i], magic_sig, 8) == 0) {
             
-            // Byte 8 defines the NTLM Message Type
             uint8_t msg_type = payload[i + 8];
+            uint32_t rem = length - i;
 
             // ---------------------------------------------------------
             // Type 1: Negotiate (Client -> Server)
-            // Leaks the Client's Workstation Name and Domain
             // ---------------------------------------------------------
             if (msg_type == 0x01) {
-                // Domain fields start at offset 16 (2 byte len, 4 byte offset)
+                if ((uint32_t)i + 32 > length) continue; // 2. Message-specific length check
+                
                 uint16_t dom_len = payload[i + 16] | (payload[i + 17] << 8);
                 uint32_t dom_off = payload[i + 20] | (payload[i + 21] << 8) | (payload[i + 22] << 16) | (payload[i + 23] << 24);
                 
-                // Workstation fields start at offset 24 (2 byte len, 4 byte offset)
                 uint16_t ws_len = payload[i + 24] | (payload[i + 25] << 8);
                 uint32_t ws_off = payload[i + 28] | (payload[i + 29] << 8) | (payload[i + 30] << 16) | (payload[i + 31] << 24);
 
                 char dom_name[32] = {0};
                 char ws_name[32] = {0};
 
-                // Embedded-friendly ASCII extraction (Filters out UTF-16LE null padding)
-                if (dom_len > 0 && i + dom_off + dom_len <= length) {
+                // 3. Hardened offset subtraction arithmetic
+                if (dom_len > 0 && dom_off <= rem && dom_len <= rem - dom_off) {
                     int d_idx = 0;
                     for (int k = 0; k < dom_len && d_idx < 31; k++) {
                         char c = payload[i + dom_off + k];
@@ -3407,7 +3489,7 @@ bool parse_smb(const uint8_t* payload, uint16_t length, char* out_text, size_t m
                     }
                 }
 
-                if (ws_len > 0 && i + ws_off + ws_len <= length) {
+                if (ws_len > 0 && ws_off <= rem && ws_len <= rem - ws_off) {
                     int w_idx = 0;
                     for (int k = 0; k < ws_len && w_idx < 31; k++) {
                         char c = payload[i + ws_off + k];
@@ -3416,21 +3498,22 @@ bool parse_smb(const uint8_t* payload, uint16_t length, char* out_text, size_t m
                 }
 
                 if (ws_name[0] != '\0') {
-                    snprintf(out_text, max_len, "SMB Client: %s\\%s", dom_name[0] ? dom_name : "WORKGROUP", ws_name);
+                    // 4. Do not invent "WORKGROUP"
+                    snprintf(out_text, max_len, "SMB Client: %s\\%s", dom_name[0] ? dom_name : "?", ws_name);
                     return true;
                 }
             }
             
             // ---------------------------------------------------------
             // Type 2: Challenge (Server -> Client)
-            // Leaks the Server's Name or Active Directory Domain
             // ---------------------------------------------------------
             else if (msg_type == 0x02) {
-                // Target Name fields start at offset 12
+                if ((uint32_t)i + 20 > length) continue;
+
                 uint16_t tgt_len = payload[i + 12] | (payload[i + 13] << 8);
                 uint32_t tgt_off = payload[i + 16] | (payload[i + 17] << 8) | (payload[i + 18] << 16) | (payload[i + 19] << 24);
 
-                if (tgt_len > 0 && i + tgt_off + tgt_len <= length) {
+                if (tgt_len > 0 && tgt_off <= rem && tgt_len <= rem - tgt_off) {
                     char tgt_name[32] = {0};
                     int t_idx = 0;
                     for (int k = 0; k < tgt_len && t_idx < 31; k++) {
@@ -3446,14 +3529,14 @@ bool parse_smb(const uint8_t* payload, uint16_t length, char* out_text, size_t m
 
             // ---------------------------------------------------------
             // Type 3: Authenticate (Client -> Server)
-            // The Holy Grail: Leaks the logged-in Username
             // ---------------------------------------------------------
             else if (msg_type == 0x03) {
-                // Username fields start at offset 36
+                if ((uint32_t)i + 44 > length) continue;
+
                 uint16_t usr_len = payload[i + 36] | (payload[i + 37] << 8);
                 uint32_t usr_off = payload[i + 40] | (payload[i + 41] << 8) | (payload[i + 42] << 16) | (payload[i + 43] << 24);
 
-                if (usr_len > 0 && i + usr_off + usr_len <= length) {
+                if (usr_len > 0 && usr_off <= rem && usr_len <= rem - usr_off) {
                     char usr_name[32] = {0};
                     int u_idx = 0;
                     for (int k = 0; k < usr_len && u_idx < 31; k++) {
@@ -5091,54 +5174,34 @@ void drawTelemetryHeader() {
     tft.drawString(stat_text, 285, 1);
 }
 
-bool parse_eapol(const uint8_t* payload, uint16_t length,
-                 char* out_text, size_t max_len,
-                 bool& is_high_value) {
-
-    is_high_value = false;
-
+bool parse_eapol(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     if (!payload || !out_text || max_len == 0 || length < 2)
         return false;
 
     uint8_t eapol_type = payload[1];
 
     switch (eapol_type) {
-
         case 0:
-            snprintf(out_text, max_len,
-                     "EAPOL: EAP Packet (802.1X Auth)");
+            snprintf(out_text, max_len, "EAPOL: EAP Packet (802.1X Auth)");
             return true;
-
         case 1:
             snprintf(out_text, max_len, "EAPOL: Start");
             return true;
-
         case 2:
             snprintf(out_text, max_len, "EAPOL: Logoff");
             return true;
-
         case 3: {   // EAPOL-Key
-
             if (length < 7) {
-                snprintf(out_text, max_len,
-                         "EAPOL-Key (Malformed)");
+                snprintf(out_text, max_len, "EAPOL-Key (Malformed)");
                 return true;
             }
 
-            // Descriptor Type
             uint8_t desc_type = payload[4];
-
             const char* desc_str = "UNK";
+            if (desc_type == 2) desc_str = "RSN";
+            else if (desc_type == 254) desc_str = "WPA";
 
-            if (desc_type == 2)
-                desc_str = "RSN";
-            else if (desc_type == 254)
-                desc_str = "WPA";
-
-            // Key Information: network byte order
-            uint16_t key_info =
-                ((uint16_t)payload[5] << 8) | payload[6];
-
+            uint16_t key_info = ((uint16_t)payload[5] << 8) | payload[6];
             bool pairwise   = (key_info & 0x0008) != 0;
             bool install    = (key_info & 0x0040) != 0;
             bool ack        = (key_info & 0x0080) != 0;
@@ -5146,50 +5209,60 @@ bool parse_eapol(const uint8_t* payload, uint16_t length,
             bool secure     = (key_info & 0x0200) != 0;
 
             const char* msg_type = "Unknown";
+            int msg_num = 0; 
 
             if (pairwise) {
-
-                if (ack && !mic) {
-                    // M1
-                    msg_type = "M1 (AP->STA)";
-                    is_high_value = true;
-                }
-                else if (!ack && mic && !secure) {
-                    // M2
-                    msg_type = "M2 (STA->AP)";
-                    is_high_value = true;
-                }
-                else if (ack && mic && install && secure) {
-                    // M3
-                    msg_type = "M3 (AP->STA)";
-                    is_high_value = true;
-                }
-                else if (!ack && mic && !install && secure) {
-                    // M4
-                    msg_type = "M4 (STA->AP)";
-                    is_high_value = true;
-                }
-
+                if (ack && !mic) { msg_type = "M1 (AP->STA)"; msg_num = 1; }
+                else if (!ack && mic && !secure) { msg_type = "M2 (STA->AP)"; msg_num = 2; }
+                else if (ack && mic && install && secure) { msg_type = "M3 (AP->STA)"; msg_num = 3; }
+                else if (!ack && mic && !install && secure) { msg_type = "M4 (STA->AP)"; msg_num = 4; }
             } else {
                 msg_type = "Group/Other Key";
             }
 
-            snprintf(out_text, max_len,
-                     "EAPOL-Key [%s]: %s",
-                     desc_str, msg_type);
+            // --- CRYPTO EXTRACTION BLOCK ---
+            bool have_nonce = (length >= 49); // offset 17 + 32 bytes
+            bool have_mic   = (length >= 97); // offset 81 + 16 bytes
+
+            if (msg_num > 0 && have_nonce) { 
+                char nonce_hex[65] = {0}; 
+                char mic_hex[33] = {0};   
+
+                const uint8_t* p_nonce = &payload[17];
+                for (int i = 0; i < 32; i++) {
+                    snprintf(&nonce_hex[i * 2], 3, "%02X", p_nonce[i]);
+                }
+
+                if (have_mic) {
+                    const uint8_t* p_mic = &payload[81];
+                    for (int i = 0; i < 16; i++) {
+                        snprintf(&mic_hex[i * 2], 3, "%02X", p_mic[i]);
+                    }
+                }
+
+                if (msg_num == 1) {
+                    snprintf(out_text, max_len, "EAPOL-Key [%s]: %s | ANonce: %s", desc_str, msg_type, nonce_hex);
+                } else if (msg_num == 2 && have_mic) {
+                    snprintf(out_text, max_len, "EAPOL-Key [%s]: %s | SNonce: %s | MIC: %s", desc_str, msg_type, nonce_hex, mic_hex);
+                } else if (msg_num == 3 && have_mic) {
+                    snprintf(out_text, max_len, "EAPOL-Key [%s]: %s | ANonce: %s | MIC: %s", desc_str, msg_type, nonce_hex, mic_hex);
+                } else if (msg_num == 4 && have_mic) {
+                    snprintf(out_text, max_len, "EAPOL-Key [%s]: %s | MIC: %s", desc_str, msg_type, mic_hex);
+                } else {
+                    // Fallback if M2/M3/M4 is truncated before the MIC
+                    snprintf(out_text, max_len, "EAPOL-Key [%s]: %s (Truncated)", desc_str, msg_type);
+                }
+            } else {
+                snprintf(out_text, max_len, "EAPOL-Key [%s]: %s", desc_str, msg_type);
+            }
 
             return true;
         }
-
         case 4:
-            snprintf(out_text, max_len,
-                     "EAPOL: Encapsulated-ASF-Alert");
+            snprintf(out_text, max_len, "EAPOL: Encapsulated-ASF-Alert");
             return true;
-
         default:
-            snprintf(out_text, max_len,
-                     "EAPOL: Unknown Type %d",
-                     eapol_type);
+            snprintf(out_text, max_len, "EAPOL: Unknown Type %d", eapol_type);
             return true;
     }
 }
@@ -6524,8 +6597,14 @@ void processLiveDumpQueue() {
         }
         // --- 0.5 EAPOL (WPA/WPA2/WPA3 Handshake) ---
         else if (l2_cap.ether_type == 0x888E) {
-            if (parse_eapol(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN, l2_cap.is_high_value)) {
-                custom_extracted = true;
+            custom_extracted = parse_eapol(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+            
+            if (custom_extracted) {
+                // Elevate M1-M4 to high value, leave Start/Logoff/Group as standard
+                if (strstr(temp_text, "M1") || strstr(temp_text, "M2") || 
+                    strstr(temp_text, "M3") || strstr(temp_text, "M4")) {
+                    l2_cap.is_high_value = true;
+                }
             }
         }
         // --- 1. DHCPv4 Extraction (Ports 67, 68) ---
