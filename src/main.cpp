@@ -4195,6 +4195,217 @@ bool parse_llmnr(const uint8_t* payload, uint16_t length, char* out_text, size_t
     return false;
 }
 */
+
+// --- Memory-Safe LLDP Parser ---
+static bool parse_lldp(const uint8_t* payload, uint16_t length, char* out_buf, size_t max_out) {
+    if (!payload || !out_buf || length < 2 || max_out < 8) return false;
+    
+    out_buf[0] = '\0';
+    uint16_t offset = 0;
+    size_t pos = 0;
+    
+    uint8_t mandatory_stage = 0;
+    bool have_end = false;
+
+    // Bounded append helper with explicit NUL reservation
+    auto append_str = [&](const char* str) -> bool {
+        size_t len = strlen(str);
+        if (pos >= max_out) return false;
+        
+        size_t available = max_out - pos - 1; // Reserve 1 byte for '\0'
+        if (len > available) return false;
+
+        memcpy(out_buf + pos, str, len);
+        pos += len;
+        out_buf[pos] = '\0';
+        return true;
+    };
+
+    if (!append_str("LLDP: ")) return false;
+
+    // Subtraction-based invariant: At least two bytes remain for a TLV header
+    while (length - offset >= 2) {
+        uint8_t tlv_type = payload[offset] >> 1;
+        uint16_t tlv_len = ((payload[offset] & 0x01) << 8) | payload[offset + 1];
+        
+        offset += 2;
+        
+        // Subtraction-safe boundary check
+        if (tlv_len > length - offset) return false; 
+
+        // Enforce strict 1 -> 2 -> 3 ordering for false-positive elimination
+        if (tlv_type == 1) {
+            if (mandatory_stage != 0 || tlv_len < 2) return false;
+            mandatory_stage = 1;
+        } else if (tlv_type == 2) {
+            if (mandatory_stage != 1 || tlv_len < 2) return false;
+            mandatory_stage = 2;
+        } else if (tlv_type == 3) {
+            if (mandatory_stage != 2 || tlv_len != 2) return false;
+            mandatory_stage = 3;
+        } else if (tlv_type == 0) {
+            if (mandatory_stage != 3 || tlv_len != 0) return false;
+            have_end = true;
+            break;
+        }
+        
+        // Extract High-Information TLVs (Port Desc, Sys Name, Sys Desc)
+        if (tlv_type == 4 || tlv_type == 5 || tlv_type == 6) {
+            const char* label = (tlv_type == 4) ? "[Port: " : (tlv_type == 5) ? "[Name: " : "[Desc: ";
+            size_t label_len = strlen(label);
+            
+            // Atomic check: Ensure space for label + at least 1 char + "] " + '\0'
+            size_t min_required = label_len + 4; 
+            
+            if (pos < max_out && (max_out - pos) >= min_required) {
+                append_str(label);
+                
+                size_t available = max_out - pos - 3; // Reserve space for "] \0"
+                size_t copy_len = std::min((size_t)tlv_len, available);
+                
+                for (size_t i = 0; i < copy_len; i++) {
+                    uint8_t c = payload[offset + i];
+                    out_buf[pos++] = (c >= 32 && c <= 126) ? (char)c : '.';
+                }
+                out_buf[pos] = '\0';
+                
+                append_str("] ");
+            }
+        }
+        
+        offset += tlv_len;
+    }
+
+    // Fail if the frame didn't cleanly terminate with a Type 0 TLV
+    if (!have_end) {
+        return false;
+    }
+
+    return (pos > 6);
+}
+
+static bool cdp_checksum_valid(const uint8_t* p, uint16_t length) {
+    if (!p || length < 4) return false;
+
+    uint32_t sum = 0;
+
+    for (uint16_t i = 0; i + 1 < length; i += 2) {
+        sum += ((uint16_t)p[i] << 8) | p[i + 1];
+
+        while (sum >> 16) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+    }
+
+    if (length & 1) {
+        sum += (uint16_t)p[length - 1] << 8;
+        while (sum >> 16) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+    }
+
+    return (sum & 0xFFFF) == 0xFFFF;
+}
+
+// --- Memory-Safe CDP (Cisco Discovery Protocol) Parser ---
+static bool parse_cdp(const uint8_t* payload, uint16_t length, char* out_buf, size_t max_out) {
+    if (!payload || !out_buf || length < 8 || max_out < 8) return false;
+    
+    out_buf[0] = '\0';
+    uint16_t offset = 0;
+    size_t pos = 0;
+
+    auto append_str = [&](const char* str) -> bool {
+        size_t len = strlen(str);
+        if (pos >= max_out) return false;
+        
+        size_t available = max_out - pos - 1; 
+        if (len > available) return false;
+
+        memcpy(out_buf + pos, str, len);
+        pos += len;
+        out_buf[pos] = '\0';
+        return true;
+    };
+
+    // Skip LLC/SNAP if present (AA AA 03 00 00 0C 20 00)
+    if (payload[0] == 0xAA && payload[1] == 0xAA && payload[2] == 0x03) {
+        if (length >= 8 && payload[3] == 0x00 && payload[4] == 0x00 && payload[5] == 0x0C && 
+            payload[6] == 0x20 && payload[7] == 0x00) {
+            offset += 8;
+        } else {
+            return false;
+        }
+    }
+
+    // CDP Header Validation (Version, TTL, Checksum)
+    if (length - offset < 4) return false;
+    
+    uint8_t version = payload[offset];
+    uint8_t ttl = payload[offset + 1];
+    
+    if (version != 1 && version != 2) return false;
+    if (ttl == 0) return false;
+    
+    // Strict checksum validation over the CDP frame
+    if (!cdp_checksum_valid(payload + offset, length - offset)) return false;
+    
+    offset += 4;
+
+    if (!append_str("CDP: ")) return false;
+
+    // TLV Walk
+    while (length - offset >= 4) {
+        uint16_t tlv_type = (payload[offset] << 8) | payload[offset + 1];
+        uint16_t tlv_len  = (payload[offset + 2] << 8) | payload[offset + 3];
+        
+        if (tlv_len < 4 || tlv_len > length - offset) return false; 
+
+        uint16_t val_len = tlv_len - 4;
+        uint16_t val_offset = offset + 4;
+
+        // Expanded OSINT Extraction
+        if (tlv_type == 0x01 || tlv_type == 0x03 || tlv_type == 0x05 || 
+            tlv_type == 0x06 || tlv_type == 0x09 || tlv_type == 0x0A || tlv_type == 0x0B) {
+            
+            const char* label = (tlv_type == 0x01) ? "[Dev: " : 
+                                (tlv_type == 0x03) ? "[Port: " : 
+                                (tlv_type == 0x05) ? "[SW: "  : 
+                                (tlv_type == 0x06) ? "[Plat: " :
+                                (tlv_type == 0x09) ? "[VTP: " :
+                                (tlv_type == 0x0A) ? "[VLAN: " : "[Duplex: ";
+            
+            size_t label_len = strlen(label);
+            size_t min_required = label_len + 4; 
+            
+            if (pos < max_out && (max_out - pos) >= min_required) {
+                append_str(label);
+                
+                size_t available = max_out - pos - 3; 
+                size_t copy_len = std::min((size_t)val_len, available);
+                
+                for (size_t i = 0; i < copy_len; i++) {
+                    uint8_t c = payload[val_offset + i];
+                    // Sanitize logic now includes tabs
+                    if (c == '\r' || c == '\n' || c == '\t') {
+                        out_buf[pos++] = ' ';
+                    } else {
+                        out_buf[pos++] = (c >= 32 && c <= 126) ? (char)c : '.';
+                    }
+                }
+                out_buf[pos] = '\0';
+                append_str("] ");
+            }
+        }
+        offset += tlv_len;
+    }
+
+    // Every byte must belong to a complete TLV sequence
+    if (offset != length) return false;
+
+    return (pos > 5); 
+}
+
 // ---------------------------------------------------------
 // TINY JSON EXTRACTOR (No dynamic memory required)
 // ---------------------------------------------------------
@@ -6993,6 +7204,15 @@ if (captured_protocol == 6 &&
   }
 }
 
+static bool is_lldp_multicast(const uint8_t* mac) {
+    return mac && mac[0] == 0x01 && mac[1] == 0x80 && mac[2] == 0xC2 && 
+           mac[3] == 0x00 && mac[4] == 0x00 && mac[5] == 0x0E;
+}
+static bool is_cdp_multicast(const uint8_t* mac) {
+    // 01:00:0C:CC:CC:CC is the dedicated Cisco CDP/VTP multicast address
+    return mac && mac[0] == 0x01 && mac[1] == 0x00 && mac[2] == 0x0C && 
+           mac[3] == 0xCC && mac[4] == 0xCC && mac[5] == 0xCC;
+}
 
 void processLiveDumpQueue() {
     if (liveDumpQueue == NULL) return;
@@ -7033,6 +7253,18 @@ void processLiveDumpQueue() {
                 if (custom_extracted && (strstr(temp_text, "M1") || strstr(temp_text, "M2") || 
                                          strstr(temp_text, "M3") || strstr(temp_text, "M4"))) {
                     l2_cap.is_high_value = true;
+                }
+            }
+            else if (is_cdp_multicast(l2_cap.dst_mac)) {
+                custom_extracted = parse_cdp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+                if (custom_extracted) {
+                    l2_cap.is_high_value = true; 
+                }
+            }
+            else if (l2_cap.ether_type == 0x88CC || is_lldp_multicast(l2_cap.dst_mac)) {
+                custom_extracted = parse_lldp(l2_cap.raw_payload, l2_cap.payload_len, temp_text, MAX_LEAK_STR_LEN);
+                if (custom_extracted) {
+                    l2_cap.is_high_value = true; 
                 }
             }
             else if (l2_cap.dst_port == 67 || l2_cap.dst_port == 68) {
@@ -7148,61 +7380,107 @@ void processLiveDumpQueue() {
             }
 
             // TLS Diagnostic Walker
-            if (!custom_extracted && l2_cap.protocol == 6 && (l2_cap.src_port == 443 || l2_cap.dst_port == 443) && len > 5) {
-                uint16_t offset = 0;
-                bool found_tls = false;
+if (!custom_extracted &&
+    l2_cap.protocol == 6 &&
+    (l2_cap.src_port == 443 || l2_cap.dst_port == 443) &&
+    len > 0) {
 
-                // FIXED: Clarified intent. Walk consecutive TLS records beginning at the TCP payload boundary.
-                while (offset + 5 <= len) {
-                    uint8_t rec_type = p[offset];
-                    uint16_t rec_version = (p[offset+1] << 8) | p[offset+2];
-                    uint16_t rec_len = (p[offset+3] << 8) | p[offset+4];
+    uint16_t offset = 0;
+    bool found_tls = false;
 
-                    if (rec_type >= 0x14 && rec_type <= 0x17 && 
-                       (rec_version == 0x0301 || rec_version == 0x0302 || rec_version == 0x0303)) {
-                        
-                        found_tls = true;
-                        Serial.printf("\n[TLS-RECORD] offset=%u type=%02X version=%04X len=%u\n", 
-                                      offset, rec_type, rec_version, rec_len);
+    // ---------------------------------------------------------
+    // 1. Walk TLS records that begin at this TCP payload boundary
+    // ---------------------------------------------------------
+    while (offset + 5 <= len) {
+        uint8_t rec_type = p[offset];
+        uint16_t rec_version = ((uint16_t)p[offset + 1] << 8) | p[offset + 2];
+        uint16_t rec_len = ((uint16_t)p[offset + 3] << 8) | p[offset + 4];
 
-                        if (rec_type == 0x16 && offset + 5 < len) {
-                            uint8_t hs_type = p[offset + 5];
-                            const char* hs_str = "Unknown";
-                            
-                            if (hs_type == 0x01) hs_str = "ClientHello";
-                            else if (hs_type == 0x02) hs_str = "ServerHello";
-                            else if (hs_type == 0x0B) hs_str = "Certificate";
-                            else if (hs_type == 0x0E) hs_str = "ServerHelloDone";
-                            else if (hs_type == 0x10) hs_str = "ClientKeyExchange";
-                            
-                            Serial.printf("  -> [TLS-HS] type=%02X %s\n", hs_type, hs_str);
-                            
-                            // FIXED: Clarified that this proves truncation in the capture, not necessarily TCP segmentation
-                            if (hs_type == 0x0B && (offset + 5 + rec_len > len)) {
-                                Serial.printf("  -> [TLS-FRAG] Warning: Certificate record extends beyond this TCP segment!\n");
-                            }
-                        }
+        if (rec_type >= 0x14 && rec_type <= 0x17 &&
+            (rec_version == 0x0301 ||
+             rec_version == 0x0302 ||
+             rec_version == 0x0303)) {
 
-                        if (offset + 5 + rec_len > len) break;
-                        offset += 5 + rec_len;
-                    } else {
-                        break;
-                    }
-                }
+            found_tls = true;
 
-                if (found_tls) {
-                    custom_extracted = parse_tls_sni(p, len, temp_text, MAX_LEAK_STR_LEN);
-                    if (!custom_extracted) {
-                        custom_extracted = parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
-                        if (custom_extracted) l2_cap.is_high_value = true;
-                    }
+            Serial.printf(
+                "\n[TLS-RECORD] offset=%u type=%02X version=%04X len=%u\n",
+                offset, rec_type, rec_version, rec_len
+            );
 
-                    if (!custom_extracted) {
-                        snprintf(temp_text, MAX_LEAK_STR_LEN, "TLS Encrypted Traffic (Port %u)", l2_cap.dst_port == 443 ? l2_cap.src_port : l2_cap.dst_port);
-                        custom_extracted = true;
-                    }
+            if (rec_type == 0x16 && offset + 5 < len) {
+                uint8_t hs_type = p[offset + 5];
+                const char* hs_str = "Unknown";
+
+                if (hs_type == 0x01) hs_str = "ClientHello";
+                else if (hs_type == 0x02) hs_str = "ServerHello";
+                else if (hs_type == 0x0B) hs_str = "Certificate";
+                else if (hs_type == 0x0E) hs_str = "ServerHelloDone";
+                else if (hs_type == 0x10) hs_str = "ClientKeyExchange";
+
+                Serial.printf(
+                    "  -> [TLS-HS] type=%02X %s\n",
+                    hs_type, hs_str
+                );
+
+                if (hs_type == 0x0B &&
+                    rec_len > len - offset - 5) {
+                    Serial.printf(
+                        "  -> [TLS-FRAG] Warning: Certificate record extends beyond this TCP segment!\n"
+                    );
                 }
             }
+
+            // Subtraction-safe boundary check
+            if (rec_len > len - offset - 5)
+                break;
+
+            offset += 5 + rec_len;
+        } else {
+            break;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 2. Parse information from recognized TLS records
+    // ---------------------------------------------------------
+    if (found_tls) {
+        custom_extracted =
+            parse_tls_sni(p, len, temp_text, MAX_LEAK_STR_LEN);
+
+        if (!custom_extracted) {
+            custom_extracted =
+                parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
+
+            if (custom_extracted)
+                l2_cap.is_high_value = true;
+        }
+
+        if (!custom_extracted) {
+            snprintf(
+                temp_text,
+                MAX_LEAK_STR_LEN,
+                "TLS Encrypted Traffic (Port %u)",
+                l2_cap.dst_port == 443 ?
+                    l2_cap.src_port :
+                    l2_cap.dst_port
+            );
+
+            custom_extracted = true;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 3. IMPORTANT: Raw certificate scan for non-header segments
+    // ---------------------------------------------------------
+    if (!custom_extracted) {
+        custom_extracted =
+            parse_tls_cert(p, len, temp_text, MAX_LEAK_STR_LEN);
+
+        if (custom_extracted)
+            l2_cap.is_high_value = true;
+    }
+}
 
             // Other structured deep extractors
             if (!custom_extracted) {
