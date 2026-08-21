@@ -11529,10 +11529,11 @@ void processLeakQueue() {
                 
                 ui_needs_update = true;
             }
-            Serial.printf("🚨 LEAK [%s] | BSSID/SSID: %02X:%02X:%02X:%02X:%02X:%02X | Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) -> Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) | Ch: %u | Text: %s\n",
+            Serial.printf("🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) -> Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) | Ch: %u | Text: %s\n",
               incomingLeak.is_high_value ? "HIGH-VALUE" : "STANDARD",
               incomingLeak.bssid[0], incomingLeak.bssid[1], incomingLeak.bssid[2], 
               incomingLeak.bssid[3], incomingLeak.bssid[4], incomingLeak.bssid[5],
+              (incomingLeak.network_ssid[0] != '\0') ? incomingLeak.network_ssid : "Unknown", // <-- Injected SSID here
               incomingLeak.src_mac[0], incomingLeak.src_mac[1], incomingLeak.src_mac[2], 
               incomingLeak.src_mac[3], incomingLeak.src_mac[4], incomingLeak.src_mac[5],
               incomingLeak.src_ip[0], incomingLeak.src_ip[1], incomingLeak.src_ip[2], incomingLeak.src_ip[3],
