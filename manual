@@ -1,3 +1,48 @@
+Already developed / discussed
+
+You now have parsers for things including:
+
+DHCPv4 / DHCPv6
+DNS/mDNS
+ARP
+ICMPv4 / ICMPv6
+EAPOL
+CDP / LLDP
+NetBIOS / NBDS
+SSDP / UPnP
+HTTP
+WS-Discovery
+IPP
+FTP
+Telnet
+SSH
+SMTP
+SMB
+RTSP
+SNMP
+MQTT
+TFTP
+RDP
+TLS certificate/SNI extraction
+DropBox discovery traffic
+
+And we specifically added/discussed SOCKS/SOCKS5.
+
+Protocols I would still consider adding
+
+The most useful remaining candidates, in my view:
+
+NTP — very cheap parser; useful for identifying time servers and NTP clients.
+LDAP — potentially valuable enterprise/device identity information.
+Kerberos — strong enterprise/network identity signals, although more complex.
+mDNS/LLMNR enhancements — particularly richer hostname/service extraction if your existing parsers are still minimal.
+DHCP option expansion — vendor class, client identifier, hostname, domain search list, etc., if you haven't already incorporated all of these.
+SIP — useful for VoIP discovery and user/device information.
+CoAP — particularly worth doing if you're interested in IoT; you've currently got a static port fingerprint rather than a real parser.
+STUN/TURN — you've got a STUN magic-cookie signature, but a structured parser could extract transaction/mapping information.
+SSDP/UPnP enrichment — you already parse it, but there is room to extract more device/service metadata.
+
+no stream reassembly
 
 TCP SYN (0x02): This is a connection request. If someone on the network is running a stealth port scan (like nmap -sS), they send thousands of SYN packets to various ports without ever actually completing the connection or sending data. Catching these alerts you immediately that a device is mapping the network.
 
