@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "tag221Lookup.h"
 #include "ble_oui.h"
 #include "ble_appearance.h"
@@ -70,12 +71,11 @@ SdFs sd;
 // ==========================================
 // WAVE HOUND LAYER 2 & LIVE DUMP GLOBALS
 // ==========================================
-#define MAX_LEAK_STR_LEN 256
-#define MAX_RETAINED_PAYLOAD 512 
+#define MAX_LEAK_STR_LEN 512
 #define MAX_LIVE_CAPTURE 1536
 #define LIVE_DUMP_QUEUE_DEPTH 10
 #define MAX_ACTIVE_FLOWS 64
-#define MAX_LEAK_SLOTS 25
+#define MAX_LEAK_SLOTS 20
 #define LIVE_DUMP_COOLDOWN_MS 30000 
 #define SEC_COOLDOWN_MS 5000 
 #define ALERT_CACHE_SIZE 8
@@ -140,10 +140,7 @@ LiveCaptureEvent* ptr_core1_evt = nullptr;
 struct Layer2Capture {
     Layer2Meta meta;
     uint16_t   retained_len;                 // bytes retained here (0 when storing parsed text), up to MAX_RETAINED_PAYLOAD
-    union {
-        uint8_t retained_payload[MAX_RETAINED_PAYLOAD];
-        char    text[MAX_LEAK_STR_LEN];
-    };
+    char    text[MAX_LEAK_STR_LEN];
 };
 
 struct LeakHistoryEntry {
@@ -2595,6 +2592,180 @@ static bool extract_header(const char* p, uint16_t length, const char* target, c
 }
 
 // --- The Upgraded Parser ---
+bool parse_http_host(
+    const uint8_t* payload,
+    uint16_t length,
+    char* out_text,
+    size_t max_len
+) {
+    if (length < 16 ||
+        payload == nullptr ||
+        out_text == nullptr ||
+        max_len < 20) {
+        return false;
+    }
+
+    const char* p =
+        reinterpret_cast<const char*>(payload);
+
+    char first_line[128] = {0};
+    char host_domain[64] = {0};
+    char user_agent[64]  = {0};
+    char auth_basic[64]  = {0};
+
+    // -----------------------------------------------------
+    // 1. REQUEST START LINE
+    //
+    // Only parse actual HTTP requests.
+    // HTTP responses deliberately return false so they can
+    // continue to the generic printable-run extractor.
+    // -----------------------------------------------------
+
+    if (memcmp(p, "GET ", 4) == 0 ||
+        memcmp(p, "POST ", 5) == 0 ||
+        memcmp(p, "PUT ", 4) == 0 ||
+        memcmp(p, "HEAD ", 5) == 0) {
+
+        const char* line_end =
+            static_cast<const char*>(
+                memchr(p, '\n', length)
+            );
+
+        if (!line_end) {
+            return false;
+        }
+
+        size_t flen =
+            static_cast<size_t>(line_end - p);
+
+        if (flen > 0 && p[flen - 1] == '\r') {
+            flen--;
+        }
+
+        size_t copy_len =
+            std::min(
+                flen,
+                sizeof(first_line) - 1
+            );
+
+        memcpy(
+            first_line,
+            p,
+            copy_len
+        );
+
+        first_line[copy_len] = '\0';
+
+    } else {
+        // HTTP response or unknown payload.
+        // Deliberately fall through to catch-all.
+        return false;
+    }
+
+    // -----------------------------------------------------
+    // 2. DEEP HEADER EXTRACTION
+    // -----------------------------------------------------
+
+    bool found_host =
+        extract_header(
+            p,
+            length,
+            "Host:",
+            host_domain,
+            sizeof(host_domain)
+        );
+
+    bool found_ua =
+        extract_header(
+            p,
+            length,
+            "User-Agent:",
+            user_agent,
+            sizeof(user_agent)
+        );
+
+    bool found_auth =
+        extract_header(
+            p,
+            length,
+            "Authorization: Basic",
+            auth_basic,
+            sizeof(auth_basic)
+        );
+
+    // -----------------------------------------------------
+    // 3. COMPACT UI STRING
+    // -----------------------------------------------------
+
+    char temp_out[256] = {0};
+
+    // IMPORTANT:
+    // Preserve "HTTP/1.1" in the request line so the
+    // existing High-Value Triage can recognize HTTP.
+    snprintf(
+        temp_out,
+        sizeof(temp_out),
+        "%s",
+        first_line
+    );
+
+    char chunk[128];
+
+    if (found_host) {
+        snprintf(
+            chunk,
+            sizeof(chunk),
+            " [Host: %s]",
+            host_domain
+        );
+
+        strncat(
+            temp_out,
+            chunk,
+            sizeof(temp_out) - strlen(temp_out) - 1
+        );
+    }
+
+    if (found_ua) {
+        snprintf(
+            chunk,
+            sizeof(chunk),
+            " [UA: %s]",
+            user_agent
+        );
+
+        strncat(
+            temp_out,
+            chunk,
+            sizeof(temp_out) - strlen(temp_out) - 1
+        );
+    }
+
+    if (found_auth) {
+        snprintf(
+            chunk,
+            sizeof(chunk),
+            " [Auth: Basic %s]",
+            auth_basic
+        );
+
+        strncat(
+            temp_out,
+            chunk,
+            sizeof(temp_out) - strlen(temp_out) - 1
+        );
+    }
+
+    snprintf(
+        out_text,
+        max_len,
+        "%s",
+        temp_out
+    );
+
+    return true;
+}
+/*
 bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     // --- STEP 0: Standard Entry Guard ---
     if (length < 16 || payload == nullptr || out_text == nullptr || max_len < 20) return false;
@@ -2662,7 +2833,7 @@ bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, si
     snprintf(out_text, max_len, "%s", temp_out);
     return true;
 }
-
+*/
 /*
 bool parse_http_host(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
     if (length < 16) return false;
@@ -4791,94 +4962,542 @@ static bool parse_coap(const uint8_t* payload,
 }
 
 // ---------------------------------------------------------
-// SSDP VERBOSE PARSER (Port 1900)
-// Extracts First Line, HOST, NT/ST, SERVER, USN, LOCATION, CACHE
-// Requires MAX_LEAK_STR_LEN to be at least 256
+// SSDP VERBOSE / SAFE PARSER
+//
+// Handles:
+//   M-SEARCH * HTTP/1.1
+//   NOTIFY * HTTP/1.1
+//   HTTP/1.1 200 OK
+//
+// Extracts useful SSDP/UPnP headers while keeping the
+// resulting string bounded by max_len.
 // ---------------------------------------------------------
-bool parse_ssdp(const uint8_t* payload, uint16_t length, char* out_text, size_t max_len) {
-    if (length < 15) return false;
 
-    // Small stack buffers for each header (limits prevent buffer overflows)
-    char first_line[32] = {0};
-    char host[24] = {0};
-    char target_key[4] = "TGT";
-    char target_val[64] = {0};
-    char server[64] = {0};
-    char usn[64] = {0};
-    char location[64] = {0};
-    char cache_control[24] = {0};
+static void ssdp_copy_trimmed(
+    const char* src,
+    size_t len,
+    char* dst,
+    size_t dst_size
+) {
+    if (!dst || dst_size == 0) return;
 
-    const char* p = (const char*)payload;
+    while (len > 0 &&
+           (*src == ' ' || *src == '\t')) {
+        src++;
+        len--;
+    }
+
+    while (len > 0 &&
+           (src[len - 1] == ' ' ||
+            src[len - 1] == '\t' ||
+            src[len - 1] == '\r')) {
+        len--;
+    }
+
+    size_t n = (len < dst_size - 1) ? len : dst_size - 1;
+
+    if (n > 0) {
+        memcpy(dst, src, n);
+    }
+
+    dst[n] = '\0';
+}
+
+static void ssdp_append(
+    char* out,
+    size_t max_len,
+    size_t& used,
+    const char* fmt,
+    ...
+) {
+    if (!out || max_len == 0 || used >= max_len - 1) return;
+
+    va_list args;
+    va_start(args, fmt);
+
+    int written = vsnprintf(
+        out + used,
+        max_len - used,
+        fmt,
+        args
+    );
+
+    va_end(args);
+
+    if (written <= 0) return;
+
+    size_t remaining = max_len - used - 1;
+
+    if ((size_t)written > remaining) {
+        used = max_len - 1;
+    } else {
+        used += (size_t)written;
+    }
+}
+
+bool parse_ssdp(
+    const uint8_t* payload,
+    uint16_t length,
+    char* out_text,
+    size_t max_len
+) {
+    if (!payload || !out_text || max_len < 2 || length < 8) {
+        return false;
+    }
+
+    out_text[0] = '\0';
+
+    // -----------------------------------------------------
+    // Local bounded fields
+    // -----------------------------------------------------
+
+    char first_line[40] = {0};
+
+    char host[40]         = {0};
+    char man[40]          = {0};
+    char mx[8]            = {0};
+
+    char target_key[4]    = {0};
+    char target_val[80]   = {0};
+
+    char nts[32]          = {0};
+    char server[80]       = {0};
+    char usn[80]          = {0};
+    char location[100]    = {0};
+    char cache_control[48]= {0};
+    char date[40]         = {0};
+
+    const char* p =
+        reinterpret_cast<const char*>(payload);
+
     const char* end = p + length;
 
-    // 1. Grab First Line (e.g., "NOTIFY * HTTP/1.1")
-    const char* line_end = (const char*)memchr(p, '\n', end - p);
-    if (!line_end) line_end = end;
-    int len = line_end - p;
-    if (len > 0 && *(line_end - 1) == '\r') len--;
-    memcpy(first_line, p, std::min(len, 31));
-    p = line_end + 1;
+    // -----------------------------------------------------
+    // 1. FIRST LINE
+    // -----------------------------------------------------
 
-    // 2. Parse Headers
+    const char* line_end =
+        static_cast<const char*>(
+            memchr(p, '\n', end - p)
+        );
+
+    if (!line_end) {
+        line_end = end;
+    }
+
+    size_t line_len =
+        static_cast<size_t>(line_end - p);
+
+    ssdp_copy_trimmed(
+        p,
+        line_len,
+        first_line,
+        sizeof(first_line)
+    );
+
+    // -----------------------------------------------------
+    // 2. CLASSIFY THE START LINE
+    //
+    // We only accept actual SSDP request/notification/
+    // response syntax here.
+    // -----------------------------------------------------
+
+    bool looks_ssdp = false;
+
+    if (strncasecmp(
+            first_line,
+            "M-SEARCH ",
+            9
+        ) == 0) {
+
+        looks_ssdp = true;
+
+    } else if (strncasecmp(
+                   first_line,
+                   "NOTIFY ",
+                   7
+               ) == 0) {
+
+        looks_ssdp = true;
+
+    } else if (strncasecmp(
+                   first_line,
+                   "HTTP/1.1 200",
+                   12
+               ) == 0) {
+
+        looks_ssdp = true;
+
+    } else if (strncasecmp(
+                   first_line,
+                   "HTTP/1.0 200",
+                   12
+               ) == 0) {
+
+        looks_ssdp = true;
+    }
+
+    // Don't parse arbitrary HTTP traffic as SSDP.
+    if (!looks_ssdp) {
+        return false;
+    }
+
+    // Advance beyond first line.
+    p = (line_end < end) ? line_end + 1 : end;
+
+    // -----------------------------------------------------
+    // 3. HEADER WALKER
+    // -----------------------------------------------------
+
     while (p < end) {
-        line_end = (const char*)memchr(p, '\n', end - p);
-        if (!line_end) line_end = end;
-        len = line_end - p;
-        if (len > 0 && *(line_end - 1) == '\r') len--;
 
-        if (len > 0) {
-            const char* colon = (const char*)memchr(p, ':', len);
-            if (colon) {
-                int k_len = colon - p;
-                const char* v = colon + 1;
-                int v_len = len - (k_len + 1);
-                
-                // Trim leading spaces from the value
-                while (v_len > 0 && *v == ' ') { v++; v_len--; }
+        line_end =
+            static_cast<const char*>(
+                memchr(p, '\n', end - p)
+            );
 
-                // Case-insensitive header matching
-                if (k_len == 4 && strncasecmp(p, "HOST", 4) == 0) {
-                    memcpy(host, v, std::min(v_len, 23));
-                } else if (k_len == 2 && (strncasecmp(p, "NT", 2) == 0 || strncasecmp(p, "ST", 2) == 0)) {
-                    memcpy(target_key, p, 2); target_key[2] = '\0';
-                    memcpy(target_val, v, std::min(v_len, 63));
-                } else if ((k_len == 6 && strncasecmp(p, "SERVER", 6) == 0) || 
-                           (k_len == 10 && strncasecmp(p, "USER-AGENT", 10) == 0)) {
-                    if (server[0] == '\0') memcpy(server, v, std::min(v_len, 63));
-                } else if (k_len == 3 && strncasecmp(p, "USN", 3) == 0) {
-                    memcpy(usn, v, std::min(v_len, 63));
-                } else if ((k_len == 8 && strncasecmp(p, "LOCATION", 8) == 0) || 
-                           (k_len >= 14 && strncasecmp(p, "SECURELOCATION", 14) == 0)) {
-                    if (location[0] == '\0') memcpy(location, v, std::min(v_len, 63));
-                } else if (k_len == 13 && strncasecmp(p, "CACHE-CONTROL", 13) == 0) {
-                    memcpy(cache_control, v, std::min(v_len, 23));
+        if (!line_end) {
+            line_end = end;
+        }
+
+        size_t current_len =
+            static_cast<size_t>(line_end - p);
+
+        // Blank line => end of HTTP-like headers.
+        size_t meaningful_len = current_len;
+
+        while (meaningful_len > 0 &&
+               (p[meaningful_len - 1] == '\r' ||
+                p[meaningful_len - 1] == ' '  ||
+                p[meaningful_len - 1] == '\t')) {
+            meaningful_len--;
+        }
+
+        if (meaningful_len == 0) {
+            break;
+        }
+
+        const char* colon =
+            static_cast<const char*>(
+                memchr(p, ':', meaningful_len)
+            );
+
+        if (colon) {
+
+            size_t key_len =
+                static_cast<size_t>(colon - p);
+
+            const char* value = colon + 1;
+
+            size_t value_len =
+                meaningful_len - key_len - 1;
+
+            // Trim whitespace.
+            while (value_len > 0 &&
+                   (*value == ' ' || *value == '\t')) {
+                value++;
+                value_len--;
+            }
+
+            while (value_len > 0 &&
+                   (value[value_len - 1] == '\r' ||
+                    value[value_len - 1] == ' '  ||
+                    value[value_len - 1] == '\t')) {
+                value_len--;
+            }
+
+            // -------------------------------------------------
+            // HOST
+            // -------------------------------------------------
+            if (key_len == 4 &&
+                strncasecmp(p, "HOST", 4) == 0) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    host, sizeof(host)
+                );
+            }
+
+            // -------------------------------------------------
+            // MAN
+            // -------------------------------------------------
+            else if (key_len == 3 &&
+                     strncasecmp(p, "MAN", 3) == 0) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    man, sizeof(man)
+                );
+            }
+
+            // -------------------------------------------------
+            // MX
+            // -------------------------------------------------
+            else if (key_len == 2 &&
+                     strncasecmp(p, "MX", 2) == 0) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    mx, sizeof(mx)
+                );
+            }
+
+            // -------------------------------------------------
+            // ST / NT
+            // -------------------------------------------------
+            else if (
+                key_len == 2 &&
+                (strncasecmp(p, "ST", 2) == 0 ||
+                 strncasecmp(p, "NT", 2) == 0)
+            ) {
+
+                target_key[0] = p[0];
+                target_key[1] = p[1];
+                target_key[2] = '\0';
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    target_val, sizeof(target_val)
+                );
+            }
+
+            // -------------------------------------------------
+            // NTS
+            // -------------------------------------------------
+            else if (
+                key_len == 3 &&
+                strncasecmp(p, "NTS", 3) == 0
+            ) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    nts, sizeof(nts)
+                );
+            }
+
+            // -------------------------------------------------
+            // SERVER / USER-AGENT
+            // -------------------------------------------------
+            else if (
+                (key_len == 6 &&
+                 strncasecmp(p, "SERVER", 6) == 0) ||
+
+                (key_len == 10 &&
+                 strncasecmp(p, "USER-AGENT", 10) == 0)
+            ) {
+
+                if (server[0] == '\0') {
+                    ssdp_copy_trimmed(
+                        value, value_len,
+                        server, sizeof(server)
+                    );
                 }
             }
+
+            // -------------------------------------------------
+            // USN
+            // -------------------------------------------------
+            else if (
+                key_len == 3 &&
+                strncasecmp(p, "USN", 3) == 0
+            ) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    usn, sizeof(usn)
+                );
+            }
+
+            // -------------------------------------------------
+            // LOCATION / SECURELOCATION
+            // -------------------------------------------------
+            else if (
+                (key_len == 8 &&
+                 strncasecmp(p, "LOCATION", 8) == 0) ||
+
+                (key_len == 14 &&
+                 strncasecmp(p, "SECURELOCATION", 14) == 0)
+            ) {
+
+                if (location[0] == '\0') {
+                    ssdp_copy_trimmed(
+                        value, value_len,
+                        location, sizeof(location)
+                    );
+                }
+            }
+
+            // -------------------------------------------------
+            // CACHE-CONTROL
+            // -------------------------------------------------
+            else if (
+                key_len == 13 &&
+                strncasecmp(p, "CACHE-CONTROL", 13) == 0
+            ) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    cache_control, sizeof(cache_control)
+                );
+            }
+
+            // -------------------------------------------------
+            // DATE
+            // -------------------------------------------------
+            else if (
+                key_len == 4 &&
+                strncasecmp(p, "DATE", 4) == 0
+            ) {
+
+                ssdp_copy_trimmed(
+                    value, value_len,
+                    date, sizeof(date)
+                );
+            }
         }
-        p = line_end + 1;
+
+        p = (line_end < end) ? line_end + 1 : end;
     }
 
-    // 3. UI Optimization: Strip redundant UPnP prefixes
-    char* clean_target = target_val;
-    if (strncmp(target_val, "urn:schemas-upnp-org:device:", 28) == 0) clean_target += 28;
-    else if (strncmp(target_val, "urn:schemas-upnp-org:service:", 29) == 0) clean_target += 29;
+    // -----------------------------------------------------
+    // 4. Clean common UPnP URN prefixes
+    // -----------------------------------------------------
 
-    // 4. Assemble the multiline string exactly as requested
-    int written = snprintf(out_text, max_len, "SSDP %s", first_line);
-    if (host[0]) written += snprintf(out_text + written, max_len - written, " | HOST=%s", host);
-    if (clean_target[0]) written += snprintf(out_text + written, max_len - written, " | %s=%s", target_key, clean_target);
-    
-    if (server[0]) written += snprintf(out_text + written, max_len - written, "\n    SERVER=%s", server);
-    if (usn[0]) written += snprintf(out_text + written, max_len - written, "\n    USN=%s", usn);
-    
-    if (location[0] || cache_control[0]) {
-        written += snprintf(out_text + written, max_len - written, "\n   ");
-        if (location[0]) written += snprintf(out_text + written, max_len - written, " LOCATION=%s", location);
-        if (location[0] && cache_control[0]) written += snprintf(out_text + written, max_len - written, " |");
-        if (cache_control[0]) written += snprintf(out_text + written, max_len - written, " CACHE-CONTROL=%s", cache_control);
+    const char* clean_target = target_val;
+
+    if (strncmp(
+            target_val,
+            "urn:schemas-upnp-org:device:",
+            28
+        ) == 0) {
+
+        clean_target = target_val + 28;
+
+    } else if (strncmp(
+                   target_val,
+                   "urn:schemas-upnp-org:service:",
+                   29
+               ) == 0) {
+
+        clean_target = target_val + 29;
     }
 
-    return true;
+    // -----------------------------------------------------
+    // 5. Assemble compact UI string
+    // -----------------------------------------------------
+
+    size_t used = 0;
+
+    ssdp_append(
+        out_text,
+        max_len,
+        used,
+        "SSDP %s",
+        first_line
+    );
+
+    if (host[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            " | HOST=%s",
+            host
+        );
+    }
+
+    if (target_val[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            " | %s=%s",
+            target_key,
+            clean_target
+        );
+    }
+
+    if (man[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    MAN=%s",
+            man
+        );
+    }
+
+    if (mx[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            " MX=%s",
+            mx
+        );
+    }
+
+    if (nts[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    NTS=%s",
+            nts
+        );
+    }
+
+    if (server[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    SERVER=%s",
+            server
+        );
+    }
+
+    if (usn[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    USN=%s",
+            usn
+        );
+    }
+
+    if (location[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    LOCATION=%s",
+            location
+        );
+    }
+
+    if (cache_control[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    CACHE=%s",
+            cache_control
+        );
+    }
+
+    if (date[0]) {
+        ssdp_append(
+            out_text,
+            max_len,
+            used,
+            "\n    DATE=%s",
+            date
+        );
+    }
+
+    return used > 0;
 }
 
 // ---------------------------------------------------------
@@ -8751,6 +9370,7 @@ void processLiveDumpQueue() {
     int packets_processed = 0; 
     uint32_t start_time = micros();
     static char temp_text[MAX_LEAK_STR_LEN];
+    static char eapol_text[MAX_LEAK_STR_LEN];
     
     // FIXED: Short-circuit evaluation order. Check count BEFORE pulling from the queue.
     while (packets_processed < 5 &&
@@ -8759,29 +9379,84 @@ void processLiveDumpQueue() {
 
         memset(temp_text, 0, sizeof(temp_text));
         bool custom_extracted = false;
+        memset(eapol_text, 0, sizeof(eapol_text));
+        bool eapol_detected = false;
 
-        // =========================================================
-        // --- 0.0 UPNP / SSDP RESPONSE BYPASS (Ephemeral Ports) ---
-        // =========================================================
-        if (live_evt.raw_len > 15 && memcmp(live_evt.raw_payload, "HTTP/1.", 7) == 0) {
-            custom_extracted = parse_ssdp(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
-        }
+        if (live_evt.meta.protocol == 6 ||
+    live_evt.meta.src_port == 80 ||
+    live_evt.meta.dst_port == 80) {
+
+    Serial.printf(
+        "[HTTPDBG] eth=0x%04X ip=%u proto=%u "
+        "src=%u dst=%u flags=0x%02X raw_len=%u | ",
+        live_evt.meta.ether_type,
+        live_evt.meta.ip_version,
+        live_evt.meta.protocol,
+        live_evt.meta.src_port,
+        live_evt.meta.dst_port,
+        live_evt.meta.tcp_flags,
+        live_evt.raw_len
+    );
+
+    for (int i = 0; i < 32 && i < live_evt.raw_len; i++) {
+        uint8_t c = live_evt.raw_payload[i];
+
+        if (c >= 32 && c <= 126)
+            Serial.printf("%c", c);
+        else
+            Serial.printf(".");
+    }
+
+    Serial.println();
+}
 
         // =========================================================
         // --- STRICT PROTOCOL PARSERS ---
         // =========================================================
+        // =========================================================
+        // --- 0.0 UPNP / SSDP RESPONSE BYPASS (UDP Ephemeral) ---
+        // =========================================================
+        // Reinstated: Guarded strictly by UDP (Protocol 17) to prevent
+        // colliding with standard TCP web traffic!
+        if (live_evt.meta.protocol == 17 && 
+            live_evt.raw_len > 15 && 
+            memcmp(live_evt.raw_payload, "HTTP/1.", 7) == 0) {
+            
+            custom_extracted = parse_ssdp(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
+            
+            // Unicast SSDP replies are pure gold. Elevate immediately!
+            if (custom_extracted) {
+                live_evt.meta.is_high_value = true;
+            }
+        }
         // FIXED: The entire chain is now guarded so the SSDP bypass isn't overwritten
         if (!custom_extracted) {
             if (live_evt.meta.ether_type == 0x0806) {
                 custom_extracted = parse_arp(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
             }
             else if (live_evt.meta.ether_type == 0x888E) {
-                custom_extracted = parse_eapol(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
-                if (custom_extracted && (strstr(temp_text, "M1") || strstr(temp_text, "M2") || 
-                                         strstr(temp_text, "M3") || strstr(temp_text, "M4"))) {
-                    live_evt.meta.is_high_value = true;
-                }
-            }
+
+    eapol_detected = parse_eapol(
+        live_evt.raw_payload,
+        live_evt.raw_len,
+        eapol_text,
+        MAX_LEAK_STR_LEN
+    );
+
+    // Preserve the existing M1/M2/M3/M4 detection exactly.
+    if (eapol_detected &&
+        (strstr(eapol_text, "M1") ||
+         strstr(eapol_text, "M2") ||
+         strstr(eapol_text, "M3") ||
+         strstr(eapol_text, "M4"))) {
+
+        live_evt.meta.is_high_value = true;
+    }
+
+    // Deliberately do NOT set custom_extracted here.
+    // The packet should continue into the deeper/catch-all
+    // payload inspection below.
+}
             else if (is_cdp_multicast(live_evt.meta.dst_mac)) {
                 custom_extracted = parse_cdp(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
                 if (custom_extracted) {
@@ -8812,7 +9487,8 @@ void processLiveDumpQueue() {
                      live_evt.meta.dst_port == 5353 || live_evt.meta.src_port == 5353) {
                 custom_extracted = parse_dns_mdns(live_evt.raw_payload, live_evt.raw_len, live_evt.meta.dst_port == 5353 || live_evt.meta.src_port == 5353, temp_text, MAX_LEAK_STR_LEN);
             }
-            else if (live_evt.meta.dst_port == 80) {
+            else if (live_evt.meta.dst_port == 80 ||
+                     live_evt.meta.src_port == 80) {
                 custom_extracted = parse_http_host(live_evt.raw_payload, live_evt.raw_len, temp_text, MAX_LEAK_STR_LEN);
                 if (custom_extracted && strstr(temp_text, "[Auth: Basic ")) live_evt.meta.is_high_value = true;
             }
@@ -9055,27 +9731,57 @@ if (!custom_extracted &&
                     custom_extracted = true;
                     live_evt.meta.is_high_value = true;
                 }
-                else if ((len >= 4 && (memcmp(p, "GET ", 4) == 0 || memcmp(p, "PUT ", 4) == 0)) || 
-                         (len >= 5 && (memcmp(p, "POST ", 5) == 0 || memcmp(p, "HEAD ", 5) == 0))) {
-                    
-                    custom_extracted = parse_http_host(p, len, temp_text, MAX_LEAK_STR_LEN);
-                    if (custom_extracted) {
-                        if (strstr(temp_text, "[Auth: Basic ")) live_evt.meta.is_high_value = true;
-                    } else {
-                        snprintf(temp_text, MAX_LEAK_STR_LEN, "HTTP Request (Hidden Port)");
-                        custom_extracted = true;
-                    }
-                }
-                else if (len >= 20 && p[0] == 0x13 && memcmp(&p[1], "BitTorrent protocol", 19) == 0) {
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "P2P: BitTorrent Handshake");
-                    custom_extracted = true;
-                    live_evt.meta.is_high_value = true;
-                }
-                else if (len == 148 && p[0] == 0x01 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x00) {
-                    snprintf(temp_text, MAX_LEAK_STR_LEN, "VPN: WireGuard Handshake");
-                    custom_extracted = true;
-                    live_evt.meta.is_high_value = true;
-                }
+                else if ((len >= 4 &&
+          (memcmp(p, "GET ", 4) == 0 ||
+           memcmp(p, "PUT ", 4) == 0)) ||
+         (len >= 5 &&
+          (memcmp(p, "POST ", 5) == 0 ||
+           memcmp(p, "HEAD ", 5) == 0))) {
+
+    custom_extracted =
+        parse_http_host(p, len, temp_text, MAX_LEAK_STR_LEN);
+
+    if (custom_extracted) {
+        if (strstr(temp_text, "[Auth: Basic ")) {
+            live_evt.meta.is_high_value = true;
+        }
+    } else {
+        snprintf(
+            temp_text,
+            MAX_LEAK_STR_LEN,
+            "HTTP Request (Hidden Port)"
+        );
+        custom_extracted = true;
+    }
+}
+
+else if (len >= 20 &&
+         p[0] == 0x13 &&
+         memcmp(&p[1], "BitTorrent protocol", 19) == 0) {
+
+    snprintf(
+        temp_text,
+        MAX_LEAK_STR_LEN,
+        "P2P: BitTorrent Handshake"
+    );
+    custom_extracted = true;
+    live_evt.meta.is_high_value = true;
+}
+
+else if (len == 148 &&
+         p[0] == 0x01 &&
+         p[1] == 0x00 &&
+         p[2] == 0x00 &&
+         p[3] == 0x00) {
+
+    snprintf(
+        temp_text,
+        MAX_LEAK_STR_LEN,
+        "VPN: WireGuard Handshake"
+    );
+    custom_extracted = true;
+    live_evt.meta.is_high_value = true;
+}
             }
 
             if (!custom_extracted) {
@@ -9131,6 +9837,16 @@ if (!custom_extracted &&
                 Serial.println();
             }
         }
+        // =========================================================
+// --- EAPOL FALLBACK ---
+// If no deeper payload extraction succeeded, preserve the
+// normal EAPOL classification.
+// =========================================================
+if (!custom_extracted && eapol_detected) {
+    strncpy(temp_text, eapol_text, MAX_LEAK_STR_LEN - 1);
+    temp_text[MAX_LEAK_STR_LEN - 1] = '\0';
+    custom_extracted = true;
+}
 
         // ==========================================
 // --- UI ROUTING ---
@@ -9142,37 +9858,20 @@ if (custom_extracted) {
     // =========================================================
     Layer2Capture l2_cap;
     memset(&l2_cap, 0, sizeof(Layer2Capture));
+
     // Copy packet metadata from the full-payload transport event
     l2_cap.meta = live_evt.meta;
 
-/*
-    l2_cap.timestamp     = live_evt.timestamp;
-    l2_cap.flow_hash     = live_evt.flow_hash;
+    // =========================================================
+    // Copy parsed text into persistent storage.
+    // MAX_LEAK_STR_LEN includes the terminating NUL.
+    // =========================================================
+    size_t text_len = strnlen(temp_text, MAX_LEAK_STR_LEN - 1);
 
-    l2_cap.src_port      = live_evt.src_port;
-    l2_cap.dst_port      = live_evt.dst_port;
-    l2_cap.frame_length  = live_evt.frame_length;
-    l2_cap.ether_type    = live_evt.ether_type;
+    l2_cap.retained_len = (uint16_t)text_len; // <--- INJECT THIS LINE
 
-    l2_cap.ip_version    = live_evt.ip_version;
-    l2_cap.protocol      = live_evt.protocol;
-    l2_cap.channel       = live_evt.channel;
-    l2_cap.direction     = live_evt.direction;
-    l2_cap.frame_subtype = live_evt.frame_subtype;
-    l2_cap.tcp_flags     = live_evt.tcp_flags;
-    l2_cap.is_high_value = live_evt.is_high_value;
-
-    // Copy addresses
-    memcpy(l2_cap.src_ip,  live_evt.src_ip,  16);
-    memcpy(l2_cap.dst_ip,  live_evt.dst_ip,  16);
-    memcpy(l2_cap.src_mac, live_evt.src_mac, 6);
-    memcpy(l2_cap.dst_mac, live_evt.dst_mac, 6);
-    memcpy(l2_cap.bssid,   live_evt.bssid,   6);
-*/
-    // IMPORTANT:
-    // payload_len refers to bytes retained in Layer2Capture.
-    // We are storing the parsed TEXT, not the full raw payload.
-    l2_cap.retained_len = 0;
+    memcpy(l2_cap.text, temp_text, text_len);
+    l2_cap.text[text_len] = '\0';
 
     // =========================================================
     // High-Value Triage
@@ -9193,13 +9892,21 @@ if (custom_extracted) {
         strcasestr(temp_text, "tasmota")) {
 
         l2_cap.meta.is_high_value = true;
-    }
+
+       // if (leakQueue != NULL) {
+       //     leak_core1_attempts++;
+
+       // if (xQueueSend(leakQueue, &l2_cap, 0) != pdTRUE) {
+       //     leak_core1_dropped++;
+       // }
+     //}
+   }
 
     // =========================================================
     // Copy final parsed text into the compact UI union
     // =========================================================
-    strncpy(l2_cap.text, temp_text, MAX_LEAK_STR_LEN - 1);
-    l2_cap.text[MAX_LEAK_STR_LEN - 1] = '\0';
+    //strncpy(l2_cap.text, temp_text, MAX_LEAK_STR_LEN - 1);
+    //l2_cap.text[MAX_LEAK_STR_LEN - 1] = '\0';
 
     // =========================================================
     // Send compact object to the UI/history pipeline
@@ -10232,9 +10939,8 @@ void drawDeviceList() {
   tft.setTextSize(1);
 
   // ==========================================
-  // DYNAMIC PAGINATION MATH
+  // 1. DEVICE COUNTING
   // ==========================================
-  int items_per_page = (currentRadioMode == RADIO_LAYER2) ? 3 : 7; 
   int total_devices = 0;
   
   if (currentRadioMode == RADIO_WIFI) total_devices = sessionMacCount;
@@ -10248,36 +10954,92 @@ void drawDeviceList() {
   }
 
   // ==========================================
-  // DRAW TOP BANNER (WITH FOXHUNT OVERRIDE)
+  // 2. DYNAMIC PAGINATION MATH
+  // ==========================================
+  int start_idx = 0;
+  int end_idx = 0;
+  bool has_next_page = false;
+
+  // DECLARE IN OUTER SCOPE SO RENDERER CAN SEE THEM!
+  int valid_indices[MAX_LEAK_SLOTS] = {0}; 
+  int valid_count = 0;
+
+  if (currentRadioMode == RADIO_LAYER2) {
+      // --- 1. GATHER LOGICAL ENTRIES ---
+      for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+          if (leakHistory[i].leak.meta.timestamp > 0) {
+              valid_indices[valid_count++] = i;
+          }
+      }
+
+      // --- 2. DYNAMIC L2 "SNUG" PACKING ---
+      const int maxChars = 58;
+      int page_starts[MAX_LEAK_SLOTS] = {0}; // FRIEND'S FIX: Eliminated the arbitrary 15
+      int total_pages = 0;
+      int test_y = 32;
+
+      for (int v = 0; v < valid_count; v++) {
+          int idx = valid_indices[v];
+          int pLen = leakHistory[idx].leak.retained_len;
+
+          // FRIEND'S FIX: Defensive clamping for the packing math
+          if (pLen > MAX_LEAK_STR_LEN - 1) pLen = MAX_LEAK_STR_LEN - 1;
+
+          // Dynamically scale up to 9 lines (512 bytes / 58 chars)
+          int n_lines = (pLen > 0) ? ((pLen - 1) / maxChars) + 1 : 1;
+          if (n_lines > 9) n_lines = 9;
+
+          int item_h = 42 + (n_lines * 14) + 5; 
+
+          if (test_y + item_h > 290) { 
+              if (total_pages < MAX_LEAK_SLOTS - 1) { // Prevents out-of-bounds on page_starts
+                  total_pages++;
+                  page_starts[total_pages] = v; 
+              }
+              test_y = 32 + item_h; 
+          } else {
+              test_y += item_h; 
+          }
+      }
+
+      if (device_current_page > total_pages) device_current_page = total_pages;
+      start_idx = page_starts[device_current_page];
+      end_idx = (device_current_page < total_pages) ? page_starts[device_current_page + 1] : valid_count;
+      has_next_page = (device_current_page < total_pages);
+      
+  } else {
+      // --- FIXED GRID PACKING (WIFI/AP/BLE/CHANNELS) ---
+      int items_per_page = 7;
+      start_idx = device_current_page * items_per_page;
+      if (start_idx >= total_devices) {
+          device_current_page = 0;
+          start_idx = 0;
+      }
+      end_idx = start_idx + items_per_page;
+      if (end_idx > total_devices) end_idx = total_devices;
+      has_next_page = (((device_current_page + 1) * items_per_page) < total_devices);
+  }
+
+  // ==========================================
+  // 3. DRAW TOP BANNER (WITH FOXHUNT OVERRIDE)
   // ==========================================
   tft.setTextColor(TFT_WHITE);
   tft.setFreeFont(&UbuntuMono_B9pt7b);
   
   if (is_selecting_target) {
-    // TACTICAL MODE HEADER (Red Alert)
     tft.fillRect(0, 0, 480, 24, TFT_RED); 
     char huntStr[64];
     const char* modeName = (currentRadioMode == RADIO_WIFI) ? "WI-FI" : (currentRadioMode == RADIO_BLE) ? "BLE" : "NETWORKS";
     snprintf(huntStr, sizeof(huntStr), " FOXHUNT TARGET (%s)", modeName);
     tft.drawString(huntStr, 5, 5);
   } else {
-    // NORMAL MODE HEADER (Dynamic Colors)
     uint16_t headerColor = TFT_BLUE;
     const char* modeStr = "WI-FI";
     
-    if (currentRadioMode == RADIO_BLE) {
-        headerColor = TFT_PURPLE;
-        modeStr = "BLE";
-    } else if (currentRadioMode == RADIO_AP) {
-        headerColor = TFT_DARKGREEN;
-        modeStr = "NETWORKS";
-    } else if (currentRadioMode == RADIO_CHANNELS) {
-        headerColor = TFT_ORANGE;
-        modeStr = "CHANNELS";
-    } else if (currentRadioMode == RADIO_LAYER2) {
-        headerColor = TFT_MAROON;
-        modeStr = "LAYER 2 LEAKS";
-    }
+    if (currentRadioMode == RADIO_BLE) { headerColor = TFT_PURPLE; modeStr = "BLE"; } 
+    else if (currentRadioMode == RADIO_AP) { headerColor = TFT_DARKGREEN; modeStr = "NETWORKS"; } 
+    else if (currentRadioMode == RADIO_CHANNELS) { headerColor = TFT_ORANGE; modeStr = "CHANNELS"; } 
+    else if (currentRadioMode == RADIO_LAYER2) { headerColor = TFT_MAROON; modeStr = "LAYER 2 LEAKS"; }
     
     tft.fillRect(0, 0, 480, 24, headerColor);
     char headerStr[64];
@@ -10286,7 +11048,7 @@ void drawDeviceList() {
   } 
 
   // ==========================================
-  // DYNAMIC SORT BUTTONS (RIGHT-ALIGNED IN HEADER)
+  // 4. DYNAMIC SORT BUTTONS
   // ==========================================
   tft.setFreeFont(&UbuntuMono_Regular9pt7b);
   char metricStr[32] = "SORT:ERR";
@@ -10320,13 +11082,11 @@ void drawDeviceList() {
     else if (currentLeakSort == SORT_LEAK_HITS) { strcpy(metricStr, "SORT:HITS"); metricColor = TFT_WHITE; }
   }
 
-  // Draw Metric Button Outline and Text
   tft.fillRoundRect(275, 2, 130, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(275, 2, 130, 20, 3, TFT_WHITE);
   tft.setTextColor(metricColor);
   tft.drawString(metricStr, 282, 4);
 
-  // Draw Direction Button Outline and Text
   tft.fillRoundRect(410, 2, 65, 20, 3, TFT_BLACK); 
   tft.drawRoundRect(410, 2, 65, 20, 3, TFT_WHITE);
   
@@ -10338,25 +11098,15 @@ void drawDeviceList() {
     tft.drawString("ASC", 427, 4);
   }
   
-  // Reset for the rest of the list
   tft.setTextColor(TFT_WHITE);
 
   if (total_devices == 0) {
     tft.setFreeFont(&UbuntuMono_Regular9pt7b);
     tft.drawString("No devices captured yet.", 5, 45);
   } else {
-    int start_idx = device_current_page * items_per_page;
-    if (start_idx >= total_devices) {
-      device_current_page = 0;
-      start_idx = 0;
-    }
-    int end_idx = start_idx + items_per_page;
-    if (end_idx > total_devices) end_idx = total_devices;
-
     // ==========================================
-    // DRAW THE UNIFIED DUAL COLUMN HEADERS
+    // 5. DRAW THE UNIFIED DUAL COLUMN HEADERS
     // ==========================================
-    // Hide headers for Layer 2 to make room for the 5-line display
     if (currentRadioMode != RADIO_LAYER2) {
         tft.setTextColor(TFT_GREEN);
         if (currentRadioMode == RADIO_WIFI) {
@@ -10388,20 +11138,20 @@ void drawDeviceList() {
     }
 
     // ==========================================
-    // DRAW THE DATA ROWS
+    // 6. DRAW THE DATA ROWS
     // ==========================================
     int row = 0;
-    int y_spacing = (currentRadioMode == RADIO_LAYER2) ? 80 : 33;
     int base_y = (currentRadioMode == RADIO_LAYER2) ? 32 : 62;
+    int y_spacing = 33; // Fixed spacing for all non-L2 modes
+    int dyn_y = base_y; // Dynamic tracker exclusively for L2 mode
 
     for (int i = start_idx; i < end_idx; i++) {
       
-      int y = base_y + (row * y_spacing); 
+      // Select the correct Y coordinate based on the mode
+      int y = (currentRadioMode == RADIO_LAYER2) ? dyn_y : (base_y + (row * y_spacing)); 
       
       if (currentRadioMode == RADIO_WIFI) {
-        // ==========================================
-        // WIFI MODE - UI LAYOUT
-        // ==========================================
+        // ... [WIFI MODE LOGIC REMAINS UNCHANGED] ...
         char line1[90]; char line2[90];
         resolveMacVendor(&sessionData[i]);
 
@@ -10462,9 +11212,7 @@ void drawDeviceList() {
         tft.setTextColor(TFT_WHITE);      
         
       } else if (currentRadioMode == RADIO_BLE) {
-        // ==========================================
-        // BLE MODE - JIT TRANSLATION & DISPLAY
-        // ==========================================
+        // ... [BLE MODE LOGIC REMAINS UNCHANGED] ...
         char line1[90]; 
         char safeName[20];
         
@@ -10540,9 +11288,7 @@ void drawDeviceList() {
         tft.setTextColor(TFT_WHITE);
 
       } else if (currentRadioMode == RADIO_AP) {
-        // ==========================================
-        // AP MODE - NETWORKS SNIFF LIST
-        // ==========================================
+        // ... [AP MODE LOGIC REMAINS UNCHANGED] ...
         char line1[90];
         char line2[90];
 
@@ -10620,9 +11366,7 @@ void drawDeviceList() {
         tft.setTextColor(TFT_WHITE); 
       }
       else if (currentRadioMode == RADIO_CHANNELS) {
-        // ==========================================
-        // CHANNELS MODE - NETWORKS SNIFF LIST
-        // ==========================================
+        // ... [CHANNELS MODE LOGIC REMAINS UNCHANGED] ...
         char line1[90];
         char line2[90];
 
@@ -10686,129 +11430,149 @@ void drawDeviceList() {
         tft.setTextColor(TFT_WHITE); 
       }
       else if (currentRadioMode == RADIO_LAYER2) {
+        // Map our logical loop variable 'i' back to the real array index!
+        int real_idx = valid_indices[i];
+        auto& lk = leakHistory[real_idx].leak;
+
         // ==========================================
-        // LAYER 2 MODE - COMPACT 5-LINE RENDERING
+        // LAYER 2 MODE - DYNAMIC 1 TO 3 LINE RENDERING
         // ==========================================
         char line1[90], line2[90], line3[90];
 
-        // 1. Age Combo
-        char firstSeenStr[8], lastSeenStr[8], ageCombo[18]; // Bumped to 18 to be safe
-        getAgeString(leakHistory[i].first_seen, firstSeenStr, sizeof(firstSeenStr));
-        getAgeString(leakHistory[i].leak.meta.timestamp, lastSeenStr, sizeof(lastSeenStr));
+        char firstSeenStr[8], lastSeenStr[8], ageCombo[18];
+        getAgeString(leakHistory[real_idx].first_seen, firstSeenStr, sizeof(firstSeenStr));
+        getAgeString(lk.meta.timestamp, lastSeenStr, sizeof(lastSeenStr));
         snprintf(ageCombo, sizeof(ageCombo), "%s|%s", firstSeenStr, lastSeenStr); 
 
-        // 2. Live SSID Lookup (Using persistent cache to bypass the union)
         char safeSsid[13] = "Unknown";
         for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
-            if (bssidCache[ap].last_seen == 0) continue; // Skip empty slots
-            
-            if (memcmp(leakHistory[i].leak.meta.bssid, bssidCache[ap].bssid, 6) == 0) {
+            if (bssidCache[ap].last_seen == 0) continue; 
+            if (memcmp(lk.meta.bssid, bssidCache[ap].bssid, 6) == 0) {
                 strncpy(safeSsid, bssidCache[ap].ssid, 12);
                 safeSsid[12] = '\0';
                 break;
             }
         }
         
-        // 3. Format Vendor Strings & Strip Trailing Spaces to save width
         char srcVend[9], dstVend[9];
-        strncpy(srcVend, leakHistory[i].src_vendor, 8); srcVend[8] = '\0';
-        strncpy(dstVend, leakHistory[i].dst_vendor, 8); dstVend[8] = '\0';
+        strncpy(srcVend, leakHistory[real_idx].src_vendor, 8); srcVend[8] = '\0';
+        strncpy(dstVend, leakHistory[real_idx].dst_vendor, 8); dstVend[8] = '\0';
         if(strlen(srcVend) == 0) strcpy(srcVend, "Unknown");
         if(strlen(dstVend) == 0) strcpy(dstVend, "Unknown");
         for (int v = 7; v >= 0; v--) { if (srcVend[v] == ' ') srcVend[v] = '\0'; else break; }
         for (int v = 7; v >= 0; v--) { if (dstVend[v] == ' ') dstVend[v] = '\0'; else break; }
 
-        // --- INLINE FORMATTERS ---
-        // 1. Compact Length (Max 4 chars)
         char lenStr[8];
-        uint16_t fLen = leakHistory[i].leak.meta.frame_length;
+        uint16_t fLen = lk.meta.frame_length;
         if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
         else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
 
-        // 2. Safe IPv6 Buffers (40 bytes to prevent overflow)
         char srcIpStr[40] = {0}, dstIpStr[40] = {0}; 
-        getIpString(leakHistory[i].leak.meta.ip_version, leakHistory[i].leak.meta.src_ip, srcIpStr, sizeof(srcIpStr));
-        getIpString(leakHistory[i].leak.meta.ip_version, leakHistory[i].leak.meta.dst_ip, dstIpStr, sizeof(dstIpStr));
+        getIpString(lk.meta.ip_version, lk.meta.src_ip, srcIpStr, sizeof(srcIpStr));
+        getIpString(lk.meta.ip_version, lk.meta.dst_ip, dstIpStr, sizeof(dstIpStr));
         
-        // 3. IPv6 Shortener (Compresses consecutive and single zero-blocks)
         char* p;
         while ((p = strstr(srcIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
         while ((p = strstr(dstIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
         while ((p = strstr(srcIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
         while ((p = strstr(dstIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
 
-        // --- ROW 1: [xHit] MAC(Vend)>MAC(Vend)|Len|C ---
         snprintf(line1, sizeof(line1), "[x%d]%02X%02X%02X%02X%02X%02X(%s)>%02X%02X%02X%02X%02X%02X(%s)|%s|C%d", 
-                 leakHistory[i].hitCount,
-                 leakHistory[i].leak.meta.src_mac[0], leakHistory[i].leak.meta.src_mac[1], leakHistory[i].leak.meta.src_mac[2],
-                 leakHistory[i].leak.meta.src_mac[3], leakHistory[i].leak.meta.src_mac[4], leakHistory[i].leak.meta.src_mac[5],
-                 srcVend,
-                 leakHistory[i].leak.meta.dst_mac[0], leakHistory[i].leak.meta.dst_mac[1], leakHistory[i].leak.meta.dst_mac[2],
-                 leakHistory[i].leak.meta.dst_mac[3], leakHistory[i].leak.meta.dst_mac[4], leakHistory[i].leak.meta.dst_mac[5],
-                 dstVend, lenStr, leakHistory[i].leak.meta.channel);
+                 leakHistory[real_idx].hitCount,
+                 lk.meta.src_mac[0], lk.meta.src_mac[1], lk.meta.src_mac[2],
+                 lk.meta.src_mac[3], lk.meta.src_mac[4], lk.meta.src_mac[5], srcVend,
+                 lk.meta.dst_mac[0], lk.meta.dst_mac[1], lk.meta.dst_mac[2],
+                 lk.meta.dst_mac[3], lk.meta.dst_mac[4], lk.meta.dst_mac[5], dstVend, lenStr, lk.meta.channel);
 
-        // --- ROW 2: BSSID(SSID)|DIR|SUBTYPE|PROTO|PORTS ---
         char portStr[24] = "";
-        if (leakHistory[i].leak.meta.protocol == 6 || leakHistory[i].leak.meta.protocol == 17) {
-            snprintf(portStr, sizeof(portStr), "|%d>%d", leakHistory[i].leak.meta.src_port, leakHistory[i].leak.meta.dst_port);
+        if (lk.meta.protocol == 6 || lk.meta.protocol == 17) {
+            snprintf(portStr, sizeof(portStr), "|%d>%d", lk.meta.src_port, lk.meta.dst_port);
         }
         snprintf(line2, sizeof(line2), "%02X%02X%02X%02X%02X%02X(%s)|%s|%s|%s%s", 
-                 leakHistory[i].leak.meta.bssid[0], leakHistory[i].leak.meta.bssid[1], leakHistory[i].leak.meta.bssid[2],
-                 leakHistory[i].leak.meta.bssid[3], leakHistory[i].leak.meta.bssid[4], leakHistory[i].leak.meta.bssid[5],
-                 safeSsid,
-                 getDirectionStr(leakHistory[i].leak.meta.direction), 
-                 getSubtypeStr(leakHistory[i].leak.meta.frame_subtype),
-                 getProtocolStr(leakHistory[i].leak.meta.protocol), portStr);
+                 lk.meta.bssid[0], lk.meta.bssid[1], lk.meta.bssid[2],
+                 lk.meta.bssid[3], lk.meta.bssid[4], lk.meta.bssid[5],
+                 safeSsid, getDirectionStr(lk.meta.direction), 
+                 getSubtypeStr(lk.meta.frame_subtype),
+                 getProtocolStr(lk.meta.protocol), portStr);
 
-        // --- ROW 3: IP>IP|first/last ---
-        snprintf(line3, sizeof(line3), "%s>%s|%s",
-                 srcIpStr, dstIpStr, ageCombo);
+        snprintf(line3, sizeof(line3), "%s>%s|%s", srcIpStr, dstIpStr, ageCombo);
 
-        // --- ROW 4 & 5: Sanitize & Split Payload ---
-        char safePayload[130] = {0};
-        strncpy(safePayload, leakHistory[i].leak.text, 128);
-        for (int pt = 0; pt < strlen(safePayload); pt++) {
+        // --- SAFE PAYLOAD SLICING (Explicit memcpy & Clamp) ---
+        int pLen = lk.retained_len; 
+        if (pLen > MAX_LEAK_STR_LEN - 1) {
+            pLen = MAX_LEAK_STR_LEN - 1; // Defensive boundary clamp
+        }
+        
+        char safePayload[MAX_LEAK_STR_LEN + 1] = {0};
+        size_t copyLen = pLen;
+        
+        memcpy(safePayload, lk.text, copyLen);
+        safePayload[copyLen] = '\0'; // Guarantee NUL termination
+
+        // Fast sanitization loop utilizing clamped pLen
+        for (int pt = 0; pt < pLen; pt++) {
             if (safePayload[pt] < 32 || safePayload[pt] > 126) safePayload[pt] = '.';
         }
         
-        // Strict boundary wrap to prevent screen edge clipping (58 chars max per line)
-        int maxChars = 58;
-        char pLine1[65] = {0};
-        char pLine2[65] = {0};
-        strncpy(pLine1, safePayload, maxChars);
-        if (strlen(safePayload) > maxChars) strncpy(pLine2, safePayload + maxChars, maxChars);
+        // --- DYNAMIC PAYLOAD SLICING (Loop-Based up to 9 lines) ---
+        const int maxChars = 58;
+        const int maxLinesAllowed = 9;
+        char pLines[9][60] = {0}; // 2D array to hold up to 9 lines of 59 chars
+        int n_lines = 1;
 
-        // ==========================================
-        // TEXT RENDERING
-        // ==========================================
+        for (int line = 0; line < maxLinesAllowed; line++) {
+            int offset = line * maxChars;
+            if (offset >= pLen) {
+                if (line == 0) n_lines = 1; // Guarantee at least 1 line is counted
+                break;
+            }
+            
+            n_lines = line + 1;
+            int remaining = pLen - offset;
+            
+            if (remaining <= maxChars) {
+                strncpy(pLines[line], safePayload + offset, remaining);
+            } else {
+                // Truncate the final allowed line with +NNN if there's more payload
+                if (line == maxLinesAllowed - 1) {
+                    const int textChars = 54; // Leaves room for the "+NNN" tag
+                    strncpy(pLines[line], safePayload + offset, textChars);
+                    snprintf(pLines[line] + textChars, sizeof(pLines[line]) - textChars, "+%d", remaining - textChars);
+                } else {
+                    strncpy(pLines[line], safePayload + offset, maxChars);
+                }
+            }
+        }
+
+        // --- RENDER DYNAMIC HEIGHT ---
         tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-        
-        // Draw Line 1
         tft.setTextColor(TFT_CYAN);
         tft.drawString(line1, 5, y);
-        
-        // Draw Line 2
         tft.setTextColor(TFT_YELLOW);
         tft.drawString(line2, 5, y + 14);
-        
-        // Draw Line 3
         tft.setTextColor(TFT_ORANGE);
         tft.drawString(line3, 5, y + 28);
         
-        // Draw Payload Lines
         tft.setTextColor(TFT_GREEN);
-        tft.drawString(pLine1, 5, y + 42);
-        if (strlen(pLine2) > 0) {
-            tft.drawString(pLine2, 5, y + 56);
-        }
         
-        tft.setTextColor(TFT_WHITE);
-      }
-      row++;
-    }
-  }
+        // Dynamically print exactly as many lines as this specific packet needs
+        for (int l = 0; l < n_lines; l++) {
+            tft.drawString(pLines[l], 5, y + 42 + (l * 14));
+        }
 
-  // --- SAFE NAVIGATION FOOTER ---
+        int current_item_h = 42 + (n_lines * 14);
+        tft.drawLine(0, y + current_item_h + 2, 480, y + current_item_h + 2, COLOR_HOT_CHEST);
+        
+        dyn_y += current_item_h + 5; 
+        tft.setTextColor(TFT_WHITE);
+      }          // closes RADIO_LAYER2 branch
+      row++;     // <-- also missing, see note below
+    }            // closes the for loop
+  }              // closes the total_devices==0 / else block
+
+  // ==========================================
+  // 7. SAFE NAVIGATION FOOTER
+  // ==========================================
   tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
   tft.drawLine(0, 294, 480, 294, TFT_WHITE); 
 
@@ -10820,7 +11584,7 @@ void drawDeviceList() {
   tft.setTextColor(TFT_RED);
   tft.drawString("BACK", 215, 300); 
 
-  if (((device_current_page + 1) * items_per_page) < total_devices) {
+  if (has_next_page) {
     tft.setTextColor(TFT_WHITE);
     tft.drawString("NEXT ->", 360, 300);
   }
@@ -12006,169 +12770,6 @@ void drawTemporalLegend() {
     tft.drawLine(0, chart_start_y, 480, chart_start_y, COLOR_HOT_CHEST);
 }
 
-void drawLeakList() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextSize(1);
-
-  // ==========================================
-  // 1. DYNAMIC HEADER BANNER
-  // ==========================================
-  int active_leaks = 0;
-  for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
-    if (leakHistory[i].hitCount > 0) {
-      active_leaks++;
-    }
-  }
-
-  tft.setFreeFont(&UbuntuMono_B9pt7b);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(TFT_WHITE);
-  tft.fillRect(0, 0, 480, 24, TFT_DARKCYAN);
-  
-  char headerStr[64];
-  snprintf(headerStr, sizeof(headerStr), "SNIFFED LEAKS (%d)", active_leaks);
-  tft.drawString(headerStr, 0, 5); 
-
-  // ==========================================
-  // 2. DATA ROWS (3 Rows fit perfectly)
-  // ==========================================
-  int LEAKS_PER_PAGE = 3; 
-  int start_idx = leak_current_page * LEAKS_PER_PAGE;
-  int end_idx = start_idx + LEAKS_PER_PAGE;
-
-  int row = 0;
-  for (int i = start_idx; i < end_idx && i < MAX_LEAK_SLOTS; i++) {
-    if (leakHistory[i].hitCount == 0) continue;
-
-    int y = 30 + (row * 80); 
-    auto& lk = leakHistory[i].leak;
-
-    char safeSsid[13] = "Unknown";
-    for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
-        if (bssidCache[ap].last_seen == 0) continue;
-        if (memcmp(lk.meta.bssid, bssidCache[ap].bssid, 6) == 0) {
-            strncpy(safeSsid, bssidCache[ap].ssid, 12);
-            safeSsid[12] = '\0';
-            break;
-        }
-    }
-
-    // ---------------------------------------------------
-    // METADATA LINE 1: MACs & Vendors
-    // ---------------------------------------------------
-    tft.setFreeFont(&UbuntuMono_Regular8pt7b); 
-    tft.setTextColor(TFT_GREEN);  
-
-    char meta1[90];
-    // Print MAC and truncate vendor to 12 chars so the " > " separator doesn't fall off the screen edge
-    snprintf(meta1, sizeof(meta1), "%02X:%02X:%02X:%02X:%02X:%02X(%-12.12s)>%02X:%02X:%02X:%02X:%02X:%02X(%-12.12s)", 
-             lk.meta.src_mac[0], lk.meta.src_mac[1], lk.meta.src_mac[2], lk.meta.src_mac[3], lk.meta.src_mac[4], lk.meta.src_mac[5], leakHistory[i].src_vendor,
-             lk.meta.dst_mac[0], lk.meta.dst_mac[1], lk.meta.dst_mac[2], lk.meta.dst_mac[3], lk.meta.dst_mac[4], lk.meta.dst_mac[5], leakHistory[i].dst_vendor);
-    tft.drawString(meta1, 0, y); 
-
-    // ---------------------------------------------------
-    // METADATA LINE 2: IPs, Ports, Channel, Direction, Time
-    // ---------------------------------------------------
-    uint32_t first_sec = leakHistory[i].first_seen / 1000;
-    uint32_t last_sec = lk.meta.timestamp / 1000;
-    uint8_t f_h = (first_sec / 3600);
-    uint8_t f_m = (first_sec % 3600) / 60;
-    uint8_t l_h = (last_sec / 3600);
-    uint8_t l_m = (last_sec % 3600) / 60;
-
-    char timeStr[24];
-    if (leakHistory[i].hitCount <= 1) {
-        snprintf(timeStr, sizeof(timeStr), "%02dh%02dm", f_h, f_m);
-    } else {
-        snprintf(timeStr, sizeof(timeStr), "%02dh%02dm|%02dh%02dm", f_h, f_m, l_h, l_m);
-    }
-
-    char meta2[90];
-    if (lk.meta.ip_version == 4 || lk.meta.ip_version == 6) {
-        tft.setTextColor(TFT_YELLOW); 
-        char srcIp[32], dstIp[32];
-        getIpString(lk.meta.ip_version, lk.meta.src_ip, srcIp, sizeof(srcIp));
-        getIpString(lk.meta.ip_version, lk.meta.dst_ip, dstIp, sizeof(dstIp));
-        
-        if (lk.meta.src_port > 0 || lk.meta.dst_port > 0) {
-            snprintf(meta2, sizeof(meta2), "%s:%d>%s:%d|CH:%d|%s|%s| H:%d", 
-                     srcIp, lk.meta.src_port, dstIp, lk.meta.dst_port,
-                     lk.meta.channel, getDirectionStr(lk.meta.direction), safeSsid, leakHistory[i].hitCount);
-        } else {
-            snprintf(meta2, sizeof(meta2), "%s>%s|CH:%d|%s|%s|H:%d",
-                     srcIp, dstIp,
-                     lk.meta.channel, getDirectionStr(lk.meta.direction), safeSsid, leakHistory[i].hitCount);
-        }
-    } else {
-        tft.setTextColor(TFT_CYAN); 
-        snprintf(meta2, sizeof(meta2), "[%s]RAW|CH:%d|%s|%s|H:%d|%s", 
-                 getSubtypeStr(lk.meta.frame_subtype), 
-                 lk.meta.channel, getDirectionStr(lk.meta.direction), 
-                 safeSsid, leakHistory[i].hitCount, timeStr);
-    }
-    
-    tft.drawString(meta2, 0, y + 15);
-    
-    // Draw the time string right-aligned if it's an IP packet (since we omitted it from meta2 above to save space)
-    if (lk.meta.ip_version == 4 || lk.meta.ip_version == 6) {
-        tft.setTextDatum(TR_DATUM);
-        tft.drawString(timeStr, 480, y + 15);
-        tft.setTextDatum(TL_DATUM); // Reset!
-    }
-    // ---------------------------------------------------
-    // LINES 3, 4, 5: Cleartext Payload (Truncated)
-    // ---------------------------------------------------
-    tft.setTextColor(TFT_WHITE);
-    
-    const int maxChars = 60; 
-    int payloadLen = strlen(lk.text);
-    char line3[maxChars + 1] = {0}; 
-    char line4[maxChars + 1] = {0};
-    char line5[maxChars + 1] = {0}; 
-
-    if (payloadLen <= (maxChars * 3)) {
-        strncpy(line3, lk.text, maxChars);
-        if (payloadLen > maxChars) strncpy(line4, lk.text + maxChars, maxChars);
-        if (payloadLen > (maxChars * 2)) strncpy(line5, lk.text + (maxChars * 2), maxChars);
-    } else {
-        strncpy(line3, lk.text, maxChars);
-        strncpy(line4, lk.text + maxChars, maxChars);
-        
-        int usableLine5Chars = maxChars - 4; 
-        strncpy(line5, lk.text + (maxChars * 2), usableLine5Chars);
-        snprintf(line5 + usableLine5Chars, 5, "+%d", payloadLen - ((maxChars*2) + usableLine5Chars));
-    }
-
-    if (strlen(line3) > 0) tft.drawString(line3, 0, y + 30); 
-    if (strlen(line4) > 0) tft.drawString(line4, 0, y + 45); 
-    if (strlen(line5) > 0) tft.drawString(line5, 0, y + 60);
-    
-    // Draw row separator
-    tft.drawLine(0, y + 75, 480, y + 75, hex24to565(0x222222));
-    
-    row++;
-  }
-  
-  // ==========================================
-  // 3. UNIFIED NAVIGATION FOOTER
-  // ==========================================
-  tft.setFreeFont(&UbuntuMono_Regular9pt7b); 
-  tft.drawLine(0, 294, 480, 294, TFT_WHITE); 
-
-  if (leak_current_page > 0 && active_leaks > 0) {
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("<- PREV", 20, 300);
-  }
-  
-  tft.setTextColor(TFT_RED);
-  tft.drawString("BACK", 215, 300); 
-
-  if (((leak_current_page + 1) * LEAKS_PER_PAGE) < active_leaks) {
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("NEXT ->", 360, 300);
-  }
-}
-
 // --- L2 QSORT COMPARATORS ---
 int compareLeakAge(const void* a, const void* b) {
     LeakHistoryEntry* lA = (LeakHistoryEntry*)a;
@@ -13177,19 +13778,19 @@ void processLeakQueue() {
                 }
             }
 
-            Serial.printf("🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) -> Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%u.%u.%u.%u:%u) | Ch: %u | Text: %s\n",
+            Serial.printf("🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] -> Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] | Ch: %u | Text: %s\n",
               incomingLeak.meta.is_high_value ? "HIGH-VALUE" : "STANDARD",
               incomingLeak.meta.bssid[0], incomingLeak.meta.bssid[1], incomingLeak.meta.bssid[2], 
               incomingLeak.meta.bssid[3], incomingLeak.meta.bssid[4], incomingLeak.meta.bssid[5],
               safeSsid,
               incomingLeak.meta.src_mac[0], incomingLeak.meta.src_mac[1], incomingLeak.meta.src_mac[2], 
               incomingLeak.meta.src_mac[3], incomingLeak.meta.src_mac[4], incomingLeak.meta.src_mac[5],
-              leakHistory[targetIndex].src_vendor,
+              leakHistory[targetIndex].src_vendor, // <--- INJECTED SRC VENDOR
               incomingLeak.meta.src_ip[0], incomingLeak.meta.src_ip[1], incomingLeak.meta.src_ip[2], incomingLeak.meta.src_ip[3],
               incomingLeak.meta.src_port,
               incomingLeak.meta.dst_mac[0], incomingLeak.meta.dst_mac[1], incomingLeak.meta.dst_mac[2], 
               incomingLeak.meta.dst_mac[3], incomingLeak.meta.dst_mac[4], incomingLeak.meta.dst_mac[5],
-              leakHistory[targetIndex].dst_vendor,
+              leakHistory[targetIndex].dst_vendor, // <--- INJECTED DST VENDOR
               incomingLeak.meta.dst_ip[0], incomingLeak.meta.dst_ip[1], incomingLeak.meta.dst_ip[2], incomingLeak.meta.dst_ip[3],
               incomingLeak.meta.dst_port,
               incomingLeak.meta.channel,
@@ -13952,13 +14553,29 @@ void drawWaterfallChart() {
             tft.setTextDatum(TL_DATUM);
             
             int cursor_y = terminal_start_y + 4;
-            
-            // Draw oldest (highest index) to newest (index 0) to create a downward scrolling effect
-            for (int i = MAX_TERMINAL_LINES - 1; i >= 0; i--) {
-                if (terminal_history[i].meta.timestamp == 0) continue;
-                
-                // STRICT BOUNDARY: Stop drawing if the next 4-line block (3 meta + 1 text) crosses the red line
-                if (cursor_y + 56 > split_y) break; 
+
+// --- PASS 1: figure out which packets actually fit, newest-first ---
+int drawIdx[MAX_TERMINAL_LINES];
+int drawCount = 0;
+{
+    int scan_y = cursor_y;
+    for (int i = 0; i < MAX_TERMINAL_LINES; i++) {
+        if (terminal_history[i].meta.timestamp == 0) continue;
+
+        int pLen = strnlen(terminal_history[i].text, MAX_LEAK_STR_LEN);
+        int payload_lines = (pLen > 0) ? ((pLen - 1) / 57) + 1 : 1;
+        if (payload_lines > 9) payload_lines = 9;
+        int needed = 42 + (payload_lines * 14) + 5; // 3 meta rows + payload + margin
+
+        if (scan_y + needed > split_y) break;
+        scan_y += needed;
+        drawIdx[drawCount++] = i;
+    }
+}
+
+// --- PASS 2: draw them oldest-of-the-kept-set first, for the scroll effect ---
+for (int k = drawCount - 1; k >= 0; k--) {
+    int i = drawIdx[k]; 
 
                 // --- LIVE VENDOR LOOKUP (FAST RAM CACHE SCAN) ---
                 char srcVend[9] = "";
@@ -14079,29 +14696,30 @@ void drawWaterfallChart() {
                 cursor_y += 14; 
 
                 // --- ROW 4 & 5: PAYLOAD ---
-                tft.setTextColor(TFT_GREEN);
-                int cursor_x = 4;
-                
-                for (int j = 0; j < MAX_LEAK_STR_LEN; j++) {
-                    char c = terminal_history[i].text[j];
-                    if (c == '\0') break; 
+tft.setTextColor(TFT_GREEN);
 
-                    if (c < 32 || c > 126) c = '.';
+int pLen = strnlen(terminal_history[i].text, MAX_LEAK_STR_LEN);
+const int maxChars = 57; // (460-4)/8
+int n_lines = (pLen > 0) ? ((pLen - 1) / maxChars) + 1 : 1;
+if (n_lines > 9) n_lines = 9;
 
-                    char charStr[2] = {c, '\0'};
-                    tft.drawString(charStr, cursor_x, cursor_y);
-                    
-                    cursor_x += 8; 
-                    
-                    // Constrained wrap to prevent screen edge clipping (pulled back to 460px)
-                    if (cursor_x >= 460) {
-                        cursor_x = 4;
-                        cursor_y += 14;
-                        // Strict check to prevent payload wrapping over the line
-                        if (cursor_y + 14 > split_y) break; 
-                    }
-                }
-                cursor_y += 12; // Margin before the next packet begins
+char sanitized[MAX_LEAK_STR_LEN + 1] = {0};
+memcpy(sanitized, terminal_history[i].text, pLen);
+for (int c = 0; c < pLen; c++) {
+    if (sanitized[c] < 32 || sanitized[c] > 126) sanitized[c] = '.';
+}
+
+for (int line = 0; line < n_lines; line++) {
+    char lineBuf[60] = {0};
+    int offset = line * maxChars;
+    int remaining = pLen - offset;
+    int chunk = (remaining < maxChars) ? remaining : maxChars;
+    strncpy(lineBuf, sanitized + offset, chunk);
+    tft.drawString(lineBuf, 4, cursor_y);
+    cursor_y += 14;
+}
+tft.drawLine(0, cursor_y + 2, 480, cursor_y + 2, COLOR_HOT_CHEST);
+cursor_y += 5;
             }
         }
     }
