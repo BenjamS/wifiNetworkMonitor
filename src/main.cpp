@@ -73,7 +73,8 @@ SdFs sd;
 // ==========================================
 #define MAX_LEAK_STR_LEN 512
 #define MAX_LIVE_CAPTURE 1536
-#define LIVE_DUMP_QUEUE_DEPTH 10
+#define LIVE_DUMP_QUEUE_DEPTH 20
+#define LEAK_QUEUE_DEPTH 15   
 #define MAX_ACTIVE_FLOWS 64
 #define MAX_LEAK_SLOTS 20
 #define LIVE_DUMP_COOLDOWN_MS 30000 
@@ -139,7 +140,7 @@ LiveCaptureEvent* ptr_core1_evt = nullptr;
 
 struct Layer2Capture {
     Layer2Meta meta;
-    uint16_t   retained_len;                 // bytes retained here (0 when storing parsed text), up to MAX_RETAINED_PAYLOAD
+    uint16_t   retained_len;
     char    text[MAX_LEAK_STR_LEN];
 };
 
@@ -262,7 +263,11 @@ volatile uint32_t ui_dropped_packets = 0;
 // ISR-side (Core 0) — deauth + crypto/WEP interceptors
 volatile uint32_t leak_isr_attempts = 0;
 volatile uint32_t leak_isr_dropped  = 0;
-
+// ISR-side Layer2 funnel diagnostics
+volatile uint32_t leak_funnel_seen       = 0;
+volatile uint32_t leak_funnel_suppressed = 0;
+volatile uint32_t leak_funnel_shipped    = 0;
+volatile uint32_t live_dump_dropped      = 0;
 // Core 1 — processLiveDumpQueue() repush after parsing
 uint32_t leak_core1_attempts = 0;
 uint32_t leak_core1_dropped  = 0;
@@ -1387,6 +1392,68 @@ void format_ipv6_addr(const uint8_t* ip, char* buf, size_t max_len) {
 // HARDENED DNS NAME DECODER
 // ---------------------------------------------------------
 int decode_dns_name(const uint8_t* payload, int end_offset, int offset, char* out_name, int max_name_len) {
+    if (!payload || !out_name || max_name_len <= 0) return -1;
+
+    out_name[0] = '\0';
+
+    int original_offset = offset;
+    int out_idx = 0;
+    bool jumped = false;
+    int jumps = 0;
+
+    while (offset < end_offset) {
+        uint8_t len = payload[offset];
+
+        if (len == 0) {
+            if (!jumped) original_offset = offset + 1;
+            break;
+        }
+
+        if ((len & 0xC0) == 0xC0) {
+            if (offset + 1 >= end_offset || jumps >= 16) {
+                out_name[out_idx] = '\0';
+                return -1;
+            }
+            if (!jumped) original_offset = offset + 2;
+
+            int ptr = ((len & 0x3F) << 8) | payload[offset + 1];
+
+            if (ptr >= offset) {           // backward-only
+                out_name[out_idx] = '\0';
+                return -1;
+            }
+
+            offset = ptr;
+            jumped = true;
+            jumps++;
+            continue;
+        }
+
+        if (len > 63 || offset + 1 > end_offset || len > end_offset - offset - 1) {
+            out_name[out_idx] = '\0';
+            return -1;
+        }
+
+        offset++;
+        if (out_idx > 0 && out_idx < max_name_len - 1) out_name[out_idx++] = '.';
+
+        for (int i = 0; i < len; i++) {
+            if (out_idx < max_name_len - 1) {
+                uint8_t c = payload[offset + i];
+                out_name[out_idx++] = (c < 32 || c == 127) ? '.' : (char)c;
+            }
+        }
+
+        offset += len;
+        if (!jumped) original_offset = offset;
+    }
+
+    out_name[out_idx] = '\0';
+    return original_offset;
+}
+
+/*
+int decode_dns_name(const uint8_t* payload, int end_offset, int offset, char* out_name, int max_name_len) {
     if (!payload || !out_name || max_name_len <= 0) return -1; 
 
     int original_offset = offset;
@@ -1434,7 +1501,6 @@ int decode_dns_name(const uint8_t* payload, int end_offset, int offset, char* ou
     return original_offset; 
 }
 
-/*
 // Helper function to decode length-prefixed DNS/mDNS names and resolve pointers
 int decode_dns_name(const uint8_t* payload, uint16_t length, int offset, char* out_name, int max_name_len) {
     int original_offset = offset;
@@ -1790,6 +1856,218 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
 
     bool is_response = (payload[2] & 0x80) != 0;
     
+    uint16_t qdcount = (payload[4] << 8) | payload[5];
+    uint16_t ancount = (payload[6] << 8) | payload[7];
+    uint16_t nscount = (payload[8] << 8) | payload[9];
+    uint16_t arcount = (payload[10] << 8) | payload[11];
+
+    char domains[MAX_LEAK_STR_LEN] = {0};
+    int d_idx = 0;
+    int valid_labels = 0;
+
+    // CHANGED: process_name() replaced with a thin wrapper around
+    // decode_dns_name(). This lambda keeps the same "append to shared
+    // domains[] buffer" responsibility process_name used to have, but the
+    // actual wire-walking/pointer-following is now in decode_dns_name().
+    auto append_dns_name = [&](int start_offset) -> int {
+    char name_buf[192];
+    int result_offset = decode_dns_name(payload, length, start_offset, name_buf, sizeof(name_buf));
+
+    if (result_offset < 0) {
+        return -1;
+    }
+
+    int name_len = strlen(name_buf);
+    if (name_len > 0 && d_idx + name_len + 3 < (int)sizeof(domains)) {
+        if (valid_labels > 0) {
+            domains[d_idx++] = ',';
+            domains[d_idx++] = ' ';
+        }
+        memcpy(&domains[d_idx], name_buf, name_len);
+        d_idx += name_len;
+        valid_labels++;
+    }
+
+    return result_offset;
+};
+
+
+    int offset = 12;
+
+    // 1. Process Questions
+    for (int i = 0; i < qdcount && offset < length; i++) {
+    offset = append_dns_name(offset);
+    if (offset < 0) break;
+
+    if (offset + 4 > length) {
+        offset = length;
+        break;
+    }
+
+    offset += 4;
+    }
+
+    // 2. Process Answers, Authorities, and Additionals
+    int total_answers = ancount + nscount + arcount;
+    for (int i = 0; i < total_answers && offset < length; i++) {
+        offset = append_dns_name(offset);  // CHANGED
+        
+        if (offset + 10 <= length) {
+            uint16_t rr_type = (payload[offset] << 8) | payload[offset+1];
+            uint16_t rdlength = (payload[offset+8] << 8) | payload[offset+9];
+            
+            offset += 10;
+            
+            if (offset + rdlength > length) break;
+            
+            if (rr_type == 16) { // TXT — unchanged
+                int txt_off = offset;
+                int txt_end = offset + rdlength;
+                
+                while (txt_off < txt_end) {
+                    uint8_t txt_len = payload[txt_off];
+                    if (txt_off + 1 + txt_len > txt_end) break;
+                    
+                    bool is_printable = true;
+                    for (int j = 0; j < txt_len; j++) {
+                        uint8_t c = payload[txt_off + 1 + j];
+                        if (c < 32 || c == 127) {
+                            is_printable = false;
+                            break;
+                        }
+                    }
+                    
+                    if (is_printable && txt_len > 0) {
+                        if (d_idx + txt_len + 3 < sizeof(domains)) {
+                            if (valid_labels > 0) {
+                                domains[d_idx++] = ','; 
+                                domains[d_idx++] = ' ';
+                            }
+                            memcpy(&domains[d_idx], &payload[txt_off+1], txt_len);
+                            d_idx += txt_len;
+                            valid_labels++;
+                        }
+                    }
+                    txt_off += 1 + txt_len; 
+                }
+            }
+            else if (rr_type == 1 && rdlength == 4) { // A — unchanged
+                char ip_str[32];
+                snprintf(ip_str, sizeof(ip_str), "[IP: %d.%d.%d.%d]", 
+                         payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]);
+                int ip_len = strlen(ip_str);
+                
+                if (d_idx + ip_len + 3 < sizeof(domains)) {
+                    if (valid_labels > 0) {
+                        domains[d_idx++] = ','; 
+                        domains[d_idx++] = ' ';
+                    }
+                    memcpy(&domains[d_idx], ip_str, ip_len);
+                    d_idx += ip_len;
+                    valid_labels++;
+                }
+            }
+            // NEW: AAAA / IPv6
+            else if (rr_type == 28 && rdlength == 16) {
+                char ip6_str[48];
+                getIpString(6, &payload[offset], ip6_str, sizeof(ip6_str));
+
+                char* p;
+                while ((p = strstr(ip6_str, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
+                while ((p = strstr(ip6_str, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+
+                char out_str[56];
+                snprintf(out_str, sizeof(out_str), "[IPv6: %s]", ip6_str);
+                int out_len = strlen(out_str);
+
+                if (d_idx + out_len + 3 < (int)sizeof(domains)) {
+                    if (valid_labels > 0) { domains[d_idx++] = ','; domains[d_idx++] = ' '; }
+                    memcpy(&domains[d_idx], out_str, out_len);
+                    d_idx += out_len;
+                    valid_labels++;
+                }
+            }
+            else if (rr_type == 12 || rr_type == 5) { // PTR / CNAME
+                append_dns_name(offset);  // CHANGED — return value still discarded, same as original
+            }
+            else if (rr_type == 33 && rdlength >= 7) { // SRV
+                uint16_t srv_port = (payload[offset+4] << 8) | payload[offset+5];
+                char port_str[32];
+                snprintf(port_str, sizeof(port_str), "[Port: %u]", srv_port);
+                int p_len = strlen(port_str);
+                
+                if (d_idx + p_len + 3 < sizeof(domains)) {
+                    if (valid_labels > 0) {
+                        domains[d_idx++] = ','; 
+                        domains[d_idx++] = ' ';
+                    }
+                    memcpy(&domains[d_idx], port_str, p_len);
+                    d_idx += p_len;
+                    valid_labels++;
+                }
+                append_dns_name(offset + 6);  // CHANGED
+            }
+
+            offset += rdlength; 
+        } else {
+            break;
+        }
+    }
+
+    domains[d_idx] = '\0';
+
+    if (valid_labels > 0) {
+        snprintf(out_text, max_len, "%s %s: %s", is_mdns ? "mDNS" : "DNS", is_response ? "Ans" : "Qry", domains);
+        return true;
+    }
+
+    // 3. Salvaged TXT Record Sweeper — unchanged
+    if (is_mdns) {
+        int best_score = 0, best_s = 0, best_l = 0;
+        int cur_s = 0, cur_l = 0;
+        bool has_equals = false;
+
+        for (int i = 12; i < length; i++) {
+            char c = payload[i];
+            if (c >= 32 && c <= 126) { 
+                if (cur_l == 0) cur_s = i;
+                if (c == '=') has_equals = true;
+                cur_l++;
+            } else {
+                if (cur_l > 0) {
+                    int cur_score = cur_l + (has_equals ? 15 : 0);
+                    if (cur_score > best_score) {
+                        best_score = cur_score; best_l = cur_l; best_s = cur_s;
+                    }
+                }
+                cur_l = 0;
+                has_equals = false;
+            }
+        }
+        
+        if (cur_l > 0) { 
+            int cur_score = cur_l + (has_equals ? 15 : 0);
+            if (cur_score > best_score) {
+                best_score = cur_score; best_l = cur_l; best_s = cur_s;
+            }
+        }
+
+        if (best_l >= 6 && best_score >= 15) {
+            int copy_len = std::min(best_l, (int)max_len - 15);
+            snprintf(out_text, max_len, "mDNS TXT: %.*s", copy_len, &payload[best_s]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
+    if (length < 12) return false; 
+
+    bool is_response = (payload[2] & 0x80) != 0;
+    
     // Read the DNS structural boundaries
     uint16_t qdcount = (payload[4] << 8) | payload[5];
     uint16_t ancount = (payload[6] << 8) | payload[7];
@@ -2038,7 +2316,6 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
     return false;
 }
 
-/*
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
     if (length < 12) return false; 
 
@@ -2697,7 +2974,7 @@ bool parse_http_host(
     // 3. COMPACT UI STRING
     // -----------------------------------------------------
 
-    char temp_out[256] = {0};
+    char temp_out[MAX_LEAK_STR_LEN] = {0};
 
     // IMPORTANT:
     // Preserve "HTTP/1.1" in the request line so the
@@ -2987,10 +3264,10 @@ bool parse_ws_discovery(const uint8_t* payload, uint16_t length, char* out_text,
 
     const char* p = (const char*)payload;
 
-    char action_val[128] = {0};
-    char types_val[64] = {0};
-    char xaddrs_val[96] = {0};
-    char scopes_val[128] = {0};
+    char action_val[128] = {0};   // unchanged — action URIs are a fixed enum-like set, rarely long
+char types_val[64]   = {0};   // unchanged — same reasoning
+char xaddrs_val[192] = {0};   // was 96 — the most likely actual truncation point
+char scopes_val[192] = {0};   // was 128 — ONVIF scope lists can carry several space-separated scope URIs (name, hardware, location, profile), similar risk to xaddrs
 
     bool found_action = extract_xml_value(p, length, "Action>", action_val, sizeof(action_val));
     bool found_types  = extract_xml_value(p, length, "Types>", types_val, sizeof(types_val));
@@ -3017,7 +3294,7 @@ bool parse_ws_discovery(const uint8_t* payload, uint16_t length, char* out_text,
     }
 
     // --- STEP 2: UI Formatting Assembly ---
-    char temp_out[256] = {0};
+    char temp_out[MAX_LEAK_STR_LEN] = {0}; // was 256
     snprintf(temp_out, sizeof(temp_out), "%s:", msg_type);
     
     char chunk[128];
@@ -4247,13 +4524,13 @@ static bool parse_mqtt_connect(const uint8_t* remaining, uint32_t bytes_left, ch
     p += 4; 
     bytes_left -= 4;
 
-    char client_id[32] = {0};
+    char client_id[64]  = {0};      // was 32 — covers UUID-style IDs with margin
     p = extract_mqtt_string(p, bytes_left, client_id, sizeof(client_id), consumed);
     if (!p) return false;
     bytes_left -= consumed;
 
-    char temp_out[256] = {0};
-    char chunk[128] = {0};
+    char temp_out[MAX_LEAK_STR_LEN] = {0};  // was 256 — now genuinely needed given the above
+    char chunk[256]      = {0};     // was 128 — must grow to avoid re-clipping username at the chunk-formatting stage
     snprintf(temp_out, sizeof(temp_out), "MQTT [CONNECT]: [Client: %s]", client_id);
 
     if (has_will) {
@@ -4265,7 +4542,7 @@ static bool parse_mqtt_connect(const uint8_t* remaining, uint32_t bytes_left, ch
     }
 
     if (has_username) {
-        char username[32] = {0};
+        char username[192]  = {0};      // was 32 — sized for realistic JWT/token lengths
         p = extract_mqtt_string(p, bytes_left, username, sizeof(username), consumed);
         if (!p) return false;
         bytes_left -= consumed;
@@ -4296,7 +4573,7 @@ static bool parse_mqtt_publish(uint8_t flags, const uint8_t* remaining, uint32_t
     // Validate raw topic before extracting
     if (!mqtt_topic_name_valid(remaining, bytes_left)) return false;
 
-    char topic[64] = {0};
+    char topic[128] = {0};  // was 64
     uint32_t consumed = 0;
     
     const uint8_t* p = extract_mqtt_string(remaining, bytes_left, topic, sizeof(topic), consumed);
@@ -5051,21 +5328,21 @@ bool parse_ssdp(
     // Local bounded fields
     // -----------------------------------------------------
 
-    char first_line[40] = {0};
+    char first_line[64] = {0};      // was 40
 
-    char host[40]         = {0};
-    char man[40]          = {0};
-    char mx[8]            = {0};
+char host[64]          = {0};   // was 40
+char man[40]           = {0};   // unchanged — "ssdp:discover" etc., always short
+char mx[8]             = {0};   // unchanged — single-digit seconds value
 
-    char target_key[4]    = {0};
-    char target_val[80]   = {0};
+char target_key[4]     = {0};   // unchanged — "ST" / "NT"
+char target_val[128]   = {0};   // was 80 — URNs like your Samsung example run 40-50 chars; other vendors' nested service URNs can run longer
 
-    char nts[32]          = {0};
-    char server[80]       = {0};
-    char usn[80]          = {0};
-    char location[100]    = {0};
-    char cache_control[48]= {0};
-    char date[40]         = {0};
+char nts[32]           = {0};   // unchanged — "ssdp:alive" / "ssdp:byebye"
+char server[128]       = {0};   // was 80 — SERVER strings often chain 3+ tokens (OS/version, UPnP/version, product/version)
+char usn[128]          = {0};   // was 80 — this is your actual bug; 82 chars needed, giving headroom for longer UUIDs+URN combos
+char location[160]     = {0};   // was 100 — full URLs with paths, occasionally query strings
+char cache_control[48] = {0};   // unchanged — "max-age=1800" style, always short
+char date[40]          = {0};   // unchanged — RFC1123 dates are ~29 chars, some margin already
 
     const char* p =
         reinterpret_cast<const char*>(payload);
@@ -8923,6 +9200,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               // =========================================================
               // TCP/443 PAYLOAD HANDOFF DIAGNOSTIC
               // =========================================================
+              /*
               if (captured_protocol == 6 &&
                   (captured_src_port == 443 || captured_dst_port == 443)) {
 
@@ -8950,11 +9228,12 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       Serial.println();
                   }
               }
+              */
 
               // =========================================================
               // 3. THE HIGH-SPEED ISR FUNNEL (LRU Cache & Deduplication)
               // =========================================================
-              
+              leak_funnel_seen++;
               // 1. Generate the fast integer hash of the flow
               uint32_t current_hash = hash_flow(frame_body, body_len, captured_src_port, captured_dst_port);
               
@@ -8987,7 +9266,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       should_process = true;
                       flow_cache[cache_idx].last_printed_ms = now_ms;
                   } else {
-                      // NEW
+                      leak_funnel_suppressed++;
                       static uint32_t suppressed = 0;
                       suppressed++;
                       if (suppressed % 20 == 1) {
@@ -9008,19 +9287,6 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
               // =========================================================
               // 4. SHIP RAW BYTES TO CORE 1 
               // =========================================================
-              //Diagnostic
-              if (!should_process && captured_protocol == 6 &&
-    (captured_src_port == 443 || captured_dst_port == 443)) {
-
-    Serial.printf(
-        "[L2-SUPPRESS-TCP443] src=%u dst=%u len=%u hash=0x%08X\n",
-        captured_src_port,
-        captured_dst_port,
-        body_len,
-        current_hash
-    );
-}
-              //---
               
                             if (should_process) {
 
@@ -9068,7 +9334,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                   // =========================================================
                   // TCP/443 DIAGNOSTIC
                   // =========================================================
-
+                  /*
                   if (captured_protocol == 6 &&
                       (captured_src_port == 443 || captured_dst_port == 443)) {
 
@@ -9096,6 +9362,7 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                           Serial.println();
                       }
                   }
+                  */
 
                   // =========================================================
                   // SHIP FULL PAYLOAD TO CORE 1
@@ -9111,6 +9378,9 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
 
                           debug_dropped_packets++;
                           ui_dropped_packets++;
+                          live_dump_dropped++;
+                      } else {
+                          leak_funnel_shipped++; // <-- IT BELONGS EXACTLY HERE
                       }
                   }
 
@@ -9194,9 +9464,12 @@ void sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                       strncpy(leak.text, temp_text, MAX_LEAK_STR_LEN - 1);
                       
                       if (leakQueue != NULL) {
-                          leak_isr_attempts++;
-                          if (xQueueSendFromISR(leakQueue, &leak, NULL) != pdTRUE) leak_isr_dropped++;
-                      }
+    leak_isr_attempts++;
+
+    if (xQueueSendFromISR(leakQueue, &leak, NULL) != pdTRUE) {
+        leak_isr_dropped++;
+    }
+}
                   }
               }
           } 
@@ -9386,6 +9659,7 @@ void processLiveDumpQueue() {
     live_evt.meta.src_port == 80 ||
     live_evt.meta.dst_port == 80) {
 
+    /*
     Serial.printf(
         "[HTTPDBG] eth=0x%04X ip=%u proto=%u "
         "src=%u dst=%u flags=0x%02X raw_len=%u | ",
@@ -9397,6 +9671,7 @@ void processLiveDumpQueue() {
         live_evt.meta.tcp_flags,
         live_evt.raw_len
     );
+    */
 
     for (int i = 0; i < 32 && i < live_evt.raw_len; i++) {
         uint8_t c = live_evt.raw_payload[i];
@@ -9450,7 +9725,7 @@ void processLiveDumpQueue() {
          strstr(eapol_text, "M3") ||
          strstr(eapol_text, "M4"))) {
 
-        live_evt.meta.is_high_value = true;
+        live_evt.meta.is_high_value = false;
     }
 
     // Deliberately do NOT set custom_extracted here.
@@ -9822,6 +10097,17 @@ else if (len == 148 &&
         }
 
         // =========================================================
+// --- EAPOL FALLBACK ---
+// If no deeper payload extraction succeeded, preserve the
+// normal EAPOL classification.
+// =========================================================
+if (!custom_extracted && eapol_detected) {
+    strncpy(temp_text, eapol_text, MAX_LEAK_STR_LEN - 1);
+    temp_text[MAX_LEAK_STR_LEN - 1] = '\0';
+    custom_extracted = true;
+}
+
+        // =========================================================
         // --- CATCH-ALL FOR UNKNOWN CLEARTEXT ---
         // =========================================================
         if (!custom_extracted && live_evt.raw_len > 0) {
@@ -9837,16 +10123,6 @@ else if (len == 148 &&
                 Serial.println();
             }
         }
-        // =========================================================
-// --- EAPOL FALLBACK ---
-// If no deeper payload extraction succeeded, preserve the
-// normal EAPOL classification.
-// =========================================================
-if (!custom_extracted && eapol_detected) {
-    strncpy(temp_text, eapol_text, MAX_LEAK_STR_LEN - 1);
-    temp_text[MAX_LEAK_STR_LEN - 1] = '\0';
-    custom_extracted = true;
-}
 
         // ==========================================
 // --- UI ROUTING ---
@@ -9958,6 +10234,177 @@ void resetMonitorState() {
   pause_sniffing = false;
 }
 
+bool lookupVendorCache(
+    const uint8_t* mac,
+    char* vendor,
+    size_t vendorSize
+) {
+    // Defensive argument validation
+    if (mac == nullptr || vendor == nullptr || vendorSize == 0) {
+        return false;
+    }
+
+    vendor[0] = '\0';
+
+    // ==========================================
+    // 0. SPECIAL MAC CLASSES
+    // ==========================================
+
+    // Broadcast
+    if (mac[0] == 0xFF &&
+        mac[1] == 0xFF &&
+        mac[2] == 0xFF &&
+        mac[3] == 0xFF &&
+        mac[4] == 0xFF &&
+        mac[5] == 0xFF) {
+
+        strlcpy(vendor, "Bcast", vendorSize);
+        return true;
+    }
+
+    // IPv6 multicast
+    if (mac[0] == 0x33 &&
+        mac[1] == 0x33) {
+
+        strlcpy(vendor, "Mcast6", vendorSize);
+        return true;
+    }
+
+    // IPv4 multicast
+    if (mac[0] == 0x01 &&
+        mac[1] == 0x00 &&
+        mac[2] == 0x5E) {
+
+        strlcpy(vendor, "Mcast4", vendorSize);
+        return true;
+    }
+
+    // Locally administered / randomized
+    if ((mac[0] & 0x02) != 0) {
+
+        strlcpy(vendor, "<Random>", vendorSize);
+        return true;
+    }
+
+    // ==========================================
+    // 1. FAST OUI RAM CACHE
+    // ==========================================
+
+    for (int i = 0; i < cacheCount; i++) {
+
+        if (vendorCache[i].oui[0] == mac[0] &&
+            vendorCache[i].oui[1] == mac[1] &&
+            vendorCache[i].oui[2] == mac[2]) {
+
+            strlcpy(
+                vendor,
+                vendorCache[i].vendor,
+                vendorSize
+            );
+
+            return true;
+        }
+    }
+
+    // ==========================================
+    // 2. NOT FOUND IN FAST CACHE
+    //    IMPORTANT: NO SD ACCESS HERE
+    // ==========================================
+
+    return false;
+}
+
+void resolveMacVendor(MacRecord* record) {
+  // If already resolved (e.g., via Information Elements "(IE)"), skip.
+  if (record->vendorFound) return;
+
+// 2. FAST PATH: RAM OUI CACHE / SPECIAL MAC CLASSES
+if (lookupVendorCache(
+        record->mac,
+        record->vendor,
+        sizeof(record->vendor))) {
+
+    record->vendorFound = true;
+    return;
+}
+
+  char target[7];
+  snprintf(target, sizeof(target), "%02X%02X%02X", record->mac[0], record->mac[1], record->mac[2]);
+
+  // 3. Binary Search the SD Card
+  bool foundInDB = false;
+  FsFile file = sd.open("/oui_db.txt", O_READ);
+  if (file) { 
+    uint32_t low = 0;
+    uint32_t high = (file.fileSize() / 32) - 1;
+
+    while (low <= high) {
+      uint32_t mid = low + (high - low) / 2;
+      file.seek(mid * 32);
+      char line[32];
+      file.read(line, 32);
+      char prefix[7];
+      strncpy(prefix, line, 6);
+      prefix[6] = '\0';
+
+      int cmp = strcmp(target, prefix);
+      if (cmp == 0) {
+        // MATCH FOUND
+        int text_start = 7;
+        while(text_start < 32 && (line[text_start] == ' ' || line[text_start] == '\t')) {
+          text_start++;
+        }
+        
+        int available_chars = 32 - text_start;
+        int max_capacity = sizeof(record->vendor) - 1;
+        int copy_len = (available_chars < max_capacity) ? available_chars : max_capacity;
+        
+        strncpy(record->vendor, &line[text_start], copy_len); 
+        record->vendor[copy_len] = '\0';
+        
+        for(int i = copy_len - 1; i >= 0; i--) {         
+          if(record->vendor[i] == ' ' || record->vendor[i] == '\r' || record->vendor[i] == '\n') {
+              record->vendor[i] = '\0';
+          } else {
+              break;
+          }
+        }
+        foundInDB = true;
+        break; 
+      }
+      else if (cmp < 0) {
+        if (mid == 0) break;
+        high = mid - 1;
+      }
+      else {
+        low = mid + 1;
+      }
+    }
+    file.close();
+  }
+
+  // 4. Handle SD Card Miss (Fallback)
+  if (!foundInDB) {
+      strncpy(record->vendor, "Unknown", sizeof(record->vendor) - 1);
+      record->vendor[sizeof(record->vendor) - 1] = '\0';
+  }
+
+  record->vendorFound = true; // Mark as found so we don't search SD again for "Unknown"
+
+  // 5. Save to RAM Cache
+  vendorCache[cacheHead].oui[0] = record->mac[0];
+  vendorCache[cacheHead].oui[1] = record->mac[1];
+  vendorCache[cacheHead].oui[2] = record->mac[2];
+  
+  // Cleaned up the magic number 26!
+  strncpy(vendorCache[cacheHead].vendor, record->vendor, sizeof(vendorCache[cacheHead].vendor) - 1);
+  vendorCache[cacheHead].vendor[sizeof(vendorCache[cacheHead].vendor) - 1] = '\0';
+  
+  if (cacheCount < OUI_CACHE_SIZE) cacheCount++;
+  cacheHead = (cacheHead + 1) % OUI_CACHE_SIZE;
+}
+
+/*
 void resolveMacVendor(MacRecord* record) {
   // If already resolved (e.g., via Information Elements "(IE)"), skip.
   if (record->vendorFound) return;
@@ -10091,6 +10538,8 @@ if ((record->mac[0] & 0x02) == 0x02) {
   if (cacheCount < OUI_CACHE_SIZE) cacheCount++;
   cacheHead = (cacheHead + 1) % OUI_CACHE_SIZE;
 }
+
+*/
 
 const char* resolveBleCompanyId(uint16_t companyId) {
   int left = 0;
@@ -12052,7 +12501,6 @@ void processProbeRequestShared(uint8_t* mac, const char* ssid, const char* known
 }
 
 // --- Background Vendor Resolver (Runs safely on Core 1) ---
-// --- Background Vendor Resolver (Runs safely on Core 1) ---
 void processPendingVendors() {
   // ==========================================
   // 1. OSINT Probe Tracker Resolution Logic
@@ -13627,6 +14075,514 @@ void runProbeCorrelationEngine() {
 // ==========================================
 // CORE 1: RAM-ONLY QUEUE CONSUMER
 // ==========================================
+void logLeakToSerial(const Layer2Capture& leak, const char* src_vendor,
+                      const char* dst_vendor, const char* ssid) {
+    Serial.printf(
+        "🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | "
+        "Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] -> "
+        "Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] | "
+        "Ch: %u | Text: %s\n",
+        leak.meta.is_high_value ? "HIGH-VALUE" : "STANDARD",
+        leak.meta.bssid[0], leak.meta.bssid[1], leak.meta.bssid[2],
+        leak.meta.bssid[3], leak.meta.bssid[4], leak.meta.bssid[5],
+        ssid,
+        leak.meta.src_mac[0], leak.meta.src_mac[1], leak.meta.src_mac[2],
+        leak.meta.src_mac[3], leak.meta.src_mac[4], leak.meta.src_mac[5],
+        src_vendor,
+        leak.meta.src_ip[0], leak.meta.src_ip[1], leak.meta.src_ip[2], leak.meta.src_ip[3],
+        leak.meta.src_port,
+        leak.meta.dst_mac[0], leak.meta.dst_mac[1], leak.meta.dst_mac[2],
+        leak.meta.dst_mac[3], leak.meta.dst_mac[4], leak.meta.dst_mac[5],
+        dst_vendor,
+        leak.meta.dst_ip[0], leak.meta.dst_ip[1], leak.meta.dst_ip[2], leak.meta.dst_ip[3],
+        leak.meta.dst_port,
+        leak.meta.channel,
+        leak.text
+    );
+}
+
+void processLeakQueue() {
+    if (leakQueue == NULL) return;
+
+    Layer2Capture incomingLeak;
+    bool ui_needs_update = false;
+
+    while (xQueueReceive(leakQueue, &incomingLeak, 0) == pdTRUE) {
+
+        // ==========================================
+        // 0. TOKEN EXPANSION
+        //    Run outside the ISR
+        // ==========================================
+        if (strcmp(incomingLeak.text, "ICMPV6_NS") == 0) {
+
+            char src_str[40] = {0};
+            char tgt_str[40] = {0};
+
+            getIpString(
+                6,
+                incomingLeak.meta.src_ip,
+                src_str,
+                sizeof(src_str)
+            );
+
+            getIpString(
+                6,
+                incomingLeak.meta.dst_ip,
+                tgt_str,
+                sizeof(tgt_str)
+            );
+
+            snprintf(
+                incomingLeak.text,
+                sizeof(incomingLeak.text),
+                "ICMPv6 ND: Who has %s? Tell %s",
+                tgt_str,
+                src_str
+            );
+        }
+
+        // ==========================================
+        // 1. TERMINAL HISTORY DEDUPLICATION
+        //
+        //    This is intentionally independent from
+        //    persistent leakHistory eviction.
+        // ==========================================
+        bool foundTerminalMatch = false;
+        int matchIndex = -1;
+
+        for (int i = 0; i < MAX_TERMINAL_LINES; i++) {
+
+            if (terminal_history[i].meta.timestamp > 0 &&
+                memcmp(
+                    terminal_history[i].meta.src_mac,
+                    incomingLeak.meta.src_mac,
+                    6
+                ) == 0 &&
+                strcmp(
+                    terminal_history[i].text,
+                    incomingLeak.text
+                ) == 0) {
+
+                foundTerminalMatch = true;
+                matchIndex = i;
+                break;
+            }
+        }
+
+        if (foundTerminalMatch) {
+
+            // Existing terminal entry: increment hits
+            terminal_hits[matchIndex]++;
+
+            // Refresh last-seen timestamp
+            terminal_history[matchIndex].meta.timestamp =
+                incomingLeak.meta.timestamp;
+
+            // Move the refreshed entry to the front
+            if (matchIndex > 0) {
+
+                Layer2Capture tempCap =
+                    terminal_history[matchIndex];
+
+                uint16_t tempHits =
+                    terminal_hits[matchIndex];
+
+                uint32_t tempFirst =
+                    terminal_first_seen[matchIndex];
+
+                for (int t = matchIndex; t > 0; t--) {
+                    terminal_history[t] =
+                        terminal_history[t - 1];
+
+                    terminal_hits[t] =
+                        terminal_hits[t - 1];
+
+                    terminal_first_seen[t] =
+                        terminal_first_seen[t - 1];
+                }
+
+                terminal_history[0] = tempCap;
+                terminal_hits[0] = tempHits;
+                terminal_first_seen[0] = tempFirst;
+            }
+
+            ui_needs_update = true;
+
+        } else {
+
+            // New terminal entry.
+            // Shift existing entries toward the back.
+            for (int t = MAX_TERMINAL_LINES - 1; t > 0; t--) {
+
+                terminal_history[t] =
+                    terminal_history[t - 1];
+
+                terminal_hits[t] =
+                    terminal_hits[t - 1];
+
+                terminal_first_seen[t] =
+                    terminal_first_seen[t - 1];
+            }
+
+            terminal_history[0] = incomingLeak;
+            terminal_hits[0] = 1;
+            terminal_first_seen[0] =
+                incomingLeak.meta.timestamp;
+
+            ui_needs_update = true;
+        }
+
+
+        // ==========================================
+        // 2. PERSISTENT LIST DEDUPLICATION
+        // ==========================================
+        bool isDuplicate = false;
+
+        for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+
+            if (leakHistory[i].leak.meta.timestamp > 0 &&
+                memcmp(
+                    leakHistory[i].leak.meta.src_mac,
+                    incomingLeak.meta.src_mac,
+                    6
+                ) == 0 &&
+                strcmp(
+                    leakHistory[i].leak.text,
+                    incomingLeak.text
+                ) == 0) {
+
+                // Existing persistent entry.
+                // Do NOT run the eviction engine.
+                leakHistory[i].hitCount++;
+
+                // Refresh last-seen timestamp.
+                leakHistory[i].leak.meta.timestamp =
+                    incomingLeak.meta.timestamp;
+
+                isDuplicate = true;
+                ui_needs_update = true;
+
+                break;
+            }
+        }
+
+
+                if (!isDuplicate) {
+
+            // ==========================================
+            // 3. RESOLVE VENDORS + LOG — UNCONDITIONAL
+            //    Runs for every genuinely new capture,
+            //    regardless of eviction outcome.
+            // ==========================================
+            MacRecord tempRec;
+            char resolved_src_vendor[16] = "Unknown";
+            char resolved_dst_vendor[16] = "Unknown";
+
+            memset(&tempRec, 0, sizeof(MacRecord));
+            memcpy(tempRec.mac, incomingLeak.meta.src_mac, 6);
+            resolveMacVendor(&tempRec);
+            strncpy(resolved_src_vendor, tempRec.vendor, sizeof(resolved_src_vendor) - 1);
+            resolved_src_vendor[sizeof(resolved_src_vendor) - 1] = '\0';
+
+            memset(&tempRec, 0, sizeof(MacRecord));
+            memcpy(tempRec.mac, incomingLeak.meta.dst_mac, 6);
+            resolveMacVendor(&tempRec);
+            strncpy(resolved_dst_vendor, tempRec.vendor, sizeof(resolved_dst_vendor) - 1);
+            resolved_dst_vendor[sizeof(resolved_dst_vendor) - 1] = '\0';
+
+            char safeSsid[33] = "Unknown";
+            for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
+                if (bssidCache[ap].last_seen == 0) continue;
+                if (memcmp(incomingLeak.meta.bssid, bssidCache[ap].bssid, 6) == 0) {
+                    strncpy(safeSsid, bssidCache[ap].ssid, sizeof(safeSsid) - 1);
+                    safeSsid[sizeof(safeSsid) - 1] = '\0';
+                    break;
+                }
+            }
+
+            logLeakToSerial(incomingLeak, resolved_src_vendor, resolved_dst_vendor, safeSsid);
+
+            // ==========================================
+            // 4. SMART EVICTION ENGINE
+            //    Only decides whether it also gets a
+            //    permanent slot in leakHistory.
+            // ==========================================
+            int targetIndex = -1;
+
+            for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                if (leakHistory[i].leak.meta.timestamp == 0) {
+                    targetIndex = i;
+                    break;
+                }
+            }
+
+            if (targetIndex == -1) {
+                int victim_idx = 0;
+                int min_score = INT_MAX;
+                uint32_t oldest_time = UINT32_MAX;
+
+                for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                    int score = leakHistory[i].leak.retained_len;
+                    if (score == 0) score = strlen(leakHistory[i].leak.text);
+                    if (leakHistory[i].leak.meta.is_high_value) score += 300;
+
+                    if (score < min_score) {
+                        min_score = score;
+                        victim_idx = i;
+                        oldest_time = leakHistory[i].first_seen;
+                    } else if (score == min_score) {
+                        if (leakHistory[i].first_seen < oldest_time) {
+                            victim_idx = i;
+                            oldest_time = leakHistory[i].first_seen;
+                        }
+                    }
+                }
+
+                int incoming_score = incomingLeak.retained_len;
+                if (incoming_score == 0) incoming_score = strlen(incomingLeak.text);
+                if (incomingLeak.meta.is_high_value) incoming_score += 10000;
+
+                if (incoming_score > min_score) {
+                    targetIndex = victim_idx;
+                }
+            }
+
+            // ==========================================
+            // 5. INSERT — GATED, using vendors already resolved above
+            // ==========================================
+            if (targetIndex != -1) {
+                leakHistory[targetIndex].leak = incomingLeak;
+                leakHistory[targetIndex].hitCount = 1;
+                leakHistory[targetIndex].first_seen = incomingLeak.meta.timestamp;
+                leakHistory[targetIndex].flow_hash = incomingLeak.meta.flow_hash;
+                strcpy(leakHistory[targetIndex].src_vendor, resolved_src_vendor);
+                strcpy(leakHistory[targetIndex].dst_vendor, resolved_dst_vendor);
+
+                ui_needs_update = true;
+            }
+        }
+    }
+
+
+    // ==========================================
+    // 8. BATCHED UI REFRESH
+    // ==========================================
+    if (ui_needs_update &&
+        currentState == SCREEN_DEVICE_LIST &&
+        currentRadioMode == RADIO_LAYER2) {
+
+        processL2Data();
+        drawDeviceList();
+    }
+}
+
+/*
+void processLeakQueue() {
+    if (leakQueue == NULL) return;
+
+    Layer2Capture incomingLeak; 
+    bool ui_needs_update = false; 
+    
+    while (xQueueReceive(leakQueue, &incomingLeak, 0) == pdTRUE) {
+        
+        // ==========================================
+        // 0. TOKEN EXPANSION (Run outside the ISR!)
+        // ==========================================
+        if (strcmp(incomingLeak.text, "ICMPV6_NS") == 0) {
+            char src_str[40] = {0};
+            char tgt_str[40] = {0};
+            
+            getIpString(6, incomingLeak.meta.src_ip, src_str, sizeof(src_str));
+            getIpString(6, incomingLeak.meta.dst_ip, tgt_str, sizeof(tgt_str));
+            
+            snprintf(incomingLeak.text, sizeof(incomingLeak.text), 
+                     "ICMPv6 ND: Who has %s? Tell %s", tgt_str, src_str);
+        }
+
+        // --- ADVANCED TERMINAL DEDUPLICATION (LRU CACHE) ---
+        bool foundTerminalMatch = false;
+        int matchIndex = -1;
+
+        for (int i = 0; i < MAX_TERMINAL_LINES; i++) {
+            if (terminal_history[i].meta.timestamp > 0 && 
+                memcmp(terminal_history[i].meta.src_mac, incomingLeak.meta.src_mac, 6) == 0 &&
+                strcmp(terminal_history[i].text, incomingLeak.text) == 0) {
+                foundTerminalMatch = true;
+                matchIndex = i;
+                break;
+            }
+        }
+
+        if (foundTerminalMatch) {
+            terminal_hits[matchIndex]++;
+            terminal_history[matchIndex].meta.timestamp = incomingLeak.meta.timestamp; 
+
+            if (matchIndex > 0) {
+                Layer2Capture tempCap = terminal_history[matchIndex];
+                uint16_t tempHits = terminal_hits[matchIndex];
+                uint32_t tempFirst = terminal_first_seen[matchIndex]; 
+
+                for (int t = matchIndex; t > 0; t--) {
+                    terminal_history[t] = terminal_history[t-1];
+                    terminal_hits[t] = terminal_hits[t-1];
+                    terminal_first_seen[t] = terminal_first_seen[t-1]; 
+                }
+                
+                terminal_history[0] = tempCap;
+                terminal_hits[0] = tempHits;
+                terminal_first_seen[0] = tempFirst; 
+            }
+            ui_needs_update = true;
+        } else {
+            for (int t = MAX_TERMINAL_LINES - 1; t > 0; t--) {
+                terminal_history[t] = terminal_history[t-1];
+                terminal_hits[t] = terminal_hits[t-1]; 
+                terminal_first_seen[t] = terminal_first_seen[t-1]; 
+            }
+            terminal_history[0] = incomingLeak;
+            terminal_hits[0] = 1; 
+            terminal_first_seen[0] = incomingLeak.meta.timestamp; 
+            ui_needs_update = true;
+        }
+        
+        bool isDuplicate = false;
+                
+        // 1. Deduplication (Sync to Session)
+        for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+            if (leakHistory[i].leak.meta.timestamp > 0 && 
+                memcmp(leakHistory[i].leak.meta.src_mac, incomingLeak.meta.src_mac, 6) == 0 &&
+                strcmp(leakHistory[i].leak.text, incomingLeak.text) == 0) {
+                
+                leakHistory[i].hitCount++;
+                leakHistory[i].leak.meta.timestamp = incomingLeak.meta.timestamp; 
+                
+                isDuplicate = true;
+                ui_needs_update = true;
+                break;
+            }
+        }
+
+        // ==========================================
+        // 2. SMART EVICTION ENGINE (Length + Value Weighted)
+        // ==========================================
+        if (!isDuplicate) {
+            int targetIndex = -1;
+
+            // Fast Pass: Look for a completely empty slot first
+            for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                if (leakHistory[i].leak.meta.timestamp == 0) {
+                    targetIndex = i;
+                    break;
+                }
+            }
+
+            // The Arena: Fight for survival if list is full
+            if (targetIndex == -1) {
+                int victim_idx = 0;
+                int min_score = 999999;
+                uint32_t oldest_time = 0xFFFFFFFF;
+
+                for (int i = 0; i < MAX_LEAK_SLOTS; i++) {
+                    int score = leakHistory[i].leak.retained_len;
+                    if (score == 0) score = strlen(leakHistory[i].leak.text);
+
+                    if (leakHistory[i].leak.meta.is_high_value) score += 10000;
+
+                    if (score < min_score) {
+                        min_score = score;
+                        victim_idx = i;
+                        oldest_time = leakHistory[i].first_seen;
+                    } 
+                    else if (score == min_score) {
+                        if (leakHistory[i].leak.meta.timestamp < oldest_time) {
+                            victim_idx = i;
+                            oldest_time = leakHistory[i].leak.meta.timestamp;
+                        }
+                    }
+                }
+
+                int incoming_score = incomingLeak.retained_len;
+                if (incoming_score == 0) incoming_score = strlen(incomingLeak.text);
+                if (incomingLeak.meta.is_high_value) incoming_score += 10000;
+
+                // The Gatekeeper Check
+                if (incoming_score >= min_score) {
+                    targetIndex = victim_idx;
+                }
+            }
+
+            // 3. Resolve BOTH MAC vendors safely into local buffers
+            MacRecord tempRec;
+            char resolved_src_vendor[16] = "Unknown";
+            char resolved_dst_vendor[16] = "Unknown";
+            
+            memset(&tempRec, 0, sizeof(MacRecord));      
+            memcpy(tempRec.mac, incomingLeak.meta.src_mac, 6); 
+            resolveMacVendor(&tempRec); 
+            strncpy(resolved_src_vendor, tempRec.vendor, 15);
+            resolved_src_vendor[15] = '\0'; 
+            
+            memset(&tempRec, 0, sizeof(MacRecord));      
+            memcpy(tempRec.mac, incomingLeak.meta.dst_mac, 6); 
+            resolveMacVendor(&tempRec); 
+            strncpy(resolved_dst_vendor, tempRec.vendor, 15);
+            resolved_dst_vendor[15] = '\0'; 
+
+            // Insert into the target slot if it survived the Gatekeeper
+            if (targetIndex != -1) {
+                leakHistory[targetIndex].leak = incomingLeak;
+                leakHistory[targetIndex].hitCount = 1;
+                leakHistory[targetIndex].first_seen = incomingLeak.meta.timestamp;
+                leakHistory[targetIndex].flow_hash = incomingLeak.meta.flow_hash;
+                strcpy(leakHistory[targetIndex].src_vendor, resolved_src_vendor);
+                strcpy(leakHistory[targetIndex].dst_vendor, resolved_dst_vendor);
+                
+                ui_needs_update = true;
+            }
+
+            // ==========================================
+            // DYNAMIC SSID LOOKUP FOR SERIAL MONITOR
+            // ==========================================
+            char safeSsid[33] = "Unknown"; 
+            for (int ap = 0; ap < MAX_BSSID_CACHE; ap++) {
+                if (bssidCache[ap].last_seen == 0) continue;
+                if (memcmp(incomingLeak.meta.bssid, bssidCache[ap].bssid, 6) == 0) {
+                    strncpy(safeSsid, bssidCache[ap].ssid, 32);
+                    safeSsid[32] = '\0';
+                    break;
+                }
+            }
+
+            Serial.printf("🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] -> Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] | Ch: %u | Text: %s\n",
+              incomingLeak.meta.is_high_value ? "HIGH-VALUE" : "STANDARD",
+              incomingLeak.meta.bssid[0], incomingLeak.meta.bssid[1], incomingLeak.meta.bssid[2], 
+              incomingLeak.meta.bssid[3], incomingLeak.meta.bssid[4], incomingLeak.meta.bssid[5],
+              safeSsid,
+              incomingLeak.meta.src_mac[0], incomingLeak.meta.src_mac[1], incomingLeak.meta.src_mac[2], 
+              incomingLeak.meta.src_mac[3], incomingLeak.meta.src_mac[4], incomingLeak.meta.src_mac[5],
+              resolved_src_vendor,
+              incomingLeak.meta.src_ip[0], incomingLeak.meta.src_ip[1], incomingLeak.meta.src_ip[2], incomingLeak.meta.src_ip[3],
+              incomingLeak.meta.src_port,
+              incomingLeak.meta.dst_mac[0], incomingLeak.meta.dst_mac[1], incomingLeak.meta.dst_mac[2], 
+              incomingLeak.meta.dst_mac[3], incomingLeak.meta.dst_mac[4], incomingLeak.meta.dst_mac[5],
+              resolved_dst_vendor,
+              incomingLeak.meta.dst_ip[0], incomingLeak.meta.dst_ip[1], incomingLeak.meta.dst_ip[2], incomingLeak.meta.dst_ip[3],
+              incomingLeak.meta.dst_port,
+              incomingLeak.meta.channel,
+              incomingLeak.text
+            );
+        }
+    }
+    
+    // ==========================================
+    // 4. BATCHED UI REFRESH
+    // ==========================================
+    if (ui_needs_update && currentState == SCREEN_DEVICE_LIST && currentRadioMode == RADIO_LAYER2) {
+        processL2Data(); 
+        drawDeviceList();  
+    }
+}
+
 void processLeakQueue() {
     if (leakQueue == NULL) return;
 
@@ -13808,6 +14764,7 @@ void processLeakQueue() {
         drawDeviceList();  // Asynchronously paint the unified screen
     }
 }
+*/
 
 bool updateRadioHopper() {
     bool trigger_render = false; // Local render trigger
@@ -14577,37 +15534,34 @@ int drawCount = 0;
 for (int k = drawCount - 1; k >= 0; k--) {
     int i = drawIdx[k]; 
 
-                // --- LIVE VENDOR LOOKUP (FAST RAM CACHE SCAN) ---
-                char srcVend[9] = "";
-                char dstVend[9] = "";
-                
-                for (int v = 0; v < MAX_LEAK_SLOTS; v++) {
-                    if (leakHistory[v].leak.meta.timestamp == 0) continue;
-                    
-                    // Check if we already resolved the Source MAC
-                    if (srcVend[0] == '\0') {
-                        if (memcmp(terminal_history[i].meta.src_mac, leakHistory[v].leak.meta.src_mac, 6) == 0) {
-                            strncpy(srcVend, leakHistory[v].src_vendor, 8); srcVend[8] = '\0';
-                        } else if (memcmp(terminal_history[i].meta.src_mac, leakHistory[v].leak.meta.dst_mac, 6) == 0) {
-                            strncpy(srcVend, leakHistory[v].dst_vendor, 8); srcVend[8] = '\0';
-                        }
-                    }
-                    // Check if we already resolved the Dest MAC
-                    if (dstVend[0] == '\0') {
-                        if (memcmp(terminal_history[i].meta.dst_mac, leakHistory[v].leak.meta.src_mac, 6) == 0) {
-                            strncpy(dstVend, leakHistory[v].src_vendor, 8); dstVend[8] = '\0';
-                        } else if (memcmp(terminal_history[i].meta.dst_mac, leakHistory[v].leak.meta.dst_mac, 6) == 0) {
-                            strncpy(dstVend, leakHistory[v].dst_vendor, 8); dstVend[8] = '\0';
-                        }
-                    }
-                    if (srcVend[0] != '\0' && dstVend[0] != '\0') break; // Found both, stop searching
-                }
-                
-                // Fallbacks and string trimming
-                if (srcVend[0] == '\0') strcpy(srcVend, "Unknown");
-                if (dstVend[0] == '\0') strcpy(dstVend, "Unknown");
-                for (int s = 7; s >= 0; s--) { if (srcVend[s] == ' ') srcVend[s] = '\0'; else break; }
-                for (int s = 7; s >= 0; s--) { if (dstVend[s] == ' ') dstVend[s] = '\0'; else break; }
+                // ==========================================
+// LIVE VENDOR LOOKUP — RAM CACHE ONLY
+//
+// IMPORTANT:
+// No leakHistory dependency.
+// No SD access.
+// No vendor resolution.
+// This is strictly an ephemeral fast-path lookup.
+// ==========================================
+
+char srcVend[9] = "";
+char dstVend[9] = "";
+
+if (!lookupVendorCache(
+        terminal_history[i].meta.src_mac,
+        srcVend,
+        sizeof(srcVend))) {
+
+    strlcpy(srcVend, "Unknown", sizeof(srcVend));
+}
+
+if (!lookupVendorCache(
+        terminal_history[i].meta.dst_mac,
+        dstVend,
+        sizeof(dstVend))) {
+
+    strlcpy(dstVend, "Unknown", sizeof(dstVend));
+}
 
                 // --- INLINE FORMATTERS ---
                 // 1. Compact Length (Max 4 chars)
@@ -14864,12 +15818,18 @@ void setup() {
   pinMode(5, OUTPUT);  digitalWrite(5, HIGH);
 
   Serial.printf("[MEM] Static footprint:  %u bytes\n", static_non_union);
-  Serial.printf("[MEM] Free heap at boot: %u bytes\n", esp_get_free_heap_size());
-  Serial.printf("[MEM] Free SRAM minimum: %u bytes\n", esp_get_minimum_free_heap_size());
+Serial.printf("[MEM] Free heap at boot: %u bytes\n", esp_get_free_heap_size());
+Serial.printf("[MEM] Free SRAM minimum: %u bytes\n", esp_get_minimum_free_heap_size());
+Serial.printf("[MEM] sizeof(LiveCaptureEvent) = %u bytes\n", sizeof(LiveCaptureEvent));   // <-- add here
+Serial.printf("[MEM] sizeof(Layer2Capture)    = %u bytes\n", sizeof(Layer2Capture));     // <-- and this one too
+Serial.printf(
+    "Layer2Capture=%u bytes | leakQueue storage ~%u bytes\n",
+    (unsigned)sizeof(Layer2Capture),
+    (unsigned)(sizeof(Layer2Capture) * LEAK_QUEUE_DEPTH)
+);
+initProbeTracker();
 
-  initProbeTracker();
-
-  // ==========================================
+// ==========================================
 // 1. CREATE THE LAYER 2 QUEUES + TRANSIENT BUFFERS
 // ==========================================
 
@@ -14884,7 +15844,7 @@ if (ptr_isr_evt == nullptr || ptr_core1_evt == nullptr) {
 }
 
 // Post-parser queue: ONLY Layer2Capture objects.
-leakQueue = xQueueCreate(20, sizeof(Layer2Capture));
+leakQueue = xQueueCreate(LEAK_QUEUE_DEPTH, sizeof(Layer2Capture));
 
 if (leakQueue == NULL) {
     Serial.println("[!] FATAL: Failed to create leakQueue!");
@@ -15019,34 +15979,61 @@ void loop() {
     // Do NOT add SCREEN_LEAK_LIST here. It updates itself asynchronously!
     
     Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-    // ==========================================
-    // 5. ASYNCHRONOUS DIAGNOSTICS (Runs every 3 seconds)
+  }
+  // ==========================================
+    // ASYNCHRONOUS DIAGNOSTICS (Runs every 3 seconds)
     // ==========================================
     static uint32_t last_debug_print = 0;
 if (millis() - last_debug_print > 3000) {
-    if (debug_dropped_packets > 0) {
-        Serial.printf("liveDumpQueue Drops (3s): %u | Free Heap: %d bytes\n", debug_dropped_packets, ESP.getFreeHeap());
-        debug_dropped_packets = 0;
-    }
 
-    // Snapshot ISR-written volatiles once so the printed numbers stay self-consistent
-    uint32_t isr_att = leak_isr_attempts;
-    uint32_t isr_drop = leak_isr_dropped;
+    uint32_t isr_att       = leak_isr_attempts;
+    uint32_t isr_drop     = leak_isr_dropped;
 
-    if (isr_drop > 0 || leak_core1_dropped > 0) {
-        Serial.printf("leakQueue Drops (3s): ISR %u/%u | Core1 %u/%u\n",
-                      isr_drop, isr_att,
-                      leak_core1_dropped, leak_core1_attempts);
-    }
-    leak_isr_attempts = 0; leak_isr_dropped = 0;
-    leak_core1_attempts = 0; leak_core1_dropped = 0;
+    uint32_t f_seen       = leak_funnel_seen;
+    uint32_t f_suppressed = leak_funnel_suppressed;
+    uint32_t f_shipped    = leak_funnel_shipped;
+    uint32_t ld_drop      = live_dump_dropped;
 
-    if (currentState == SCREEN_CHART && currentRadioMode == RADIO_LAYER2) { 
+    Serial.printf(
+        "[DIAG] Funnel: Seen=%u | Suppressed=%u | Shipped=%u\n",
+        f_seen,
+        f_suppressed,
+        f_shipped
+    );
+
+    Serial.printf(
+        "[DIAG] Drops: liveDumpQueue=%u | "
+        "leakQueue ISR=%u/%u | Core1=%u/%u\n",
+        ld_drop,
+        isr_drop,
+        isr_att,
+        leak_core1_dropped,
+        leak_core1_attempts
+    );
+
+    Serial.printf(
+        "[DIAG] Free Heap: %d bytes\n",
+        ESP.getFreeHeap()
+    );
+
+    leak_funnel_seen       = 0;
+    leak_funnel_suppressed = 0;
+    leak_funnel_shipped    = 0;
+    live_dump_dropped      = 0;
+
+    leak_isr_attempts      = 0;
+    leak_isr_dropped       = 0;
+    leak_core1_attempts    = 0;
+    leak_core1_dropped     = 0;
+
+    if (currentState == SCREEN_CHART &&
+        currentRadioMode == RADIO_LAYER2) {
+
         drawTelemetryHeader();
     }
+
     last_debug_print = millis();
 }
-  }
 }
 
 /*

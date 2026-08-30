@@ -1,3 +1,110 @@
+The general capture pipeline for real time and persistent list (sniff list)/display
+
+                 CORE 0 / CAPTURE
+                        │
+                        ▼
+                sniffer_callback()
+                        │
+                        │ capture metadata/raw data
+                        ▼
+               LiveCaptureEvent
+                        │
+                        ▼
+              processLiveDumpQueue()
+                        │
+              protocol parsing
+              text extraction
+              high-value marking
+                        │
+                        │
+                        ├──── vendor resolution may happen
+                        │     here for real-time purposes
+                        │
+                        ▼
+                  Layer2Capture
+                        │
+                        │  compact handoff
+                        ▼
+                    leakQueue
+                        │
+                        ▼
+              processLeakQueue()
+                        │
+                ┌───────┴────────┐
+                │                │
+             terminal        persistent
+             history           history
+                                 │
+                                 ▼
+                         vendor enrichment
+                                 │
+                         resolveMacVendor()
+                                 │
+                         ┌───────┴────────┐
+                         │                │
+                    vendorCache       SD/OUI DB
+                     (cheap)           (slow)
+                         │
+                         ▼
+                  LeakHistoryEntry
+
+processLiveDumpQueue() pipeline:
+
+                     LiveCaptureEvent
+                            │
+                            ▼
+                    STRICT PARSERS
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+       recognized                     not recognized
+             │                             │
+             ▼                             ▼
+       custom_extracted              DEEP PARSERS
+                                           │
+                                  ┌────────┴────────┐
+                                  │                 │
+                              recognized       not recognized
+                                  │                 │
+                                  ▼                 ▼
+                                                   STATIC
+                                                   PORTS
+                                                     │
+                                              ┌──────┴──────┐
+                                              │             │
+                                          recognized    unknown
+                                              │             │
+                                              ▼             ▼
+                                                        EAPOL
+                                                        FALLBACK
+                                                           │
+                                                           ▼
+                                                      CATCH-ALL
+                                                           │
+                                                           ▼
+                                                  custom_extracted
+                                                           │
+                                                           ▼
+                                                   Layer2Capture
+                                                           │
+                              ┌────────────────────────────┴───────┐
+                              │                                    │
+                         meta copied                         text copied
+                              │                                    │
+                              ▼                                    ▼
+                     vendor already present                 retained_len
+                              │                                    │
+                              └────────────────┬───────────────────┘
+                                               ▼
+                                          leakQueue
+
+funnel_seen        = packets entering the L2 funnel
+funnel_suppressed  = packets intentionally rejected by 30-sec dedup
+funnel_shipped     = packets accepted by dedup and sent onward
+live_dump_dropped  = packets that passed dedup but couldn't enter liveDumpQueue
+leak_isr_dropped   = crypto/deauth packets that couldn't enter leakQueue directly
+leak_core1_dropped = parsed packets that couldn't enter leakQueue on Core 1
+
 Already developed / discussed
 
 You now have parsers for things including:
@@ -60,3 +167,24 @@ Because Wave Hound operates on a stateless, packet-by-packet basis, there are th
     Encrypted Client Hello (ECH): Cloudflare and Chrome are currently rolling out ECH, which encrypts the SNI extension so middleboxes cannot read it. When Wave Hound captures an ECH packet, it will correctly parse the TLS headers, but it will only see the "outer" cover domain (usually something generic like cloudflare-ech.com) rather than the true target.
 
 Overall, the logic is highly robust and ready to tackle random network traffic.
+
+
+eapol
+What is the MIC?
+
+MIC stands for Message Integrity Code. Once the Access Point (AP) and the Station (STA - the client device) combine the network password, the AP's MAC, the STA's MAC, the ANonce (from M1), and the SNonce (from M2), they generate a master session key called the PTK (Pairwise Transient Key).
+
+A piece of that PTK is the Key Confirmation Key (KCK). The MIC is an HMAC (a cryptographic hash) calculated by feeding the entire EAPOL frame + the KCK into an algorithm (usually SHA-1 or AES-CMAC).
+Why M2, M3, and M4 have different MICs:
+
+Because the MIC is a hash of the frame's contents, any change to the payload completely changes the resulting MIC.
+
+    M1 (AP -> STA): Has no MIC. The AP is just handing the client the ANonce so the client can do the math to build the keys.
+
+    M2 (STA -> AP): The client builds the keys, generates the SNonce, and sends it to the AP. It hashes this specific packet with the KCK to create MIC 1 (F92C...).
+
+    M3 (AP -> STA): The AP verifies M2. Now it needs to send the client the encrypted Group Key (GTK) for broadcast traffic. It increments the "Key Replay Counter" (so hackers can't replay old packets). Because the payload now contains the encrypted GTK and a new replay counter, hashing it produces a completely different signature: MIC 2 (6EB6...).
+
+    M4 (STA -> AP): The client sends a final, tiny packet that is basically just an "Ack" confirming it installed the keys. It has no nonces or key data, just a new replay counter. Different payload = MIC 3 (5801...).
+
+If the MIC were identical across packets, a hacker could simply copy the MIC from M2 and forge their own M3 or M4 packets to hijack the handshake!
