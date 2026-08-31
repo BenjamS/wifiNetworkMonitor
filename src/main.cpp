@@ -1851,6 +1851,73 @@ static inline uint16_t read_u16(const uint8_t* p, uint16_t len, int offset) {
     return (p[offset] << 8) | p[offset + 1];
 }
 
+// Compresses a fully-expanded IPv6 address string (8 groups, e.g.
+// "fe80:0000:0000:0000:1cee:da6a:322a:dd7a") into standard compressed
+// form (e.g. "fe80::1cee:da6a:322a:dd7a") per RFC 5952: collapses only
+// the single longest run of consecutive all-zero groups (length >= 2),
+// and strips leading zeros within each remaining group.
+// `full` and `out` must be different buffers.
+static void compress_ipv6(const char* full, char* out, size_t out_size) {
+    if (out_size == 0) return;
+    out[0] = '\0';
+
+    const char* g_start[8];
+    int g_len[8];
+    int g_count = 0;
+
+    const char* p = full;
+    while (*p && g_count < 8) {
+        g_start[g_count] = p;
+        const char* colon = strchr(p, ':');
+        g_len[g_count] = colon ? (int)(colon - p) : (int)strlen(p);
+        g_count++;
+        if (!colon) break;
+        p = colon + 1;
+    }
+
+    bool is_zero[8] = {false};
+    for (int i = 0; i < g_count; i++) {
+        bool z = true;
+        for (int j = 0; j < g_len[i]; j++) {
+            if (g_start[i][j] != '0') { z = false; break; }
+        }
+        is_zero[i] = z;
+    }
+
+    int best_start = -1, best_len = 0, run_start = -1, run_len = 0;
+    for (int i = 0; i < g_count; i++) {
+        if (is_zero[i]) {
+            if (run_start == -1) run_start = i;
+            run_len++;
+            if (run_len > best_len) { best_len = run_len; best_start = run_start; }
+        } else {
+            run_start = -1;
+            run_len = 0;
+        }
+    }
+    bool collapse = best_len >= 2;
+    int collapse_end = best_start + best_len;
+
+    size_t idx = 0;
+    auto put = [&](char c) { if (idx + 1 < out_size) out[idx++] = c; };
+
+    for (int i = 0; i < g_count; ) {
+        if (collapse && i == best_start) {
+            put(':');
+            put(':');
+            i = collapse_end;
+            continue;
+        }
+        int j = 0;
+        while (j < g_len[i] - 1 && g_start[i][j] == '0') j++;
+        for (; j < g_len[i]; j++) put(g_start[i][j]);
+        i++;
+        if (i < g_count && !(collapse && i == best_start)) put(':');
+    }
+
+    out[idx < out_size ? idx : out_size - 1] = '\0';
+}
+
 bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char* out_text, size_t max_len) {
     if (length < 12) return false; 
 
@@ -1969,6 +2036,25 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
             }
             // NEW: AAAA / IPv6
             else if (rr_type == 28 && rdlength == 16) {
+                char raw_ip6[48];
+                getIpString(6, &payload[offset], raw_ip6, sizeof(raw_ip6));
+
+                char compressed_ip6[48];
+                compress_ipv6(raw_ip6, compressed_ip6, sizeof(compressed_ip6));
+
+                char out_str[56];
+                snprintf(out_str, sizeof(out_str), "[IPv6: %s]", compressed_ip6);
+                int out_len = strlen(out_str);
+
+                if (d_idx + out_len + 3 < (int)sizeof(domains)) {
+                    if (valid_labels > 0) { domains[d_idx++] = ','; domains[d_idx++] = ' '; }
+                    memcpy(&domains[d_idx], out_str, out_len);
+                    d_idx += out_len;
+                    valid_labels++;
+                }
+            }
+            /*
+            else if (rr_type == 28 && rdlength == 16) {
                 char ip6_str[48];
                 getIpString(6, &payload[offset], ip6_str, sizeof(ip6_str));
 
@@ -1987,6 +2073,7 @@ bool parse_dns_mdns(const uint8_t* payload, uint16_t length, bool is_mdns, char*
                     valid_labels++;
                 }
             }
+            */
             else if (rr_type == 12 || rr_type == 5) { // PTR / CNAME
                 append_dns_name(offset);  // CHANGED — return value still discarded, same as original
             }
@@ -14077,10 +14164,27 @@ void runProbeCorrelationEngine() {
 // ==========================================
 void logLeakToSerial(const Layer2Capture& leak, const char* src_vendor,
                       const char* dst_vendor, const char* ssid) {
+
+    // Render correctly regardless of IP version, reusing meta.ip_version
+    // as the single source of truth (same field the on-screen L2 display
+    // already keys off of).
+    char srcIpStr[48], dstIpStr[48];
+
+    if (leak.meta.ip_version == 6) {
+        char srcIpRaw[48], dstIpRaw[48];
+        getIpString(6, leak.meta.src_ip, srcIpRaw, sizeof(srcIpRaw));
+        getIpString(6, leak.meta.dst_ip, dstIpRaw, sizeof(dstIpRaw));
+        compress_ipv6(srcIpRaw, srcIpStr, sizeof(srcIpStr));
+        compress_ipv6(dstIpRaw, dstIpStr, sizeof(dstIpStr));
+    } else {
+        getIpString(leak.meta.ip_version, leak.meta.src_ip, srcIpStr, sizeof(srcIpStr));
+        getIpString(leak.meta.ip_version, leak.meta.dst_ip, dstIpStr, sizeof(dstIpStr));
+    }
+
     Serial.printf(
         "🚨 LEAK [%s] | BSSID(SSID): %02X:%02X:%02X:%02X:%02X:%02X (%s) | "
-        "Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] -> "
-        "Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%u.%u.%u.%u:%u] | "
+        "Src MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%s:%u] -> "
+        "Dst MAC: %02X:%02X:%02X:%02X:%02X:%02X (%s) [%s:%u] | "
         "Ch: %u | Text: %s\n",
         leak.meta.is_high_value ? "HIGH-VALUE" : "STANDARD",
         leak.meta.bssid[0], leak.meta.bssid[1], leak.meta.bssid[2],
@@ -14089,13 +14193,11 @@ void logLeakToSerial(const Layer2Capture& leak, const char* src_vendor,
         leak.meta.src_mac[0], leak.meta.src_mac[1], leak.meta.src_mac[2],
         leak.meta.src_mac[3], leak.meta.src_mac[4], leak.meta.src_mac[5],
         src_vendor,
-        leak.meta.src_ip[0], leak.meta.src_ip[1], leak.meta.src_ip[2], leak.meta.src_ip[3],
-        leak.meta.src_port,
+        srcIpStr, leak.meta.src_port,
         leak.meta.dst_mac[0], leak.meta.dst_mac[1], leak.meta.dst_mac[2],
         leak.meta.dst_mac[3], leak.meta.dst_mac[4], leak.meta.dst_mac[5],
         dst_vendor,
-        leak.meta.dst_ip[0], leak.meta.dst_ip[1], leak.meta.dst_ip[2], leak.meta.dst_ip[3],
-        leak.meta.dst_port,
+        dstIpStr, leak.meta.dst_port,
         leak.meta.channel,
         leak.text
     );
