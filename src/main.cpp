@@ -12002,16 +12002,19 @@ void drawDeviceList() {
         uint16_t fLen = lk.meta.frame_length;
         if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
         else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
-
-        char srcIpStr[40] = {0}, dstIpStr[40] = {0}; 
-        getIpString(lk.meta.ip_version, lk.meta.src_ip, srcIpStr, sizeof(srcIpStr));
-        getIpString(lk.meta.ip_version, lk.meta.dst_ip, dstIpStr, sizeof(dstIpStr));
         
-        char* p;
-        while ((p = strstr(srcIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
-        while ((p = strstr(dstIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
-        while ((p = strstr(srcIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
-        while ((p = strstr(dstIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+        char srcIpRaw[40] = {0}, dstIpRaw[40] = {0};
+getIpString(lk.meta.ip_version, lk.meta.src_ip, srcIpRaw, sizeof(srcIpRaw));
+getIpString(lk.meta.ip_version, lk.meta.dst_ip, dstIpRaw, sizeof(dstIpRaw));
+
+char srcIpStr[40] = {0}, dstIpStr[40] = {0};
+if (lk.meta.ip_version == 6) {
+    compress_ipv6(srcIpRaw, srcIpStr, sizeof(srcIpStr));
+    compress_ipv6(dstIpRaw, dstIpStr, sizeof(dstIpStr));
+} else {
+    strncpy(srcIpStr, srcIpRaw, sizeof(srcIpStr) - 1);
+    strncpy(dstIpStr, dstIpRaw, sizeof(dstIpStr) - 1);
+}
 
         snprintf(line1, sizeof(line1), "[x%d]%02X%02X%02X%02X%02X%02X(%s)>%02X%02X%02X%02X%02X%02X(%s)|%s|C%d", 
                  leakHistory[real_idx].hitCount,
@@ -15666,23 +15669,26 @@ if (!lookupVendorCache(
 }
 
                 // --- INLINE FORMATTERS ---
-                // 1. Compact Length (Max 4 chars)
-                char lenStr[8];
-                uint16_t fLen = terminal_history[i].meta.frame_length;
-                if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
-                else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
+// 1. Compact Length (Max 4 chars)
+char lenStr[8];
+uint16_t fLen = terminal_history[i].meta.frame_length;
+if (fLen < 1000) snprintf(lenStr, sizeof(lenStr), "%dB", fLen);
+else snprintf(lenStr, sizeof(lenStr), "%dK", fLen / 1000);
 
-                // 2. Safe IPv6 Buffers (40 bytes to prevent overflow)
-                char srcIpStr[40] = {0}, dstIpStr[40] = {0};
-                getIpString(terminal_history[i].meta.ip_version, terminal_history[i].meta.src_ip, srcIpStr, sizeof(srcIpStr));
-                getIpString(terminal_history[i].meta.ip_version, terminal_history[i].meta.dst_ip, dstIpStr, sizeof(dstIpStr));
-                
-                // 3. IPv6 Shortener (Compresses consecutive and single zero-blocks)
-                char* p;
-                while ((p = strstr(srcIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
-                while ((p = strstr(dstIpStr, ":0000:0000:")) != NULL) memmove(p + 1, p + 10, strlen(p + 10) + 1);
-                while ((p = strstr(srcIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
-                while ((p = strstr(dstIpStr, ":0000:")) != NULL) memmove(p + 1, p + 5, strlen(p + 5) + 1);
+// 2. Safe IPv6 Buffers (40 bytes to prevent overflow)
+char srcIpRaw[40] = {0}, dstIpRaw[40] = {0};
+getIpString(terminal_history[i].meta.ip_version, terminal_history[i].meta.src_ip, srcIpRaw, sizeof(srcIpRaw));
+getIpString(terminal_history[i].meta.ip_version, terminal_history[i].meta.dst_ip, dstIpRaw, sizeof(dstIpRaw));
+
+// 3. IPv6 Compression (RFC 5952 longest-run collapse, replaces old sequential strstr/memmove approach)
+char srcIpStr[40] = {0}, dstIpStr[40] = {0};
+if (terminal_history[i].meta.ip_version == 6) {
+    compress_ipv6(srcIpRaw, srcIpStr, sizeof(srcIpStr));
+    compress_ipv6(dstIpRaw, dstIpStr, sizeof(dstIpStr));
+} else {
+    strncpy(srcIpStr, srcIpRaw, sizeof(srcIpStr) - 1);
+    strncpy(dstIpStr, dstIpRaw, sizeof(dstIpStr) - 1);
+}
 
                 // 4. Fast Live Age Calculator (Seconds Resolution)
                 char firstSeenStr[8], lastSeenStr[8], ageCombo[18];
